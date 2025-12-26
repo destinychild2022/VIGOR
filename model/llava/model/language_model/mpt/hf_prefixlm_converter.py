@@ -15,20 +15,64 @@ import torch
 from transformers.models.bloom.modeling_bloom import (
     BaseModelOutputWithPastAndCrossAttentions, BloomForCausalLM, BloomModel,
     CausalLMOutputWithCrossAttentions, CrossEntropyLoss)
-from transformers.models.bloom.modeling_bloom import \
-    _expand_mask as _expand_mask_bloom
-from transformers.models.bloom.modeling_bloom import \
-    _make_causal_mask as _make_causal_mask_bloom
 from transformers.models.bloom.modeling_bloom import logging
+
+# transformers 4.40+ 中移除了 _expand_mask 和 _make_causal_mask，需要自己实现
+def _expand_mask_bloom(mask: torch.Tensor, dtype: torch.dtype, tgt_length: int = None):
+    """
+    扩展 attention mask 到目标长度
+    替代 transformers 4.40+ 中移除的 _expand_mask 函数
+    """
+    batch_size, src_length = mask.shape
+    tgt_length = tgt_length if tgt_length is not None else src_length
+    
+    expanded_mask = mask[:, None, None, :].expand(batch_size, 1, tgt_length, src_length).to(dtype)
+    
+    inverted_mask = 1.0 - expanded_mask
+    
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
+def _make_causal_mask_bloom(
+    input_ids_shape: torch.Size, 
+    dtype: torch.dtype, 
+    device: torch.device, 
+    past_key_values_length: int = 0
+):
+    """
+    创建因果 attention mask
+    替代 transformers 4.40+ 中移除的 _make_causal_mask 函数
+    """
+    batch_size, target_length = input_ids_shape
+    
+    mask = torch.full(
+        (target_length, target_length),
+        torch.tensor(torch.finfo(dtype).min, device=device),
+        device=device,
+    )
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = torch.cat(
+            [
+                torch.zeros(
+                    target_length, past_key_values_length, dtype=dtype, device=device
+                ),
+                mask,
+            ],
+            dim=-1,
+        )
+    return mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoForCausalLM
 from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXForCausalLM
 from transformers.models.gptj.modeling_gptj import GPTJForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
-from transformers.models.opt.modeling_opt import \
-    _expand_mask as _expand_mask_opt
-from transformers.models.opt.modeling_opt import \
-    _make_causal_mask as _make_causal_mask_opt
+
+# transformers 4.40+ 中移除了 _expand_mask 和 _make_causal_mask，使用相同的实现
+_expand_mask_opt = _expand_mask_bloom
+_make_causal_mask_opt = _make_causal_mask_bloom
 
 logger = logging.get_logger(__name__)
 _SUPPORTED_GPT_MODELS = (

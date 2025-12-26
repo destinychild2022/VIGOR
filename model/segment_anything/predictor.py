@@ -234,6 +234,7 @@ class SamPredictor:
             points=points,
             boxes=boxes,
             masks=mask_input,
+            text_embeds=None,
         )
 
         # Predict masks

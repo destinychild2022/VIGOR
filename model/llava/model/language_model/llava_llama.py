@@ -163,5 +163,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return model_inputs
 
 
-AutoConfig.register("llava", LlavaConfig)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+# 检查是否已经注册，避免与 transformers 4.40+ 内置的 llava 配置冲突
+try:
+    AutoConfig.register("llava", LlavaConfig, exist_ok=True)
+except ValueError:
+    # 如果已经注册，忽略错误
+    pass
+try:
+    AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM, exist_ok=True)
+except ValueError:
+    # 如果已经注册，忽略错误
+    pass

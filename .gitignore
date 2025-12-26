@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Model checkpoints and large files
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Data directories (usually too large)
+dataset/
+data/
+*.zip
+*.tar.gz
+*.tar
+
+# Project specific directories (not uploaded)
+SAM_finetune/sam_output/
+swanlog/
+vis_output/
+runs/
+
+# Logs and outputs
+*.log
+logs/
+runs/
+wandb/
+tensorboard/
+outputs/
+checkpoints/
+ckpt_model/
+
+# Project specific directories (not uploaded)
+SAM_finetune/sam_output/
+swanlog/
+vis_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Cursor specific
+cursor_.md
+.cursor/
+
+# Test outputs
+test_vis/
+test_vis_*/
+eval_vis*/
+*.png
+*.jpg
+*.jpeg
+!assets/**/*.png
+!assets/**/*.jpg
+
+# Results
+*.txt
+!requirements.txt
+!README.md
+success_rate_results.txt
+test_results*.txt

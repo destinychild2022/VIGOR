@@ -16,14 +16,38 @@ class CLIPVisionTower(nn.Module):
         if not delay_load:
             self.load_model()
         else:
-            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+            import os
+            # 检查是否是本地路径（绝对路径或相对路径）
+            is_local_path = (
+                os.path.exists(self.vision_tower_name) and 
+                os.path.isdir(self.vision_tower_name) and
+                os.path.exists(os.path.join(self.vision_tower_name, "config.json"))
+            )
+            # 如果不是本地路径，尝试强制使用本地文件（避免网络请求）
+            local_files_only = is_local_path
+            if not is_local_path:
+                # 如果路径不存在，但仍然尝试使用 local_files_only=True 避免网络请求
+                # 这会在文件不存在时抛出更清晰的错误
+                local_files_only = True
+            
+            self.cfg_only = CLIPVisionConfig.from_pretrained(
+                self.vision_tower_name,
+                local_files_only=local_files_only
+            )
 
     def load_model(self):
+        import os
+        # 如果是本地路径，强制使用本地文件，避免网络请求
+        local_files_only = os.path.exists(self.vision_tower_name) and os.path.isdir(self.vision_tower_name)
+        
         self.image_processor = CLIPImageProcessor.from_pretrained(
-            self.vision_tower_name
+            self.vision_tower_name,
+            local_files_only=local_files_only
         )
         self.vision_tower = CLIPVisionModel.from_pretrained(
-            self.vision_tower_name, low_cpu_mem_usage=True
+            self.vision_tower_name, 
+            low_cpu_mem_usage=True,
+            local_files_only=local_files_only
         )
         self.vision_tower.requires_grad_(False)
         self.is_loaded = True

@@ -1,4 +1,5 @@
 from typing import List
+import os
 
 import torch
 import torch.nn as nn
@@ -25,8 +26,12 @@ class LisaMetaModel:
 
         self.config = config
         if not hasattr(self.config, "train_mask_decoder"):
-            self.config.train_mask_decoder = kwargs["train_mask_decoder"]
-            self.config.out_dim = kwargs["out_dim"]
+            # Transformers 的 from_pretrained 可能会把 train_mask_decoder/out_dim 当作 config kwargs
+            # 先消费掉，导致它们不再出现在这里的 kwargs 里，所以必须做 fallback。
+            self.config.train_mask_decoder = kwargs.get(
+                "train_mask_decoder", getattr(self.config, "train_mask_decoder", False)
+            )
+            self.config.out_dim = kwargs.get("out_dim", getattr(self.config, "out_dim", 256))
             self.vision_pretrained = kwargs.get("vision_pretrained", None)
         else:
             self.vision_pretrained = kwargs.get("vision_pretrained", None)
@@ -45,7 +50,53 @@ class LisaMetaModel:
                 param.requires_grad = True
 
         # DINO-V2
-        dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        # 优先从本地路径加载权重文件
+        dinov2_local_path = "/opt/data/private/model/dinov2_vitl14"
+        dinov2_weight_path = None
+        
+        # 检查本地路径是否有权重文件
+        if os.path.exists(dinov2_local_path):
+            import glob
+            pth_files = glob.glob(os.path.join(dinov2_local_path, "*.pth"))
+            if pth_files:
+                dinov2_weight_path = pth_files[0]
+                print(f"Found local DINOv2 weight: {dinov2_weight_path}")
+        
+        # 加载模型结构（从 torch.hub，这会下载代码但可能失败）
+        # 如果本地有权重文件，使用 pretrained=False 避免下载权重
+        use_pretrained = dinov2_weight_path is None
+        try:
+            dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
+            if use_pretrained:
+                print("Loaded DINOv2 from torch.hub (with pretrained weights)")
+            else:
+                print("Loaded DINOv2 model structure from torch.hub")
+        except Exception as e:
+            print(f"Warning: Failed to load DINOv2 from torch.hub ({e})")
+            # 如果 torch.hub 失败，尝试从缓存加载（如果之前下载过）
+            cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+            if os.path.exists(cache_dir):
+                try:
+                    dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
+                    print("Loaded DINOv2 model structure from local cache")
+                except Exception as e2:
+                    print(f"Error: Cannot load DINOv2 model structure from cache. Please ensure the model is available.")
+                    raise e2
+            else:
+                raise e
+        
+        # 如果本地有权重文件，加载本地权重
+        if dinov2_weight_path and os.path.exists(dinov2_weight_path):
+            try:
+                print(f"Loading DINOv2 weights from: {dinov2_weight_path}")
+                state_dict = torch.load(dinov2_weight_path, map_location='cpu')
+                dinov2_vitl14.load_state_dict(state_dict, strict=False)
+                print(f"Successfully loaded DINOv2 weights from local path")
+            except Exception as e:
+                print(f"Warning: Failed to load weights from local path ({e}), using pretrained weights")
+                # 如果本地权重加载失败，使用预训练权重
+                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        
         self.visual_model_dinov2 = dinov2_vitl14
         for param in self.visual_model_dinov2.parameters():
             param.requires_grad = False
@@ -147,16 +198,27 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         config,
         **kwargs,
     ):
+        # 这些 loss 权重在 forward 中总会用到；即使 config 里已有 train_mask_decoder 也必须有默认值
+        self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
+        self.align_loss_weight = kwargs.pop("align_loss_weight", 1.0)
+        self.regression_loss_weight = kwargs.pop("regression_loss_weight", 1.0)
+
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
-            config.mm_vision_tower = kwargs.get(
-                "vision_tower", "openai/clip-vit-large-patch14"
+            # ⚠️ 注意：Transformers 的 from_pretrained 可能会把 vision_tower/mm_vision_tower 当作 config kwargs
+            # 先消耗掉，从而不会再出现在这里的 kwargs 里。
+            # 因此这里必须优先保留 config.mm_vision_tower（已经从 config.json 或 config kwargs 里设置好），
+            # 只有当 config 里没有时才从 kwargs 读取，最后才回退到 HF id。
+            config.mm_vision_tower = getattr(config, "mm_vision_tower", None) or kwargs.get(
+                "mm_vision_tower", kwargs.get("vision_tower", "openai/clip-vit-large-patch14")
             )
-            self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
-            self.align_loss_weight = kwargs.pop("align_loss_weight", 1.0)
-            self.regression_loss_weight = kwargs.pop("regression_loss_weight", 1.0)
             #self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
             #self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
+        else:
+            # 即使配置文件中已有 train_mask_decoder，也要强制使用命令行传入的 vision_tower
+            # 这样可以确保使用本地路径而不是配置文件中的 Hugging Face 路径
+            if "vision_tower" in kwargs:
+                config.mm_vision_tower = kwargs["vision_tower"]
 
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
@@ -217,6 +279,65 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         return output
 
+    @staticmethod
+    def _cosine_sim_stats_kd(feat_kd: torch.Tensor):
+        """计算 (K,D) 特征之间的余弦相似度统计（仅统计非对角元素）"""
+        if feat_kd is None or (not isinstance(feat_kd, torch.Tensor)):
+            return None
+        if feat_kd.dim() != 2:
+            return None
+        K = feat_kd.shape[0]
+        if K < 2:
+            return None
+        x = feat_kd.detach().float().cpu()
+        x = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+        sim = torch.clamp(x @ x.T, -1.0, 1.0)
+        mask = ~torch.eye(K, dtype=torch.bool)
+        vals = sim[mask]
+        return {
+            "shape": [int(K), int(feat_kd.shape[1])],
+            "mean": float(vals.mean().item()),
+            "min": float(vals.min().item()),
+            "max": float(vals.max().item()),
+            "std": float(vals.std().item()),
+        }
+
+    @staticmethod
+    def _mask_iou_stats_khw(masks_khw: torch.Tensor):
+        """计算 (K,H,W) mask之间的IoU相似度统计（仅统计非对角元素）"""
+        if masks_khw is None or (not isinstance(masks_khw, torch.Tensor)):
+            return None
+        if masks_khw.dim() != 3:
+            return None
+        K = masks_khw.shape[0]
+        if K < 2:
+            return None
+        # 将mask二值化（>0.5为前景）
+        masks_binary = (masks_khw > 0.5).float()
+        # 计算每对mask之间的IoU
+        ious = []
+        for i in range(K):
+            for j in range(i + 1, K):
+                mask_i = masks_binary[i].flatten()  # (H*W,)
+                mask_j = masks_binary[j].flatten()  # (H*W,)
+                intersection = (mask_i * mask_j).sum()
+                union = (mask_i + mask_j).clamp(0, 1).sum()
+                if union > 0:
+                    iou = intersection / union
+                else:
+                    iou = 0.0
+                ious.append(float(iou))
+        if len(ious) == 0:
+            return None
+        ious_tensor = torch.tensor(ious)
+        return {
+            "shape": [int(K), int(masks_khw.shape[1]), int(masks_khw.shape[2])],
+            "mean": float(ious_tensor.mean().item()),
+            "min": float(ious_tensor.min().item()),
+            "max": float(ious_tensor.max().item()),
+            "std": float(ious_tensor.std().item()),
+        }
+
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
             return super().forward(**kwargs)
@@ -239,10 +360,15 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         inference: bool = False,
         **kwargs,
     ):
+        # 训练阶段可选返回可视化所需字段（避免为了可视化额外跑一次 inference forward）
+        return_vis = bool(kwargs.pop("return_vis", False))
+        debug_train_shapes = bool(kwargs.pop("debug_train_shapes", False))
+        debug_epoch = kwargs.pop("debug_epoch", None)
         # image_embeddings = self.get_visual_embs(images)
 
-        image_embeddings = self.get_dinov2_visual_embs(images)
-        image_embeddings = self.model.lisa_dino_conv(image_embeddings)
+        # === 原图 -> 视觉特征（供 mask_pooling 使用） ===
+        dino_embeds = self.get_dinov2_visual_embs(images)
+        image_embeddings = self.model.lisa_dino_conv(dino_embeds)
 
         #import pdb; pdb.set_trace()
         
@@ -266,28 +392,28 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         )
 
         if inference:
-            n_batch = 1
-            length = input_ids.shape[0]
-            assert images_clip.shape[0] == 1
-            images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
-
-            output_hidden_states = []
-            for i in range(n_batch):
-                start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
-                output_i = super().forward(
-                    images=images_clip_extend[: end_i - start_i],
-                    attention_mask=attention_masks[start_i:end_i],
-                    input_ids=input_ids[start_i:end_i],
-                    output_hidden_states=True,
+            # 推理阶段也需要支持 batch>1（训练可视化会用 batch_size>1）。
+            # 使用 offset 将每张图对应的 images_clip 复制到该图的对话轮次范围内，
+            # 使 images_clip 的 batch 维与 input_ids / attention_masks 对齐。
+            images_clip_list = []
+            for i in range(len(offset) - 1):
+                start_i, end_i = offset[i], offset[i + 1]
+                images_clip_i = (
+                    images_clip[i]
+                    .unsqueeze(0)
+                    .expand(end_i - start_i, -1, -1, -1)
+                    .contiguous()
                 )
-                output_hidden_states.append(output_i.hidden_states)
-                torch.cuda.empty_cache()
+                images_clip_list.append(images_clip_i)
+            images_clip = torch.cat(images_clip_list, dim=0)
 
-            output_hidden_states_list = []
-            output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
-            output_hidden_states_list.append(output_hidden_states_level)
-            output_hidden_states = output_hidden_states_list
-            output = None
+            output = super().forward(
+                images=images_clip,
+                attention_mask=attention_masks,
+                input_ids=input_ids,
+                output_hidden_states=True,
+            )
+            output_hidden_states = output.hidden_states
 
         else:
             images_clip_list = []
@@ -315,12 +441,49 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         hidden_states = []
 
         assert len(self.model.text_hidden_fcs) == 1
-        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
+        # `output_hidden_states` is expected to be a tuple/list (per-layer),
+        # but some code paths may return a single tensor. Handle both safely.
+        if isinstance(output_hidden_states, (tuple, list)):
+            last_layer_hs = output_hidden_states[-1]
+        else:
+            last_layer_hs = output_hidden_states
+
+        # Some rare paths may accidentally drop batch dim when batch_size==1.
+        # Align it back to [B, L, H] to match `seg_token_mask` ([B, L]).
+        if last_layer_hs is not None and last_layer_hs.dim() == 2 and input_ids.dim() == 2 and input_ids.shape[0] == 1:
+            last_layer_hs = last_layer_hs.unsqueeze(0)
+
+        hidden_states.append(self.model.text_hidden_fcs[0](last_layer_hs))
 
         # import pdb; pdb.set_trace()
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        pred_embeddings = last_hidden_state[seg_token_mask]
+
+        # Debug print (once) to help track shape issues in validation/inference.
+        if not hasattr(self, "_llmseg_shape_debug_printed"):
+            try:
+                print(
+                    "[ShapeDebug] input_ids:",
+                    tuple(input_ids.shape),
+                    "attention_masks:",
+                    tuple(attention_masks.shape),
+                    "seg_token_mask:",
+                    tuple(seg_token_mask.shape),
+                    "last_hidden_state:",
+                    tuple(last_hidden_state.shape),
+                    "output_hidden_states_type:",
+                    type(output_hidden_states),
+                    flush=True,
+                )
+            except Exception:
+                pass
+            self._llmseg_shape_debug_printed = True
+
+        # Make boolean indexing robust for both [B, L, D] and [L, D] hidden states.
+        seg_mask = seg_token_mask
+        if last_hidden_state.dim() == 2 and seg_mask.dim() == 2 and seg_mask.shape[0] == 1:
+            seg_mask = seg_mask[0]
+        pred_embeddings = last_hidden_state[seg_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
         seg_token_offset = seg_token_counts.cumsum(-1)
@@ -347,18 +510,191 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         # do not support fp16, because interpolate does not support fp16
         # see the disucssion here: https://github.com/pytorch/pytorch/issues/88536
         # first convert to float32
+        # 记录 interpolate 前后的维度（用于“每一步都要”的维度追踪）
+        image_embeddings_pre_interp_shape = tuple(image_embeddings.shape)
+        image_embeddings_pre_interp_dtype = image_embeddings.dtype
+
         origin_dtype = image_embeddings.dtype
-        image_embeddings = image_embeddings.to(dtype = torch.float32)
-        image_embeddings = F.interpolate(image_embeddings, size=(256, 256), mode='bilinear', align_corners=False)
+        image_embeddings = image_embeddings.to(dtype=torch.float32)
+        image_embeddings = F.interpolate(image_embeddings, size=(256, 256), mode="bilinear", align_corners=False)
         # convert back to original dtype
-        image_embeddings = image_embeddings.to(dtype = origin_dtype)
+        image_embeddings = image_embeddings.to(dtype=origin_dtype)
+
+        image_embeddings_post_interp_shape = tuple(image_embeddings.shape)
+
+        # ✅ 训练阶段：每个 epoch 只打印一次“从进入模型到 loss”的关键维度链路（验证/推理不打印）
+        if debug_train_shapes and (not inference):
+            try:
+                if not hasattr(self, "_debug_epoch_printed"):
+                    self._debug_epoch_printed = set()
+                epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                if epoch_key not in self._debug_epoch_printed:
+                    print("\n" + "=" * 90, flush=True)
+                    print(f"[debug] 模型-训练维度链路(epoch={epoch_key}) | batch_size={batch_size}", flush=True)
+                    # 每个 epoch 固定随机选 3 个样本做更详细的打印（不足3则全选）
+                    try:
+                        import random as _py_random
+                        k = 3 if batch_size >= 3 else batch_size
+                        rng = _py_random.Random(int(epoch_key) + 12345)
+                        chosen = sorted(rng.sample(list(range(batch_size)), k=k)) if batch_size > 0 else []
+                    except Exception:
+                        chosen = [0] if batch_size > 0 else []
+                    self._debug_epoch_sample_indices = getattr(self, "_debug_epoch_sample_indices", {})
+                    self._debug_epoch_sample_indices[int(epoch_key)] = chosen
+                    print(f"[debug] 本epoch随机选中的batch内样本索引: {chosen}", flush=True)
+                    print(f"[debug] 第1步-模型输入(原图tensor) | images.shape={tuple(images.shape)} | dtype={images.dtype}", flush=True)
+                    print(f"[debug] 第2步-模型输入(CLIP图像) | images_clip.shape={tuple(images_clip.shape)} | dtype={images_clip.dtype}", flush=True)
+                    print(f"[debug] 第3步-模型输入(文本) | input_ids.shape={tuple(input_ids.shape)} | attention_masks.shape={tuple(attention_masks.shape)}", flush=True)
+                    print(f"[debug] 第4步-offset展开 | offset={offset.detach().cpu().tolist() if isinstance(offset, torch.Tensor) else offset}", flush=True)
+                    # 原图->dinov2->conv 的输出（插值前）
+                    try:
+                        print(f"[debug] 第5步-视觉特征(dinov2输出) | shape={tuple(dino_embeds.shape)} | dtype={dino_embeds.dtype}", flush=True)
+                    except Exception:
+                        pass
+                    print(f"[debug] 第6步-视觉特征(conv后,插值前) | shape={image_embeddings_pre_interp_shape} | dtype={image_embeddings_pre_interp_dtype}", flush=True)
+                    print(f"[debug] 第7步-视觉特征(插值到256x256后) | shape={image_embeddings_post_interp_shape} | dtype={image_embeddings.dtype}", flush=True)
+                    # sam_segs_list: list of (K, 256, 256)
+                    if isinstance(sam_segs_list, list) and len(sam_segs_list) > 0 and hasattr(sam_segs_list[0], "shape"):
+                        print(f"[debug] 第8步-候选掩码进入模型 | sam_segs_list[0].shape={tuple(sam_segs_list[0].shape)} (K,256,256)", flush=True)
+                    if isinstance(masks_list, list) and len(masks_list) > 0 and hasattr(masks_list[0], "shape"):
+                        print(f"[debug] 第9步-GT掩码进入模型 | gt_masks_list[0].shape={tuple(masks_list[0].shape)}", flush=True)
+                    if isinstance(sam_ious_list, list) and len(sam_ious_list) > 0 and hasattr(sam_ious_list[0], "shape"):
+                        print(f"[debug] 第10步-候选掩码与GT IoU | sam_ious_list[0].shape={tuple(sam_ious_list[0].shape)}", flush=True)
+                    if isinstance(sam_iops_list, list) and len(sam_iops_list) > 0 and hasattr(sam_iops_list[0], "shape"):
+                        print(f"[debug] 第11步-候选掩码与GT IoP | sam_iops_list[0].shape={tuple(sam_iops_list[0].shape)}", flush=True)
+                    self._debug_epoch_printed.add(epoch_key)
+                    print("=" * 90 + "\n", flush=True)
+            except Exception as e:
+                print("[TrainShapePipeline] debug print failed:", repr(e), flush=True)
 
         # mask pooling
         sam_segs_feature_list = []
         sam_pred_ious_list = []
         for batch_idx in range(len(sam_segs_list)):
             segs = sam_segs_list[batch_idx]
-            segs_feature = self.mask_pooling(image_embeddings[batch_idx], segs)
+            # ✅ 重要：mask_pooling 的 weight_maps 期望“前景权重越大贡献越大”。
+            # 但机器人手臂数据目前的 mask 语义是：前景(掩码)=0，背景=1（训练可视化里也按 ==0 作为掩码区域）。
+            # 若直接把 segs 当权重，会变成在“背景”上 pooling，导致不同候选 mask 的特征非常相似，
+            # 进而出现 pred_similarity 区分度低、AlignLoss 难下降的问题。
+            # 因此这里将权重转换为“前景权重”：segs_fg = 1 - segs（反转mask：掩码区域=1，背景区域=0）。
+            # 注意：使用 1 - segs 而不是 (segs < 0.5)，可以保留插值后的平滑过渡信息。
+            if isinstance(segs, torch.Tensor):
+                segs_fg = 1 - segs
+            else:
+                segs_fg = 1 - segs
+            
+            # ✅ 打印初始候选mask之间的相似度（在mask_pooling之前）
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    if batch_idx in chosen:
+                        if not hasattr(self, "_debug_epoch_mask_iou_printed"):
+                            self._debug_epoch_mask_iou_printed = {}
+                        printed_mask_iou = self._debug_epoch_mask_iou_printed.get(int(epoch_key), set())
+                        if batch_idx not in printed_mask_iou:
+                            # 计算初始候选mask之间的IoU相似度
+                            stats_mask_iou = self._mask_iou_stats_khw(segs_fg)
+                            if stats_mask_iou is not None:
+                                print(f"[debug] 第11步-初始候选mask相似度(IoU) | sample(batch_idx={batch_idx}) | "
+                                      f"shape={stats_mask_iou['shape']} | "
+                                      f"mean={stats_mask_iou['mean']:.6f} min={stats_mask_iou['min']:.6f} "
+                                      f"max={stats_mask_iou['max']:.6f} std={stats_mask_iou['std']:.6f}", flush=True)
+                                if stats_mask_iou["mean"] > 0.8:
+                                    print(f"[debug] 注意-初始候选mask过于相似 | mean IoU={stats_mask_iou['mean']:.3f}>0.8（可能候选mask本身重复度高）", flush=True)
+                                elif stats_mask_iou["mean"] < 0.3:
+                                    print(f"[debug] 信息-初始候选mask区分度较好 | mean IoU={stats_mask_iou['mean']:.3f}<0.3", flush=True)
+                            printed_mask_iou.add(batch_idx)
+                            self._debug_epoch_mask_iou_printed[int(epoch_key)] = printed_mask_iou
+                except Exception as e:
+                    pass
+            
+            segs_feature = self.mask_pooling(image_embeddings[batch_idx], segs_fg)
+
+            # 进一步打印 pooling 细节（只在该 epoch 第一次；只看 batch_idx=0，避免刷屏）
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    # 如果启用了“随机3张”，就不要再重复打印 sample0 的那一套
+                    if hasattr(self, "_debug_epoch_printed") and epoch_key in self._debug_epoch_printed and batch_idx == 0 and len(chosen) == 1 and chosen[0] == 0:
+                        # 只在首次打印中补充一次更细节的统计
+                        if not hasattr(self, "_debug_epoch_pool_stats_printed"):
+                            self._debug_epoch_pool_stats_printed = set()
+                        if epoch_key not in self._debug_epoch_pool_stats_printed:
+                            ws = segs_fg
+                            ws_sum = ws.sum(dim=(1, 2)) if isinstance(ws, torch.Tensor) else None
+                            if ws_sum is not None:
+                                # 计算mask面积占比（前景像素数/总像素数）
+                                total_pixels = ws.shape[1] * ws.shape[2]  # H * W
+                                area_ratios = ws_sum.float() / total_pixels  # (K,)
+                                print(f"[debug] 第12步-mask_pooling输入前景像素数统计(sample0) | "
+                                      f"min={float(ws_sum.min().item()):.1f} max={float(ws_sum.max().item()):.1f} "
+                                      f"mean={float(ws_sum.float().mean().item()):.1f}", flush=True)
+                                print(f"[debug] 第13步-mask_pooling输入前景占比(sample0, 256x256) | "
+                                      f"min={float(area_ratios.min().item()):.4f} max={float(area_ratios.max().item()):.4f} "
+                                      f"mean={float(area_ratios.mean().item()):.4f}", flush=True)
+                            print(f"[debug] 第14步-mask_pooling输出特征 | segs_feature.shape={tuple(segs_feature.shape)} (K, D)", flush=True)
+                            self._debug_epoch_pool_stats_printed.add(epoch_key)
+                except Exception:
+                    pass
+
+            # ✅ 额外：对本epoch随机选中的 3 个样本分别打印 mask 前景占比与 pooling 输出维度（每个epoch只打印一次）
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    if batch_idx in chosen:
+                        if not hasattr(self, "_debug_epoch_pool_stats_printed_multi"):
+                            self._debug_epoch_pool_stats_printed_multi = {}
+                        printed_set = self._debug_epoch_pool_stats_printed_multi.get(int(epoch_key), set())
+                        if batch_idx not in printed_set:
+                            # 额外打印：进入 mask_pooling 前，原图特征与候选mask的输入维度
+                            print(f"[debug] 第12步-mask_pooling输入(原图特征) | sample(batch_idx={batch_idx}) | image_embeddings.shape={tuple(image_embeddings[batch_idx].shape)}", flush=True)
+                            print(f"[debug] 第13步-mask_pooling输入(候选mask) | sample(batch_idx={batch_idx}) | segs.shape={tuple(segs.shape)} | segs_fg.shape={tuple(segs_fg.shape)}", flush=True)
+
+                            ws = segs_fg
+                            if isinstance(ws, torch.Tensor):
+                                ws_sum = ws.sum(dim=(1, 2))  # (K,)
+                                total_pixels = ws.shape[1] * ws.shape[2]
+                                area_ratios = ws_sum.float() / total_pixels
+                                print(f"[debug] 第14步-mask_pooling输入前景像素数统计 | sample(batch_idx={batch_idx}) | min={float(ws_sum.min().item()):.1f} max={float(ws_sum.max().item()):.1f} mean={float(ws_sum.float().mean().item()):.1f}", flush=True)
+                                print(f"[debug] 第15步-mask_pooling输入前景占比(256x256) | sample(batch_idx={batch_idx}) | min={float(area_ratios.min().item()):.4f} max={float(area_ratios.max().item()):.4f} mean={float(area_ratios.mean().item()):.4f}", flush=True)
+                            print(f"[debug] 第16步-mask_pooling输出特征 | sample(batch_idx={batch_idx}) | segs_feature.shape={tuple(segs_feature.shape)} (K, D)", flush=True)
+                            printed_set.add(batch_idx)
+                            self._debug_epoch_pool_stats_printed_multi[int(epoch_key)] = printed_set
+                except Exception:
+                    pass
+
+            # ✅ 打印mask_pooling之后的特征相似度（并保存用于总结）
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    if batch_idx in chosen:
+                        if not hasattr(self, "_debug_epoch_masksim_printed_multi"):
+                            self._debug_epoch_masksim_printed_multi = {}
+                        if not hasattr(self, "_debug_epoch_sim_stats_cache"):
+                            self._debug_epoch_sim_stats_cache = {}
+                        printed = self._debug_epoch_masksim_printed_multi.get(int(epoch_key), set())
+                        if batch_idx not in printed:
+                            stats_pool = self._cosine_sim_stats_kd(segs_feature)
+                            # 保存用于总结
+                            cache_key = f"{epoch_key}_{batch_idx}"
+                            if cache_key not in self._debug_epoch_sim_stats_cache:
+                                self._debug_epoch_sim_stats_cache[cache_key] = {}
+                            self._debug_epoch_sim_stats_cache[cache_key]["pool"] = stats_pool
+                            if stats_pool is not None:
+                                print(f"[debug] 第17步-mask_pooling后特征相似度 | sample(batch_idx={batch_idx}) | "
+                                      f"shape={stats_pool['shape']} | "
+                                      f"mean={stats_pool['mean']:.6f} min={stats_pool['min']:.6f} "
+                                      f"max={stats_pool['max']:.6f} std={stats_pool['std']:.6f}", flush=True)
+                                if stats_pool["mean"] > 0.95:
+                                    print(f"[debug] ⚠️ 问题-mask_pooling后特征过于相似 | mean={stats_pool['mean']:.3f}>0.95（可能mask_pooling有问题）", flush=True)
+                                elif stats_pool["mean"] < 0.5:
+                                    print(f"[debug] ✅ 信息-mask_pooling后特征区分度较好 | mean={stats_pool['mean']:.3f}<0.5", flush=True)
+                except Exception:
+                    pass
             # use attention to update the mask feature, keep text embedding unchanged
             text_feature = pred_embeddings[batch_idx] # (C, D)
             # # add one dimension to text_feature （C, 1, D）
@@ -383,12 +719,132 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             segs_feature = segs_feature + attn_out
             segs_feature = self.model.lisa_norm_final_attn(segs_feature)
 
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    if batch_idx in chosen:
+                        if not hasattr(self, "_debug_epoch_masksim_printed_multi"):
+                            self._debug_epoch_masksim_printed_multi = {}
+                        if not hasattr(self, "_debug_epoch_sim_stats_cache"):
+                            self._debug_epoch_sim_stats_cache = {}
+                        printed = self._debug_epoch_masksim_printed_multi.get(int(epoch_key), set())
+                        if batch_idx not in printed:
+                            print(f"[debug] 第18步-attention后mask特征 | sample(batch_idx={batch_idx}) | segs_feature.shape={tuple(segs_feature.shape)} (C, K, D)", flush=True)
+                            stats_attn = self._cosine_sim_stats_kd(segs_feature[0])
+                            # 保存用于总结
+                            cache_key = f"{epoch_key}_{batch_idx}"
+                            if cache_key not in self._debug_epoch_sim_stats_cache:
+                                self._debug_epoch_sim_stats_cache[cache_key] = {}
+                            self._debug_epoch_sim_stats_cache[cache_key]["attn"] = stats_attn
+                            if stats_attn is not None:
+                                print(f"[debug] 第19步-attention后mask特征相似度 | sample(batch_idx={batch_idx}) | "
+                                      f"shape={stats_attn['shape']} | "
+                                      f"mean={stats_attn['mean']:.6f} min={stats_attn['min']:.6f} "
+                                      f"max={stats_attn['max']:.6f} std={stats_attn['std']:.6f}", flush=True)
+                                if stats_attn["mean"] > 0.95:
+                                    print(f"[debug] ⚠️ 问题-attention后mask特征过于相似 | mean={stats_attn['mean']:.3f}>0.95（可能attention导致特征collapse）", flush=True)
+                                elif stats_attn["mean"] < 0.5:
+                                    print(f"[debug] ✅ 信息-attention后mask特征区分度较好 | mean={stats_attn['mean']:.3f}<0.5", flush=True)
+                except Exception:
+                    pass
+
             # use MLP to reduce the seg_features to 1 dimension
             sam_iou = self.model.lisa_iou_head(segs_feature) # (C, K, 1)
             sam_pred_ious_list.append(sam_iou) # (C, K, 1)
 
             segs_feature = self.model.lisa_embedding_head(segs_feature) # (C, K, D)
             sam_segs_feature_list.append(segs_feature)
+
+            if debug_train_shapes and (not inference):
+                try:
+                    epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                    chosen = getattr(self, "_debug_epoch_sample_indices", {}).get(int(epoch_key), [0])
+                    if batch_idx in chosen:
+                        if not hasattr(self, "_debug_epoch_masksim_printed_multi"):
+                            self._debug_epoch_masksim_printed_multi = {}
+                        printed = self._debug_epoch_masksim_printed_multi.get(int(epoch_key), set())
+                        if batch_idx not in printed:
+                            print(f"[debug] 第20步-IoU回归头输出 | sample(batch_idx={batch_idx}) | sam_iou.shape={tuple(sam_iou.shape)} (C, K, 1)", flush=True)
+                            print(f"[debug] 第21步-embedding_head输出特征 | sample(batch_idx={batch_idx}) | segs_feature.shape={tuple(segs_feature.shape)} (C, K, D)", flush=True)
+                            stats_final = self._cosine_sim_stats_kd(segs_feature[0])
+                            if stats_final is not None:
+                                print(f"[debug] 第22步-最终mask特征相似度 | sample(batch_idx={batch_idx}) | "
+                                      f"shape={stats_final['shape']} | "
+                                      f"mean={stats_final['mean']:.6f} min={stats_final['min']:.6f} "
+                                      f"max={stats_final['max']:.6f} std={stats_final['std']:.6f}", flush=True)
+                                if stats_final["mean"] > 0.95:
+                                    print(f"[debug] ⚠️ 问题-最终mask特征过于相似 | mean={stats_final['mean']:.3f}>0.95（可能attention或embedding_head导致特征collapse）", flush=True)
+                                elif stats_final["mean"] > 0.85:
+                                    print(f"[debug] ⚠️ 注意-最终mask特征相似度偏高 | mean={stats_final['mean']:.3f}>0.85", flush=True)
+                                else:
+                                    print(f"[debug] ✅ 信息-最终mask特征区分度较好 | mean={stats_final['mean']:.3f}<=0.85", flush=True)
+                            
+                            # 打印相似度变化总结（从缓存中获取之前步骤的统计信息）
+                            print(f"\n[debug] ========== 相似度变化总结 (sample batch_idx={batch_idx}) ==========", flush=True)
+                            try:
+                                cache_key = f"{epoch_key}_{batch_idx}"
+                                cache = getattr(self, "_debug_epoch_sim_stats_cache", {}).get(cache_key, {})
+                                
+                                # 1. 初始mask IoU（重新计算，因为segs_fg还在）
+                                stats_mask_iou = self._mask_iou_stats_khw(segs_fg)
+                                if stats_mask_iou:
+                                    print(f"[debug] 步骤1-初始候选mask IoU相似度: mean={stats_mask_iou['mean']:.6f}", flush=True)
+                                
+                                # 2. mask_pooling后特征相似度（从缓存获取）
+                                stats_pool = cache.get("pool")
+                                if stats_pool:
+                                    print(f"[debug] 步骤2-mask_pooling后特征相似度: mean={stats_pool['mean']:.6f}", flush=True)
+                                
+                                # 3. attention后特征相似度（从缓存获取）
+                                stats_attn = cache.get("attn")
+                                if stats_attn:
+                                    print(f"[debug] 步骤3-attention后特征相似度: mean={stats_attn['mean']:.6f}", flush=True)
+                                
+                                # 4. embedding_head后特征相似度（最终）
+                                if stats_final:
+                                    print(f"[debug] 步骤4-embedding_head后特征相似度(最终): mean={stats_final['mean']:.6f}", flush=True)
+                                
+                                # 打印变化趋势
+                                print(f"[debug] 相似度变化趋势:", flush=True)
+                                if stats_mask_iou:
+                                    print(f"[debug]   初始mask IoU: {stats_mask_iou['mean']:.6f}", flush=True)
+                                if stats_pool:
+                                    if stats_mask_iou:
+                                        print(f"[debug]   mask_pooling后: {stats_pool['mean']:.6f} (相对初始mask变化: {stats_pool['mean'] - stats_mask_iou['mean']:+.6f})", flush=True)
+                                    else:
+                                        print(f"[debug]   mask_pooling后: {stats_pool['mean']:.6f}", flush=True)
+                                if stats_attn:
+                                    if stats_pool:
+                                        print(f"[debug]   attention后: {stats_attn['mean']:.6f} (相对pooling变化: {stats_attn['mean'] - stats_pool['mean']:+.6f})", flush=True)
+                                    else:
+                                        print(f"[debug]   attention后: {stats_attn['mean']:.6f}", flush=True)
+                                if stats_final:
+                                    if stats_attn:
+                                        print(f"[debug]   embedding_head后: {stats_final['mean']:.6f} (相对attention变化: {stats_final['mean'] - stats_attn['mean']:+.6f})", flush=True)
+                                    elif stats_pool:
+                                        print(f"[debug]   embedding_head后: {stats_final['mean']:.6f} (相对pooling变化: {stats_final['mean'] - stats_pool['mean']:+.6f})", flush=True)
+                                    else:
+                                        print(f"[debug]   embedding_head后: {stats_final['mean']:.6f}", flush=True)
+                                
+                                # 诊断信息
+                                if stats_final and stats_pool:
+                                    if stats_final['mean'] > stats_pool['mean'] + 0.1:
+                                        print(f"[debug] ⚠️ 警告: embedding_head后相似度显著增加 ({stats_final['mean']:.3f} > {stats_pool['mean']:.3f} + 0.1)，可能特征collapse", flush=True)
+                                    elif stats_final['mean'] < stats_pool['mean'] - 0.1:
+                                        print(f"[debug] ✅ 信息: embedding_head后相似度降低，特征区分度提升", flush=True)
+                                if stats_attn and stats_pool:
+                                    if stats_attn['mean'] > stats_pool['mean'] + 0.1:
+                                        print(f"[debug] ⚠️ 警告: attention后相似度显著增加 ({stats_attn['mean']:.3f} > {stats_pool['mean']:.3f} + 0.1)，可能attention导致特征collapse", flush=True)
+                            except Exception as e:
+                                print(f"[debug] 相似度总结计算失败: {repr(e)}", flush=True)
+                            print(f"[debug] ============================================================\n", flush=True)
+                            
+                            # 标记该 sample 已输出（每个epoch仅对 chosen 的样本各输出一次）
+                            printed.add(batch_idx)
+                            self._debug_epoch_masksim_printed_multi[int(epoch_key)] = printed
+                except Exception as e:
+                    pass
 
 
         if inference:
@@ -415,13 +871,35 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         ce_loss = output.loss  # loss of LLaVA
 
+        # ✅ 打印loss计算时的关键维度（每个epoch只打印一次）
+        if debug_train_shapes and (not inference):
+            try:
+                epoch_key = int(debug_epoch) if debug_epoch is not None else -1
+                if not hasattr(self, "_debug_epoch_loss_printed"):
+                    self._debug_epoch_loss_printed = set()
+                if epoch_key not in self._debug_epoch_loss_printed:
+                    if len(pred_embeddings) > 0 and len(sam_segs_feature_list) > 0:
+                        print(f"[debug] 第18步-loss计算输入维度(batch_idx=0):", flush=True)
+                        print(f"[debug]  - pred_embeddings[0].shape={tuple(pred_embeddings[0].shape)} (C, D)", flush=True)
+                        print(f"[debug]  - sam_segs_feature_list[0].shape={tuple(sam_segs_feature_list[0].shape)} (C, K, D)", flush=True)
+                        if len(sam_ious_list) > 0:
+                            print(f"[debug]  - sam_ious_list[0].shape={tuple(sam_ious_list[0].shape)} (R, K)", flush=True)
+                        if len(sam_iops_list) > 0:
+                            print(f"[debug]  - sam_iops_list[0].shape={tuple(sam_iops_list[0].shape)} (R, K)", flush=True)
+                        if len(sam_pred_ious_list) > 0:
+                            print(f"[debug]  - sam_pred_ious_list[0].shape={tuple(sam_pred_ious_list[0].shape)} (C, K, 1)", flush=True)
+                        print(f"[debug]  - ce_loss.shape={tuple(ce_loss.shape) if hasattr(ce_loss, 'shape') else 'scalar'}", flush=True)
+                    self._debug_epoch_loss_printed.add(epoch_key)
+            except Exception as e:
+                print(f"[TrainShapePipeline] loss维度打印失败: {repr(e)}", flush=True)
+
         # compute align loss
         align_loss = 0.0 
         regression_loss = 0.0
 
         valid_batch = 0
         for batch_idx in range(len(sam_segs_feature_list)):
-            segs_feature = sam_segs_feature_list[batch_idx]  # (K, D) D=256
+            segs_feature = sam_segs_feature_list[batch_idx]  # (C, K, D) D=256
             gt_iou = sam_ious_list[batch_idx]            # (R,K)
             gt_iop = sam_iops_list[batch_idx]            # (R,K)
             pred_iou = sam_pred_ious_list[batch_idx] 
@@ -466,12 +944,45 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         regression_loss = regression_loss * self.regression_loss_weight
         loss = ce_loss + align_loss + regression_loss
 
-        return {
+        out = {
             "loss": loss,
             "ce_loss": ce_loss,
             "align_loss": align_loss,
             "regression_loss": regression_loss,
         }
+
+        # ✅ 参考 finetune_llmseg_copy.py：训练过程中做可视化时，直接复用训练 forward 的输出
+        # 返回与 inference 分支一致的字段格式（list，元素 shape 为 (1,K)），方便训练脚本直接 argmax。
+        if return_vis:
+            pred_similarity = []
+            for batch_idx in range(len(pred_embeddings)):
+                pred_embedding = pred_embeddings[batch_idx]
+                # 多轮对话时取第0轮；一般训练数据是一轮
+                if isinstance(pred_embedding, torch.Tensor) and pred_embedding.dim() == 2 and pred_embedding.shape[0] > 0:
+                    pred_embedding = pred_embedding[0:1]  # (1, D)
+                pred_embedding_normlized = pred_embedding / (pred_embedding.norm(dim=-1, keepdim=True) + 1e-8)
+
+                # sam_segs_feature_list: (C, K, D)，取第0轮
+                sam_features = sam_segs_feature_list[batch_idx][0, :, :]  # (K, D)
+                sam_features_normlized = sam_features / (sam_features.norm(dim=-1, keepdim=True) + 1e-8)
+                similarity = pred_embedding_normlized @ sam_features_normlized.T  # (1, K)
+                pred_similarity.append(similarity)
+
+            pred_ious = []
+            for batch_idx in range(len(sam_pred_ious_list)):
+                # sam_pred_ious_list: (C, K, 1)，取第0轮并转为 (1, K)
+                sam_pred_ious = sam_pred_ious_list[batch_idx][0, :, :]  # (K, 1)
+                pred_ious.append(sam_pred_ious.T)  # (1, K)
+
+            out.update(
+                {
+                    "pred_similarity": pred_similarity,
+                    "gt_masks": masks_list,
+                    "pred_iou": pred_ious,
+                }
+            )
+
+        return out
 
 
     def evaluate(

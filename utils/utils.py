@@ -154,10 +154,22 @@ class ProgressMeter(object):
         return "[" + fmt + "/" + fmt.format(num_batches) + "]"
 
 
-def dict_to_cuda(input_dict, torch_dtype=torch.bfloat16):
+def dict_to_cuda(input_dict, torch_dtype=torch.bfloat16, device=None):
+    """
+    将字典中的 tensor 移动到 CUDA device
+    
+    Args:
+        input_dict: 包含 tensor 的字典
+        torch_dtype: tensor 的数据类型
+        device: 目标 device，如果为 None 则使用默认 CUDA device
+    """
+    if device is None:
+        # 如果没有指定 device，使用默认 CUDA device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     for k, v in input_dict.items():
         if isinstance(input_dict[k], torch.Tensor):
-            input_dict[k] = v.cuda(non_blocking=True)
+            input_dict[k] = v.to(device=device, non_blocking=True)
             if k == "images" or k == "images_clip":
                 input_dict[k] = input_dict[k].to(dtype=torch_dtype)
         elif (
@@ -165,7 +177,7 @@ def dict_to_cuda(input_dict, torch_dtype=torch.bfloat16):
             and len(input_dict[k]) > 0
             and isinstance(input_dict[k][0], torch.Tensor)
         ):
-            input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
+            input_dict[k] = [ele.to(device=device, non_blocking=True) for ele in v]
             if k == "sam_segs_list":
                 input_dict[k] = [ele.to(dtype=torch_dtype) for ele in input_dict[k]] 
     return input_dict

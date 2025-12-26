@@ -50,6 +50,9 @@ def collate_fn_new(
     inferences = []
     origin_segs_list = []
     bbox_list = []
+    segmentation_paths_list = []
+    candidate_mask_paths_list = []
+    debug_meta_list = []
     
     for data in batch:
         image_path_list.append(data.get('image_path'))
@@ -69,6 +72,19 @@ def collate_fn_new(
         inferences.append(data.get('inference'))
         origin_segs_list.append(data.get('segs_origin', None))  # optional
         bbox_list.append(data.get('bbox', None))  # optional
+        # segmentation_paths 可能是字符串或列表，统一处理为字符串
+        seg_paths = data.get('segmentation_paths', [])
+        if isinstance(seg_paths, list) and len(seg_paths) > 0:
+            seg_paths = seg_paths[0]  # 取第一个路径
+        elif isinstance(seg_paths, str):
+            pass  # 已经是字符串
+        else:
+            seg_paths = ""  # 默认为空字符串
+        segmentation_paths_list.append(seg_paths)
+        
+        # candidate_mask_paths_list 应该是列表
+        candidate_mask_paths_list.append(data.get('candidate_mask_paths_list', []))  # optional
+        debug_meta_list.append(data.get("debug_meta", None))
 
     if use_mm_start_end:
         # replace <image> token
@@ -167,6 +183,9 @@ def collate_fn_new(
         "sam_iops_list": iops_list,
         "origin_segs_list": origin_segs_list,
         "bbox_list": bbox_list,
+        "segmentation_paths": segmentation_paths_list,  # GT mask paths
+        "candidate_mask_paths_list": candidate_mask_paths_list,  # SAM candidate mask paths
+        "debug_meta_list": debug_meta_list,  # 每个样本的维度追踪信息（非tensor）
     }
 
 
