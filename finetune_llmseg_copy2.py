@@ -37,6 +37,7 @@ from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, collate_fn, ValDataSet_ReasonSeg, collate_fn_new, ValDataSet_LLMSeg
 from utils.llm_seg_dataset import LLMSegDataset
 from utils.robot_arm_dataset import RobotArmDataset
+from utils.vigor_dataset import VIGORDataset
 from utils.sam_mask_reader import SAM_Mask_Reader
 from utils.sam_mask_reader_png import SAM_Mask_Reader_PNG
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -70,6 +71,12 @@ def parse_args(args):
     parser.add_argument(
         "--dataset", default="refer_seg||reason_seg", type=str
     )
+    # VIGOR-100K数据集参数
+    parser.add_argument("--vigor_data_base_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K", type=str, help="VIGOR-100K数据集根目录")
+    parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
+    parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
+    parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR验证集划分（train/test/unseen）")
+    parser.add_argument("--vigor_max_samples", default=None, type=int, help="VIGOR数据集最多使用多少个样本（None表示使用全部）")
     
     parser.add_argument("--sample_rates", default="10, 1", type=str)
 

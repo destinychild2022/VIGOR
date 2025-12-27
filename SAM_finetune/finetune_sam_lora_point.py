@@ -81,7 +81,15 @@ class SAMDataset(Dataset):
         
         # 加载标注数据
         with open(annotations_file, 'r', encoding='utf-8') as f:
-            self.annotations = json.load(f)
+            data = json.load(f)
+        
+        # ✅ 支持VIGOR-100K格式：如果data是dict且包含"annotations"字段，提取annotations
+        if isinstance(data, dict) and 'annotations' in data:
+            self.annotations = data['annotations']
+        elif isinstance(data, list):
+            self.annotations = data
+        else:
+            raise ValueError(f"Unsupported annotations format in {annotations_file}")
         
         self.images_dir = images_dir
         self.additional_image_dirs = additional_image_dirs or []
@@ -102,11 +110,19 @@ class SAMDataset(Dataset):
             # ✅ 根据数据集名称查找图像（确保图像和mask来自同一个数据集）
             dataset_name = ann.get('_dataset_name', None)
             img_path = self._find_image(ann['img_name'], dataset_name=dataset_name)
-            # gt_path可能是绝对路径或相对路径
-            if os.path.isabs(ann.get('gt_path', '')):
-                mask_path = ann['gt_path']
+            
+            # ✅ 处理gt_path：可能是绝对路径、相对路径（相对于images_dir）或只有文件名
+            gt_path = ann.get('gt_path', '')
+            if os.path.isabs(gt_path):
+                mask_path = gt_path
+            elif '/' in gt_path or '\\' in gt_path:
+                # 相对路径（如 "masks/1_part_00_Lever.usd.png"）
+                # 对于VIGOR-100K：images_dir是train目录，gt_path是"masks/xxx.png"
+                # 所以mask_path应该是images_dir + gt_path（相对于images_dir）
+                mask_path = os.path.join(self.images_dir, gt_path.replace('\\', '/'))
             else:
-                mask_path = os.path.join(masks_dir, os.path.basename(ann['gt_path']))
+                # 只有文件名，使用masks_dir
+                mask_path = os.path.join(masks_dir, gt_path)
             
             if img_path and os.path.exists(img_path) and os.path.exists(mask_path):
                 self.valid_annotations.append(ann)
@@ -161,11 +177,18 @@ class SAMDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         original_size = image.shape[:2]  # (H, W)
         
-        # 加载mask（gt_path可能是绝对路径）
-        if os.path.isabs(ann.get('gt_path', '')):
-            mask_path = ann['gt_path']
+        # ✅ 加载mask（处理VIGOR-100K格式的gt_path）
+        gt_path = ann.get('gt_path', '')
+        if os.path.isabs(gt_path):
+            mask_path = gt_path
+        elif '/' in gt_path or '\\' in gt_path:
+            # 相对路径（如 "masks/1_part_00_Lever.usd.png"），相对于images_dir
+            # 对于VIGOR-100K：images_dir是train目录，gt_path是"masks/xxx.png"
+            # 所以mask_path应该是images_dir + gt_path
+            mask_path = os.path.join(self.images_dir, gt_path.replace('\\', '/'))
         else:
-            mask_path = os.path.join(self.masks_dir, os.path.basename(ann['gt_path']))
+            # 只有文件名，使用masks_dir
+            mask_path = os.path.join(self.masks_dir, gt_path)
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         
         # 验证图像和mask尺寸是否一致（不强制对齐，如果尺寸不一致则报错）
@@ -178,25 +201,32 @@ class SAMDataset(Dataset):
         mask = (mask < 128).astype(np.uint8)  # 转换为二值mask (0/1)
         ground_truth_mask = torch.from_numpy(mask.astype(np.float32))
         
-        # ✅ 使用 affordance_points 的第一个点作为 prompt（而不是 bbox）
-        affordance_points = ann.get('affordance_points', [])
-        
-        # ❌ 如果没有 affordance_points，直接报错
-        if len(affordance_points) == 0:
-            raise ValueError(
-                f"标注中缺少 affordance_points 字段: "
-                f"图像={img_path}, 标注={ann.get('img_name', 'unknown')}"
-            )
-        
-        # ✅ 只使用第一个点
-        first_point = affordance_points[0]
-        if len(first_point) < 2:
-            raise ValueError(
-                f"affordance_points 第一个点格式错误（需要至少2个坐标）: "
-                f"图像={img_path}, 点={first_point}"
-            )
-        
-        x, y = first_point[0], first_point[1]
+        # ✅ 优先使用 points 字段（VIGOR-100K格式），如果没有则使用 affordance_points
+        points = ann.get('points', [])
+        if len(points) == 0:
+            # 回退到affordance_points（兼容robot_arm数据集）
+            affordance_points = ann.get('affordance_points', [])
+            if len(affordance_points) == 0:
+                raise ValueError(
+                    f"标注中缺少 points 或 affordance_points 字段: "
+                    f"图像={img_path}, 标注={ann.get('img_name', 'unknown')}"
+                )
+            # 使用affordance_points的第一个点
+            first_point = affordance_points[0]
+            if len(first_point) < 2:
+                raise ValueError(
+                    f"affordance_points 第一个点格式错误（需要至少2个坐标）: "
+                    f"图像={img_path}, 点={first_point}"
+                )
+            x, y = first_point[0], first_point[1]
+        else:
+            # ✅ 使用points字段（VIGOR-100K格式：[x, y]）
+            if len(points) < 2:
+                raise ValueError(
+                    f"points 字段格式错误（需要至少2个坐标）: "
+                    f"图像={img_path}, points={points}"
+                )
+            x, y = points[0], points[1]
         
         # 如果坐标是归一化的（0-1之间），转换为像素坐标
         if 0 <= x <= 1 and 0 <= y <= 1:
@@ -1016,12 +1046,21 @@ def main():
                        help="数据加载器工作进程数")
     parser.add_argument("--save_every", type=int, default=5,
                        help="每N个epoch保存一次")
+    parser.add_argument("--val_every", type=int, default=1,
+                       help="每N个epoch验证一次（默认每个epoch都验证，设为更大值可加速训练）")
     parser.add_argument("--swanlab_api_key", type=str, default=None,
                        help="SwanLab API key")
     parser.add_argument("--swanlab_project", type=str, default="SAM-Finetune",
                        help="SwanLab项目名称")
     parser.add_argument("--swanlab_experiment_name", type=str, default=None,
                        help="SwanLab实验名称")
+    parser.add_argument("--dataset_type", type=str, default="robot_arm",
+                       choices=["robot_arm", "vigor"],
+                       help="数据集类型：robot_arm 或 vigor")
+    parser.add_argument("--vigor_annotations_file", type=str, default=None,
+                       help="VIGOR数据集的all_annotations.json文件路径（当dataset_type=vigor时使用）")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="从checkpoint恢复训练（checkpoint文件路径，例如：./sam_output/sam_finetuned_vigor_point/best_model.pth）")
     
     args = parser.parse_args()
     
@@ -1125,84 +1164,121 @@ def main():
         print(f"可训练参数: {trainable_params:,} / {total_params:,} "
               f"({100 * trainable_params / total_params:.2f}%)")
     
-    # 合并三个数据集（robot_arm_01, robot_arm_02, robot_arm_03）
-    # 每个数据集都有：图像目录、mask目录，可能还有annotations.json
-    datasets_config = []
-    # args.images_dir应该是picture目录，直接使用它而不是os.path.dirname
-    base_images_dir = args.images_dir
-    base_masks_dir = "/opt/data/private/LLMSeg/dataset/GT_mask"
+    # ✅ 初始化训练状态变量（将在checkpoint加载时更新）
+    start_epoch = 1
+    best_val_loss = float('inf')
     
-    for dataset_name in ['robot_arm_01', 'robot_arm_02', 'robot_arm_03']:
-        images_dir = os.path.join(base_images_dir, dataset_name)
-        masks_dir = os.path.join(base_masks_dir, dataset_name, "masks")
-        # annotations.json在每个数据集的mask目录下
-        annotations_file = os.path.join(base_masks_dir, dataset_name, "annotations.json")
+    # ✅ 根据数据集类型加载数据
+    if args.dataset_type == "vigor":
+        # VIGOR-100K数据集
+        if args.vigor_annotations_file is None:
+            raise ValueError("使用VIGOR数据集时，必须指定--vigor_annotations_file参数")
         
-        if os.path.exists(images_dir) and os.path.exists(masks_dir):
-            config = {
-                'name': dataset_name,
-                'images_dir': images_dir,
-                'masks_dir': masks_dir,
-                'annotations_file': annotations_file if os.path.exists(annotations_file) else None
-            }
-            datasets_config.append(config)
-            print(f"找到数据集 {dataset_name}: 图像={images_dir}, mask={masks_dir}, 标注文件={'存在' if config['annotations_file'] else '不存在（将从mask文件名生成）'}")
-    
-    # 合并所有数据集的标注
-    all_annotations = []
-    for config in datasets_config:
-        if config['annotations_file']:
-            # 如果有标注文件，直接加载
-            with open(config['annotations_file'], 'r', encoding='utf-8') as f:
-                annotations = json.load(f)
-                # 更新gt_path以指向正确的mask目录
-                for ann in annotations:
-                    # gt_path可能是相对路径（如 robot_arm_01\masks\1_seat_mask.png）或文件名
-                    gt_path = ann.get('gt_path', '')
-                    # 统一处理路径分隔符
-                    gt_path = gt_path.replace('\\', '/')
-                    # 提取mask文件名
-                    mask_filename = os.path.basename(gt_path)
-                    # 使用绝对路径
-                    ann['gt_path'] = os.path.join(config['masks_dir'], mask_filename).replace('\\', '/')
-                    ann['_dataset_name'] = config['name']
-                all_annotations.extend(annotations)
+        print(f"使用VIGOR-100K数据集")
+        print(f"标注文件: {args.vigor_annotations_file}")
+        print(f"图像目录: {args.images_dir}")
+        
+        # 直接加载VIGOR的all_annotations.json
+        with open(args.vigor_annotations_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 提取annotations字段
+        if isinstance(data, dict) and 'annotations' in data:
+            all_annotations = data['annotations']
+        elif isinstance(data, list):
+            all_annotations = data
         else:
-            # 如果没有标注文件，从mask文件名生成
-            mask_files = [f for f in os.listdir(config['masks_dir']) if f.endswith(('.png', '.jpg'))]
-            for mask_file in mask_files:
-                # mask文件名格式: {image_number}_{object_name}_mask.png
-                # 例如: 1_core_mask.png -> img_name=1.png, object=core
-                parts = mask_file.replace('_mask.png', '').replace('_mask.jpg', '').split('_')
-                if len(parts) >= 2:
-                    img_number = parts[0]
-                    object_name = '_'.join(parts[1:])
-                    # 尝试找到对应的图像文件
-                    img_name = f"{img_number}.png"
-                    img_path = os.path.join(config['images_dir'], img_name)
-                    if not os.path.exists(img_path):
-                        img_name = f"{img_number}.jpg"
+            raise ValueError(f"Unsupported VIGOR annotations format in {args.vigor_annotations_file}")
+        
+        print(f"加载了 {len(all_annotations)} 个VIGOR标注")
+        
+        # VIGOR数据集配置（图像目录就是args.images_dir）
+        datasets_config = [{
+            'name': 'vigor',
+            'images_dir': args.images_dir,
+            'masks_dir': os.path.join(os.path.dirname(args.images_dir), 'masks'),  # VIGOR的masks在train/masks
+        }]
+        
+    else:
+        # robot_arm数据集（原有逻辑）
+        # 合并三个数据集（robot_arm_01, robot_arm_02, robot_arm_03）
+        # 每个数据集都有：图像目录、mask目录，可能还有annotations.json
+        datasets_config = []
+        # args.images_dir应该是picture目录，直接使用它而不是os.path.dirname
+        base_images_dir = args.images_dir
+        base_masks_dir = "/opt/data/private/LLMSeg/dataset/GT_mask"
+        
+        for dataset_name in ['robot_arm_01', 'robot_arm_02', 'robot_arm_03']:
+            images_dir = os.path.join(base_images_dir, dataset_name)
+            masks_dir = os.path.join(base_masks_dir, dataset_name, "masks")
+            # annotations.json在每个数据集的mask目录下
+            annotations_file = os.path.join(base_masks_dir, dataset_name, "annotations.json")
+            
+            if os.path.exists(images_dir) and os.path.exists(masks_dir):
+                config = {
+                    'name': dataset_name,
+                    'images_dir': images_dir,
+                    'masks_dir': masks_dir,
+                    'annotations_file': annotations_file if os.path.exists(annotations_file) else None
+                }
+                datasets_config.append(config)
+                print(f"找到数据集 {dataset_name}: 图像={images_dir}, mask={masks_dir}, 标注文件={'存在' if config['annotations_file'] else '不存在（将从mask文件名生成）'}")
+        
+        # 合并所有数据集的标注
+        all_annotations = []
+        for config in datasets_config:
+            if config['annotations_file']:
+                # 如果有标注文件，直接加载
+                with open(config['annotations_file'], 'r', encoding='utf-8') as f:
+                    annotations = json.load(f)
+                    # 更新gt_path以指向正确的mask目录
+                    for ann in annotations:
+                        # gt_path可能是相对路径（如 robot_arm_01\masks\1_seat_mask.png）或文件名
+                        gt_path = ann.get('gt_path', '')
+                        # 统一处理路径分隔符
+                        gt_path = gt_path.replace('\\', '/')
+                        # 提取mask文件名
+                        mask_filename = os.path.basename(gt_path)
+                        # 使用绝对路径
+                        ann['gt_path'] = os.path.join(config['masks_dir'], mask_filename).replace('\\', '/')
+                        ann['_dataset_name'] = config['name']
+                    all_annotations.extend(annotations)
+            else:
+                # 如果没有标注文件，从mask文件名生成
+                mask_files = [f for f in os.listdir(config['masks_dir']) if f.endswith(('.png', '.jpg'))]
+                for mask_file in mask_files:
+                    # mask文件名格式: {image_number}_{object_name}_mask.png
+                    # 例如: 1_core_mask.png -> img_name=1.png, object=core
+                    parts = mask_file.replace('_mask.png', '').replace('_mask.jpg', '').split('_')
+                    if len(parts) >= 2:
+                        img_number = parts[0]
+                        object_name = '_'.join(parts[1:])
+                        # 尝试找到对应的图像文件
+                        img_name = f"{img_number}.png"
                         img_path = os.path.join(config['images_dir'], img_name)
-                    
-                    if os.path.exists(img_path):
-                        # 加载图像获取尺寸
-                        import cv2
-                        img = cv2.imread(img_path)
-                        if img is not None:
-                            h, w = img.shape[:2]
-                            ann = {
-                                'img_name': img_name,
-                                'bbox': [0, 0, 0, 0],  # 将从mask计算
-                                'object': object_name,
-                                'action': 'grasp',  # 默认值
-                                'gt_path': os.path.join(config['masks_dir'], mask_file).replace('\\', '/'),
-                                'points': [],
-                                'affordance_points': [],
-                                'height': h,
-                                'width': w,
-                                '_dataset_name': config['name']
-                            }
-                            all_annotations.append(ann)
+                        if not os.path.exists(img_path):
+                            img_name = f"{img_number}.jpg"
+                            img_path = os.path.join(config['images_dir'], img_name)
+                        
+                        if os.path.exists(img_path):
+                            # 加载图像获取尺寸
+                            import cv2
+                            img = cv2.imread(img_path)
+                            if img is not None:
+                                h, w = img.shape[:2]
+                                ann = {
+                                    'img_name': img_name,
+                                    'bbox': [0, 0, 0, 0],  # 将从mask计算
+                                    'object': object_name,
+                                    'action': 'grasp',  # 默认值
+                                    'gt_path': os.path.join(config['masks_dir'], mask_file).replace('\\', '/'),
+                                    'points': [],
+                                    'affordance_points': [],
+                                    'height': h,
+                                    'width': w,
+                                    '_dataset_name': config['name']
+                                }
+                                all_annotations.append(ann)
     
     print(f"\n合并后的总标注数: {len(all_annotations)}")
     
@@ -1220,8 +1296,14 @@ def main():
     main_images_dir = all_image_dirs[0] if all_image_dirs else args.images_dir
     additional_image_dirs = all_image_dirs[1:] if len(all_image_dirs) > 1 else []
     
-    # 使用第一个数据集的mask目录作为主目录（实际会从标注中的gt_path读取）
-    main_masks_dir = datasets_config[0]['masks_dir'] if datasets_config else os.path.join(args.dataset_dir, "masks")
+    # ✅ 使用第一个数据集的mask目录作为主目录（实际会从标注中的gt_path读取）
+    # 对于VIGOR数据集，masks_dir在数据集配置中已设置
+    # 对于robot_arm数据集，使用第一个数据集的masks_dir
+    if args.dataset_type == "vigor":
+        # VIGOR数据集：masks在images_dir的masks子目录
+        main_masks_dir = os.path.join(args.images_dir, "masks")
+    else:
+        main_masks_dir = datasets_config[0]['masks_dir'] if datasets_config else os.path.join(args.dataset_dir, "masks")
 
     
     
@@ -1409,18 +1491,30 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=BatchSamplerWrapper(train_batch_sampler),
-        num_workers=0,  # 暂时设为0，避免多进程问题
-        pin_memory=True,
+        num_workers=args.num_workers,  # ✅ 使用命令行参数，启用多进程数据加载
+        pin_memory=True,  # ✅ 加速GPU传输
+        prefetch_factor=2 if args.num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
+        persistent_workers=True if args.num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
         collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_sampler=BatchSamplerWrapper(val_batch_sampler),
-        num_workers=0,  # 暂时设为0，避免多进程问题
-        pin_memory=True,
+        num_workers=args.num_workers,  # ✅ 使用命令行参数，启用多进程数据加载
+        pin_memory=True,  # ✅ 加速GPU传输
+        prefetch_factor=2 if args.num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
+        persistent_workers=True if args.num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
         collate_fn=collate_fn
     )
+    
+    # ✅ 打印数据加载器配置信息
+    print(f"\n数据加载器配置:")
+    print(f"  训练集 num_workers: {args.num_workers} ({'多进程' if args.num_workers > 0 else '单进程'})")
+    print(f"  验证集 num_workers: {args.num_workers} ({'多进程' if args.num_workers > 0 else '单进程'})")
+    print(f"  pin_memory: True")
+    print(f"  prefetch_factor: {2 if args.num_workers > 0 else 'None'}")
+    print(f"  persistent_workers: {True if args.num_workers > 0 else False}")
     
     # 优化器和学习率调度器
     optimizer = optim.AdamW(
@@ -1433,6 +1527,52 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
     
+    # ✅ 从checkpoint恢复训练（如果指定）
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"\n从checkpoint恢复训练: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # 加载模型权重
+            if 'model_state_dict' in checkpoint:
+                sam.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                print("✅ 模型权重加载成功")
+            
+            # 加载LoRA权重（如果使用LoRA）
+            if args.use_lora and PEFT_AVAILABLE and 'lora_state_dict' in checkpoint:
+                try:
+                    actual_model = sam.module if isinstance(sam, nn.DataParallel) else sam
+                    if hasattr(actual_model.mask_decoder, '_peft_model'):
+                        peft_model = actual_model.mask_decoder._peft_model
+                        peft_model.load_state_dict(checkpoint['lora_state_dict'], strict=False)
+                        print("✅ LoRA权重加载成功")
+                except Exception as e:
+                    print(f"⚠️  LoRA权重加载失败（可能配置不匹配）: {e}")
+            
+            # 恢复optimizer状态
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("✅ Optimizer状态恢复成功")
+                except Exception as e:
+                    print(f"⚠️  Optimizer状态恢复失败: {e}")
+            
+            # 恢复scheduler状态（需要知道当前epoch）
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                # 恢复scheduler到正确的epoch
+                for _ in range(checkpoint['epoch']):
+                    scheduler.step()
+                print(f"✅ Scheduler状态恢复成功（当前学习率: {optimizer.param_groups[0]['lr']:.6f})")
+                print(f"✅ 从epoch {start_epoch}继续训练")
+            
+            if 'val_loss' in checkpoint:
+                best_val_loss = checkpoint['val_loss']
+                print(f"✅ 恢复最佳验证损失: {best_val_loss:.4f}")
+        else:
+            print(f"⚠️  Checkpoint文件不存在: {args.resume}")
+            print("   将从头开始训练")
+    
     # 混合精度训练
     scaler = GradScaler()
     
@@ -1444,11 +1584,11 @@ def main():
         'iou': 0.5  # ✅ 启用IoU损失，直接约束位置重合度
     }
     
-    # 训练循环
-    best_val_loss = float('inf')
+    # 训练循环（best_val_loss和start_epoch已在checkpoint加载时设置）
+    # best_val_loss 和 start_epoch 在checkpoint加载时已设置
     
     print("\n开始训练...")
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n{'='*50}")
         print(f"Epoch {epoch}/{args.epochs}")
         print(f"{'='*50}")
@@ -1458,11 +1598,16 @@ def main():
             sam, train_loader, optimizer, scaler, device, epoch, loss_weights, swanlab_run
         )
         
-        # 验证（带可视化）
-        visualize_dir = os.path.join(args.output_dir, "val_vis")
-        val_loss, val_loss_dict = validate(
-            sam, val_loader, device, loss_weights, visualize_dir=visualize_dir, epoch=epoch
-        )
+        # 验证（带可视化）- 根据val_every参数决定是否验证
+        if epoch % args.val_every == 0 or epoch == args.epochs:
+            visualize_dir = os.path.join(args.output_dir, "val_vis")
+            val_loss, val_loss_dict = validate(
+                sam, val_loader, device, loss_weights, visualize_dir=visualize_dir, epoch=epoch
+            )
+        else:
+            # 跳过验证，使用上一次的验证损失（或设为None）
+            val_loss = None
+            val_loss_dict = {'dice': 0.0, 'focal': 0.0, 'ce': 0.0, 'iou': 0.0}
         
         # 更新学习率
         scheduler.step()
@@ -1471,29 +1616,34 @@ def main():
         # 打印结果
         print(f"\n训练损失: {train_loss:.4f} (dice: {train_loss_dict['dice']:.4f}, "
               f"ce: {train_loss_dict['ce']:.4f}, iou: {train_loss_dict['iou']:.4f})")
-        print(f"验证损失: {val_loss:.4f} (dice: {val_loss_dict['dice']:.4f}, "
-              f"ce: {val_loss_dict['ce']:.4f}, iou: {val_loss_dict['iou']:.4f})")
+        if val_loss is not None:
+            print(f"验证损失: {val_loss:.4f} (dice: {val_loss_dict['dice']:.4f}, "
+                  f"ce: {val_loss_dict['ce']:.4f}, iou: {val_loss_dict['iou']:.4f})")
+        else:
+            print(f"验证: 跳过（val_every={args.val_every}）")
         print(f"学习率: {current_lr:.6f}")
         
         # 记录到SwanLab
         if swanlab_run is not None:
-            swanlab_run.log({
+            log_dict = {
                 'epoch': epoch,
                 'train/loss': train_loss,
                 'train/dice_loss': train_loss_dict['dice'],
-                # 'train/focal_loss': train_loss_dict['focal'],
                 'train/ce_loss': train_loss_dict['ce'],
                 'train/iou_loss': train_loss_dict['iou'],
-                'val/loss': val_loss,
-                'val/dice_loss': val_loss_dict['dice'],
-                # 'val/focal_loss': val_loss_dict['focal'],
-                'val/ce_loss': val_loss_dict['ce'],
-                'val/iou_loss': val_loss_dict['iou'],
                 'learning_rate': current_lr,
-            }, step=epoch)
+            }
+            if val_loss is not None:
+                log_dict.update({
+                    'val/loss': val_loss,
+                    'val/dice_loss': val_loss_dict['dice'],
+                    'val/ce_loss': val_loss_dict['ce'],
+                    'val/iou_loss': val_loss_dict['iou'],
+                })
+            swanlab_run.log(log_dict, step=epoch)
         
-        # 保存最佳模型
-        if val_loss < best_val_loss:
+        # 保存最佳模型（仅在验证时更新）
+        if val_loss is not None and val_loss < best_val_loss:
             best_val_loss = val_loss
             # 确保输出目录存在
             os.makedirs(args.output_dir, exist_ok=True)

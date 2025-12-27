@@ -7,13 +7,19 @@
 SAM_CHECKPOINT="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # 设置数据集路径
-# 数据集包含：原图、mask和annotations.json
-# 注意：代码会自动遍历picture目录下的robot_arm_01, robot_arm_02, robot_arm_03三个子目录
+# VIGOR-100K数据集
+DATASET_TYPE="vigor"
+VIGOR_ANNOTATIONS_FILE="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train/all_annotations.json"
+IMAGES_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train"  # VIGOR训练集图像目录
 DATASET_DIR="/opt/data/private/LLMSeg/dataset"  # 保留用于兼容性，实际不使用
-IMAGES_DIR="/opt/data/private/LLMSeg/dataset/raw_pic"  # 父目录，代码会自动遍历子目录
 
 # 设置输出目录
-OUTPUT_DIR="./sam_output/sam_finetuned_robot_arm_point2"
+OUTPUT_DIR="./sam_output/sam_finetuned_vigor_point"
+
+# ✅ 设置是否从checkpoint恢复训练（如果需要继续训练，设置为checkpoint路径）
+# 例如：RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
+# 如果不需要恢复，设置为空字符串 "" 或注释掉
+RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
 
 # 设置GPU
 GPU_IDS="0"
@@ -26,31 +32,81 @@ if [ ! -f "$SAM_CHECKPOINT" ]; then
 fi
 
 # 检查数据集目录是否存在
-# 检查原图目录（应该包含robot_arm_01, robot_arm_02, robot_arm_03子目录）
-if [ ! -d "$IMAGES_DIR" ]; then
-    echo "Error: Images directory not found at $IMAGES_DIR"
-    exit 1
-fi
-
-# 检查mask目录
-MASKS_DIR="/opt/data/private/LLMSeg/dataset/GT_mask"
-if [ ! -d "$MASKS_DIR" ]; then
-    echo "Error: Masks directory not found at $MASKS_DIR"
-    exit 1
-fi
-
-# 检查是否有至少一个数据集子目录
-if [ ! -d "$IMAGES_DIR/robot_arm_01" ] && [ ! -d "$IMAGES_DIR/robot_arm_02" ] && [ ! -d "$IMAGES_DIR/robot_arm_03" ]; then
-    echo "Warning: No dataset subdirectories found in $IMAGES_DIR (expected robot_arm_01, robot_arm_02, or robot_arm_03)"
+if [ "$DATASET_TYPE" = "vigor" ]; then
+    # VIGOR-100K数据集检查
+    if [ ! -d "$IMAGES_DIR" ]; then
+        echo "Error: VIGOR images directory not found at $IMAGES_DIR"
+        exit 1
+    fi
+    
+    if [ ! -f "$VIGOR_ANNOTATIONS_FILE" ]; then
+        echo "Error: VIGOR annotations file not found at $VIGOR_ANNOTATIONS_FILE"
+        exit 1
+    fi
+    
+    MASKS_DIR="$IMAGES_DIR/masks"
+    if [ ! -d "$MASKS_DIR" ]; then
+        echo "Warning: VIGOR masks directory not found at $MASKS_DIR"
+    fi
+else
+    # robot_arm数据集检查（原有逻辑）
+    if [ ! -d "$IMAGES_DIR" ]; then
+        echo "Error: Images directory not found at $IMAGES_DIR"
+        exit 1
+    fi
+    
+    MASKS_DIR="/opt/data/private/LLMSeg/dataset/GT_mask"
+    if [ ! -d "$MASKS_DIR" ]; then
+        echo "Error: Masks directory not found at $MASKS_DIR"
+        exit 1
+    fi
+    
+    # 检查是否有至少一个数据集子目录
+    if [ ! -d "$IMAGES_DIR/robot_arm_01" ] && [ ! -d "$IMAGES_DIR/robot_arm_02" ] && [ ! -d "$IMAGES_DIR/robot_arm_03" ]; then
+        echo "Warning: No dataset subdirectories found in $IMAGES_DIR (expected robot_arm_01, robot_arm_02, or robot_arm_03)"
+    fi
 fi
 
 # 显示参数
-echo "=== SAM模型LoRA微调（使用affordance points） ==="
-echo "SAM Checkpoint: $SAM_CHECKPOINT"
-echo "Images Directory: $IMAGES_DIR (将自动遍历robot_arm_01/02/03子目录)"
-echo "Masks Directory: $MASKS_DIR (将自动遍历robot_arm_01/02/03子目录)"
+echo "=== SAM模型LoRA微调（使用points） ==="
+echo "Dataset Type: $DATASET_TYPE"
+if [ "$DATASET_TYPE" = "vigor" ]; then
+    echo "SAM Checkpoint: $SAM_CHECKPOINT"
+    echo "VIGOR Annotations File: $VIGOR_ANNOTATIONS_FILE"
+    echo "Images Directory: $IMAGES_DIR"
+    echo "Masks Directory: $MASKS_DIR"
+else
+    echo "SAM Checkpoint: $SAM_CHECKPOINT"
+    echo "Images Directory: $IMAGES_DIR (将自动遍历robot_arm_01/02/03子目录)"
+    echo "Masks Directory: $MASKS_DIR (将自动遍历robot_arm_01/02/03子目录)"
+fi
+# 切换到脚本所在目录（需要在路径检查之前切换）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+# ✅ 将相对路径转换为绝对路径（用于checkpoint检查）
+# 注意：这个转换需要在cd到SCRIPT_DIR之后进行
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    # 如果路径是相对路径，转换为基于SCRIPT_DIR的绝对路径
+    if [[ "$RESUME_CHECKPOINT" != /* ]]; then
+        RESUME_CHECKPOINT="$SCRIPT_DIR/$RESUME_CHECKPOINT"
+    fi
+fi
+
 echo "Output Directory: $OUTPUT_DIR"
 echo "GPU IDs: $GPU_IDS"
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    echo "Resume Checkpoint: $RESUME_CHECKPOINT"
+    if [ -f "$RESUME_CHECKPOINT" ]; then
+        echo "  ✅ Checkpoint文件存在，将从checkpoint恢复训练"
+    else
+        echo "  ⚠️  Checkpoint文件不存在，将从头开始训练"
+        # 如果文件不存在，清空RESUME_CHECKPOINT，避免传递无效参数
+        RESUME_CHECKPOINT=""
+    fi
+else
+    echo "Resume Checkpoint: 无（从头开始训练）"
+fi
 echo "SwanLab: 已启用，将记录训练曲线"
 echo ""
 
@@ -60,10 +116,6 @@ mkdir -p "$OUTPUT_DIR"
 # 设置SwanLab API Key
 SWANLAB_API_KEY="BBd5HKuM6sIhTwyWmgZ6Z"
 export SWANLAB_API_KEY=$SWANLAB_API_KEY
-
-# 切换到脚本所在目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR" || exit 1
 
 # 激活虚拟环境（优先使用项目根目录的 .venv）
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -76,28 +128,60 @@ else
 fi
 
 # 启动微调
-echo "Starting SAM LoRA fine-tuning (使用 affordance points)..."
-python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
-    --sam_checkpoint "$SAM_CHECKPOINT" \
-    --dataset_dir "$DATASET_DIR" \
-    --images_dir "$IMAGES_DIR" \
-    --output_dir "$OUTPUT_DIR" \
-    --device "cuda" \
-    --batch_size 8 \
-    --epochs 200 \
-    --lr 1e-4 \
-    --weight_decay 1e-4 \
-    --use_lora \
-    --lora_r 32 \
-    --lora_alpha 64 \
-    --lora_dropout 0.1 \
-    --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
-    --val_split 0.1 \
-    --num_workers 8 \
-    --save_every 20 \
-    --swanlab_api_key "$SWANLAB_API_KEY" \
-    --swanlab_project "SAM-Finetune" \
-    --swanlab_experiment_name "SAM-LoRA-robot-arm-point"
+if [ "$DATASET_TYPE" = "vigor" ]; then
+    echo "Starting SAM LoRA fine-tuning with VIGOR-100K dataset (使用 points)..."
+    # 设置PyTorch内存优化（避免内存碎片）
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+        --sam_checkpoint "$SAM_CHECKPOINT" \
+        --dataset_dir "$DATASET_DIR" \
+        --images_dir "$IMAGES_DIR" \
+        --output_dir "$OUTPUT_DIR" \
+        --device "cuda" \
+        --batch_size 12 \
+        --epochs 200 \
+        --lr 1e-4 \
+        --weight_decay 1e-4 \
+        --use_lora \
+        --lora_r 32 \
+        --lora_alpha 64 \
+        --lora_dropout 0.1 \
+        --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+        --val_split 0.1 \
+        --num_workers 16 \
+        --save_every 1 \
+        --dataset_type "vigor" \
+        --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
+        $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+        --swanlab_api_key "$SWANLAB_API_KEY" \
+        --swanlab_project "SAM-Finetune" \
+        --swanlab_experiment_name "SAM-LoRA-vigor-point"
+else
+    echo "Starting SAM LoRA fine-tuning with robot_arm dataset (使用 affordance points)..."
+    python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+        --sam_checkpoint "$SAM_CHECKPOINT" \
+        --dataset_dir "$DATASET_DIR" \
+        --images_dir "$IMAGES_DIR" \
+        --output_dir "$OUTPUT_DIR" \
+        --device "cuda" \
+        --batch_size 8 \
+        --epochs 200 \
+        --lr 1e-4 \
+        --weight_decay 1e-4 \
+        --use_lora \
+        --lora_r 32 \
+        --lora_alpha 64 \
+        --lora_dropout 0.1 \
+        --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+        --val_split 0.1 \
+        --num_workers 8 \
+        --save_every 20 \
+        --dataset_type "robot_arm" \
+        $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+        --swanlab_api_key "$SWANLAB_API_KEY" \
+        --swanlab_project "SAM-Finetune" \
+        --swanlab_experiment_name "SAM-LoRA-robot-arm-point"
+fi
 
 echo ""
 echo "Fine-tuning completed!"
