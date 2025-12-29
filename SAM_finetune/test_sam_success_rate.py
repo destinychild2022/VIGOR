@@ -426,6 +426,11 @@ def load_candidate_masks_from_dir(masks_dir: str) -> List[np.ndarray]:
     
     Returns:
         候选masks列表，格式：0=掩码区域，1=背景
+    
+    注意：VIGOR数据集中保存的mask格式：
+        - 白色（255）= 掩码区域
+        - 黑色（0）= 背景
+    这与GT mask格式相反（GT mask中黑色是掩码区域，白色是背景）
     """
     if not os.path.exists(masks_dir):
         return []
@@ -440,14 +445,310 @@ def load_candidate_masks_from_dir(masks_dir: str) -> List[np.ndarray]:
         if mask is None:
             continue
         
-        # 保存的mask格式：白色背景（255），黑色mask（0）
+        # VIGOR数据集保存的mask格式：白色（255）= 掩码区域，黑色（0）= 背景
         # 转换为统一格式：0=掩码区域，1=背景
-        # 注意：保存时mask是bool数组，True=掩码区域，保存为黑色(0)
-        # 所以：黑色(0)=掩码区域，白色(255)=背景
-        mask_binary = (mask > 0).astype(np.uint8)  # 黑色(0)->0(掩码)，白色(255)->1(背景)
+        # 所以：白色(255)->0(掩码)，黑色(0)->1(背景)
+        mask_binary = (mask == 0).astype(np.uint8)  # 黑色(0)->1(背景)，白色(255)->0(掩码)
         candidate_masks.append(mask_binary)
     
     return candidate_masks
+
+
+def test_vigor_success_rate(
+    annotations_file: str,
+    dataset_dir: str,
+    sam_masks_dir: str,
+    sam_masks2_dir: str,
+    success_threshold: float = 0.4,
+    output_file: str = None,
+):
+    """测试VIGOR-100K数据集中SAM和SAM2生成的候选掩码成功率
+    
+    Args:
+        annotations_file: VIGOR标注文件路径（all_annotations.json）
+        dataset_dir: VIGOR数据集目录（包含图像和masks子目录）
+        sam_masks_dir: SAM生成的候选掩码目录（如 sam_masks/）
+        sam_masks2_dir: SAM2生成的候选掩码目录（如 sam_masks2/）
+        success_threshold: 成功阈值（IoU >= threshold算成功）
+        output_file: 结果输出文件路径
+    """
+    print("=" * 80)
+    print("VIGOR-100K Test Set Success Rate Evaluation")
+    print("=" * 80)
+    print(f"Annotations file: {annotations_file}")
+    print(f"Dataset dir: {dataset_dir}")
+    print(f"SAM masks dir: {sam_masks_dir}")
+    print(f"SAM masks2 dir: {sam_masks2_dir}")
+    print(f"Success threshold: IoU >= {success_threshold}")
+    print("=" * 80)
+    
+    # 加载标注文件
+    with open(annotations_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # 提取annotations
+    if isinstance(data, dict) and 'annotations' in data:
+        annotations = data['annotations']
+    elif isinstance(data, list):
+        annotations = data
+    else:
+        raise ValueError(f"Unsupported annotations format in {annotations_file}")
+    
+    print(f"\n加载了 {len(annotations)} 个标注")
+    
+    # GT masks目录
+    gt_masks_dir = os.path.join(dataset_dir, 'masks')
+    
+    # 存储所有测试结果
+    sam_results = []
+    sam2_results = []
+    sam_success_count = 0
+    sam2_success_count = 0
+    total_count = 0
+    
+    # 按图像分组
+    img_to_annotations = {}
+    for ann in annotations:
+        img_name = ann.get('img_name', '')
+        if not img_name:
+            continue
+        if img_name not in img_to_annotations:
+            img_to_annotations[img_name] = []
+        img_to_annotations[img_name].append(ann)
+    
+    print(f"\n共有 {len(img_to_annotations)} 张唯一图像")
+    
+    # 处理每张图像
+    for img_name in tqdm(sorted(img_to_annotations.keys()), desc="Processing images"):
+        img_stem = Path(img_name).stem  # 去掉扩展名，如 "10.png" -> "10"
+        
+        # 加载SAM候选masks
+        sam_masks_path = os.path.join(sam_masks_dir, img_stem, 'masks')
+        sam_candidate_masks = load_candidate_masks_from_dir(sam_masks_path)
+        
+        # 加载SAM2候选masks
+        sam2_masks_path = os.path.join(sam_masks2_dir, img_stem, 'masks')
+        sam2_candidate_masks = load_candidate_masks_from_dir(sam2_masks_path)
+        
+        # 处理该图像的每个GT mask
+        for ann in img_to_annotations[img_name]:
+            gt_path_rel = ann.get('gt_path', '')
+            if not gt_path_rel:
+                continue
+            
+            object_name = ann.get('object', 'unknown')
+            
+            # 构建GT mask完整路径
+            gt_mask_path = os.path.join(dataset_dir, gt_path_rel.replace('\\', '/'))
+            
+            # 加载GT mask
+            gt_mask = load_gt_mask(gt_mask_path)
+            if gt_mask is None:
+                continue
+            
+            total_count += 1
+            
+            # 测试SAM候选masks
+            if len(sam_candidate_masks) > 0:
+                # 调整GT mask大小以匹配候选mask
+                h, w = sam_candidate_masks[0].shape
+                if gt_mask.shape != (h, w):
+                    gt_mask_resized = cv2.resize(gt_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                    gt_mask_resized = (gt_mask_resized > 0).astype(np.uint8)
+                else:
+                    gt_mask_resized = gt_mask
+                
+                max_iou, best_mask_idx = compute_iou_batch(gt_mask_resized, sam_candidate_masks)
+                is_success = max_iou >= success_threshold
+                if is_success:
+                    sam_success_count += 1
+                
+                sam_results.append({
+                    'img_name': img_name,
+                    'object_name': object_name,
+                    'gt_mask_path': gt_mask_path,
+                    'max_iou': max_iou,
+                    'best_mask_idx': best_mask_idx,
+                    'is_success': is_success,
+                    'num_candidates': len(sam_candidate_masks),
+                })
+            else:
+                # 没有候选masks，算失败
+                sam_results.append({
+                    'img_name': img_name,
+                    'object_name': object_name,
+                    'gt_mask_path': gt_mask_path,
+                    'max_iou': 0.0,
+                    'best_mask_idx': -1,
+                    'is_success': False,
+                    'num_candidates': 0,
+                })
+            
+            # 测试SAM2候选masks
+            if len(sam2_candidate_masks) > 0:
+                # 调整GT mask大小以匹配候选mask
+                h, w = sam2_candidate_masks[0].shape
+                if gt_mask.shape != (h, w):
+                    gt_mask_resized = cv2.resize(gt_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                    gt_mask_resized = (gt_mask_resized > 0).astype(np.uint8)
+                else:
+                    gt_mask_resized = gt_mask
+                
+                max_iou, best_mask_idx = compute_iou_batch(gt_mask_resized, sam2_candidate_masks)
+                is_success = max_iou >= success_threshold
+                if is_success:
+                    sam2_success_count += 1
+                
+                sam2_results.append({
+                    'img_name': img_name,
+                    'object_name': object_name,
+                    'gt_mask_path': gt_mask_path,
+                    'max_iou': max_iou,
+                    'best_mask_idx': best_mask_idx,
+                    'is_success': is_success,
+                    'num_candidates': len(sam2_candidate_masks),
+                })
+            else:
+                # 没有候选masks，算失败
+                sam2_results.append({
+                    'img_name': img_name,
+                    'object_name': object_name,
+                    'gt_mask_path': gt_mask_path,
+                    'max_iou': 0.0,
+                    'best_mask_idx': -1,
+                    'is_success': False,
+                    'num_candidates': 0,
+                })
+    
+    # 计算成功率
+    sam_success_rate = (sam_success_count / total_count * 100) if total_count > 0 else 0.0
+    sam2_success_rate = (sam2_success_count / total_count * 100) if total_count > 0 else 0.0
+    
+    # 打印结果
+    print(f"\n{'='*80}")
+    print(f"测试结果统计")
+    print(f"{'='*80}")
+    print(f"总GT mask数: {total_count}")
+    print(f"\nSAM结果:")
+    print(f"  成功数（IoU >= {success_threshold}）: {sam_success_count}")
+    print(f"  失败数: {total_count - sam_success_count}")
+    print(f"  成功率: {sam_success_rate:.2f}%")
+    print(f"  平均IoU: {np.mean([r['max_iou'] for r in sam_results]):.4f}")
+    print(f"\nSAM2结果:")
+    print(f"  成功数（IoU >= {success_threshold}）: {sam2_success_count}")
+    print(f"  失败数: {total_count - sam2_success_count}")
+    print(f"  成功率: {sam2_success_rate:.2f}%")
+    print(f"  平均IoU: {np.mean([r['max_iou'] for r in sam2_results]):.4f}")
+    
+    # 打印多阈值成功率统计
+    thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    print(f"\n{'='*90}")
+    print("不同IoU阈值下的成功率统计")
+    print(f"{'='*90}")
+    print(f"{'阈值':<10} {'SAM成功率':<18} {'SAM成功数/总数':<20} {'SAM2成功率':<18} {'SAM2成功数/总数':<20}")
+    print("-" * 90)
+    
+    for threshold in thresholds:
+        sam_success_at_threshold = sum(1 for r in sam_results if r['max_iou'] >= threshold)
+        sam2_success_at_threshold = sum(1 for r in sam2_results if r['max_iou'] >= threshold)
+        sam_rate_at_threshold = (sam_success_at_threshold / total_count * 100) if total_count > 0 else 0.0
+        sam2_rate_at_threshold = (sam2_success_at_threshold / total_count * 100) if total_count > 0 else 0.0
+        
+        print(f"{threshold:<10.1f} {sam_rate_at_threshold:>6.2f}%{'':<10} {sam_success_at_threshold}/{total_count:<15} "
+              f"{sam2_rate_at_threshold:>6.2f}%{'':<10} {sam2_success_at_threshold}/{total_count:<15}")
+    
+    print("=" * 90)
+    
+    # 保存详细结果到文件
+    if output_file:
+        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("VIGOR-100K Test Set Success Rate Evaluation\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Annotations file: {annotations_file}\n")
+            f.write(f"Dataset dir: {dataset_dir}\n")
+            f.write(f"SAM masks dir: {sam_masks_dir}\n")
+            f.write(f"SAM masks2 dir: {sam_masks2_dir}\n")
+            f.write(f"Success threshold: IoU >= {success_threshold}\n")
+            f.write(f"\n总GT mask数: {total_count}\n")
+            f.write("\n" + "=" * 80 + "\n\n")
+            
+            f.write("SAM结果:\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"成功数（IoU >= {success_threshold}）: {sam_success_count}\n")
+            f.write(f"失败数: {total_count - sam_success_count}\n")
+            f.write(f"成功率: {sam_success_rate:.2f}%\n")
+            f.write(f"平均IoU: {np.mean([r['max_iou'] for r in sam_results]):.4f}\n")
+            f.write("\n" + "=" * 80 + "\n\n")
+            
+            f.write("SAM2结果:\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"成功数（IoU >= {success_threshold}）: {sam2_success_count}\n")
+            f.write(f"失败数: {total_count - sam2_success_count}\n")
+            f.write(f"成功率: {sam2_success_rate:.2f}%\n")
+            f.write(f"平均IoU: {np.mean([r['max_iou'] for r in sam2_results]):.4f}\n")
+            f.write("\n" + "=" * 80 + "\n\n")
+            
+            # 添加多阈值成功率统计
+            thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+            f.write("不同IoU阈值下的成功率统计:\n")
+            f.write("-" * 90 + "\n")
+            f.write(f"{'阈值':<10} {'SAM成功率':<18} {'SAM成功数/总数':<20} {'SAM2成功率':<18} {'SAM2成功数/总数':<20}\n")
+            f.write("-" * 90 + "\n")
+            
+            for threshold in thresholds:
+                sam_success_at_threshold = sum(1 for r in sam_results if r['max_iou'] >= threshold)
+                sam2_success_at_threshold = sum(1 for r in sam2_results if r['max_iou'] >= threshold)
+                sam_rate_at_threshold = (sam_success_at_threshold / total_count * 100) if total_count > 0 else 0.0
+                sam2_rate_at_threshold = (sam2_success_at_threshold / total_count * 100) if total_count > 0 else 0.0
+                
+                f.write(f"{threshold:<10.1f} {sam_rate_at_threshold:>6.2f}%{'':<10} {sam_success_at_threshold}/{total_count:<15} "
+                       f"{sam2_rate_at_threshold:>6.2f}%{'':<10} {sam2_success_at_threshold}/{total_count:<15}\n")
+            
+            f.write("=" * 90 + "\n\n")
+            
+            # 合并SAM和SAM2结果到一个表格（按SAM IoU降序）
+            f.write("SAM vs SAM2 对比结果（按SAM IoU降序）:\n")
+            f.write("-" * 100 + "\n")
+            f.write(f"{'序号':<6} {'图像名':<20} {'物体':<30} {'SAM IoU':<12} {'SAM状态':<12} "
+                   f"{'SAM2 IoU':<12} {'SAM2状态':<12}\n")
+            f.write("-" * 100 + "\n")
+            
+            # 合并结果：sam_results和sam2_results应该是对应的（按相同顺序添加）
+            merged_results = []
+            for i in range(len(sam_results)):
+                sam_r = sam_results[i]
+                sam2_r = sam2_results[i] if i < len(sam2_results) else {
+                    'img_name': sam_r['img_name'],
+                    'object_name': sam_r['object_name'],
+                    'max_iou': 0.0,
+                    'is_success': False,
+                    'num_candidates': 0
+                }
+                merged_results.append({
+                    'img_name': sam_r['img_name'],
+                    'object_name': sam_r['object_name'],
+                    'sam_iou': sam_r['max_iou'],
+                    'sam_status': sam_r['is_success'],
+                    'sam_candidates': sam_r['num_candidates'],
+                    'sam2_iou': sam2_r['max_iou'],
+                    'sam2_status': sam2_r['is_success'],
+                    'sam2_candidates': sam2_r['num_candidates'],
+                })
+            
+            # 按SAM IoU降序排序
+            sorted_merged_results = sorted(merged_results, key=lambda x: x['sam_iou'], reverse=True)
+            for idx, result in enumerate(sorted_merged_results, 1):
+                sam_status = "成功" if result['sam_status'] else "失败"
+                sam2_status = "成功" if result['sam2_status'] else "失败"
+                f.write(f"{idx:<6} {result['img_name']:<20} {result['object_name']:<30} "
+                       f"{result['sam_iou']:<12.4f} {sam_status:<12} "
+                       f"{result['sam2_iou']:<12.4f} {sam2_status:<12}\n")
+        
+        print(f"\n详细结果已保存到: {output_file}")
+    
+    return sam_success_rate, sam2_success_rate, sam_results, sam2_results
 
 
 def load_gt_mask(gt_mask_path: str) -> np.ndarray:
@@ -841,10 +1142,14 @@ def test_sam_success_rate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="测试训练好的SAM模型的分割成功率")
+    parser = argparse.ArgumentParser(description="测试SAM和SAM2模型的分割成功率")
+    parser.add_argument("--dataset_type", type=str, choices=["robot_arm", "vigor"], default="robot_arm",
+                       help="数据集类型：robot_arm 或 vigor")
+    
+    # Robot Arm数据集参数
     parser.add_argument("--sam_model_path", type=str, default=None,
                        help="训练好的SAM模型checkpoint路径（使用--use_original_sam时不需要）")
-    parser.add_argument("--sam_checkpoint", type=str, required=True,
+    parser.add_argument("--sam_checkpoint", type=str, default=None,
                        help="原始SAM checkpoint路径")
     parser.add_argument("--annotations_dir", type=str,
                        default="/opt/data/private/LLMSeg/dataset/GT_mask",
@@ -855,6 +1160,22 @@ def main():
     parser.add_argument("--gt_masks_dir", type=str,
                        default="/opt/data/private/LLMSeg/dataset/GT_mask",
                        help="GT mask目录（包含robot_arm_01/02/03/masks子目录）")
+    
+    # VIGOR数据集参数
+    parser.add_argument("--vigor_annotations_file", type=str,
+                       default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/all_annotations.json",
+                       help="VIGOR标注文件路径")
+    parser.add_argument("--vigor_dataset_dir", type=str,
+                       default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test",
+                       help="VIGOR数据集目录（包含图像和masks子目录）")
+    parser.add_argument("--sam_masks_dir", type=str,
+                       default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/sam_masks",
+                       help="SAM生成的候选掩码目录")
+    parser.add_argument("--sam_masks2_dir", type=str,
+                       default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/sam_masks2",
+                       help="SAM2生成的候选掩码目录（sam_masks2）")
+    
+    # 通用参数
     parser.add_argument("--success_threshold", type=float, default=0.4,
                        help="成功阈值（IoU >= threshold算成功）")
     parser.add_argument("--use_lora", action="store_true", default=True,
@@ -885,41 +1206,63 @@ def main():
     
     args = parser.parse_args()
     
-    # 如果启用仅计算模式，vis_output_dir必须指定
-    if args.compute_only and not args.vis_output_dir:
-        parser.error("--compute_only模式需要指定--vis_output_dir")
+    # VIGOR数据集模式
+    if args.dataset_type == "vigor":
+        print("=" * 80)
+        print("使用VIGOR数据集模式")
+        print("=" * 80)
+        
+        # 运行VIGOR测试
+        sam_success_rate, sam2_success_rate, sam_results, sam2_results = test_vigor_success_rate(
+            annotations_file=args.vigor_annotations_file,
+            dataset_dir=args.vigor_dataset_dir,
+            sam_masks_dir=args.sam_masks_dir,
+            sam_masks2_dir=args.sam_masks2_dir,
+            success_threshold=args.success_threshold,
+            output_file=args.output_file,
+        )
+        
+        print(f"\n测试完成！")
+        print(f"SAM成功率: {sam_success_rate:.2f}%")
+        print(f"SAM2成功率: {sam2_success_rate:.2f}%")
     
-    # 如果不是仅计算模式，需要模型路径
-    if not args.compute_only:
-        if not args.sam_checkpoint:
-            parser.error("正常模式需要指定--sam_checkpoint")
-        # 如果使用原始SAM，不需要训练权重路径
-        if not args.use_original_sam and not args.sam_model_path:
-            parser.error("正常模式需要指定--sam_model_path（或使用--use_original_sam使用原始SAM）")
-    
-    # 运行测试
-    success_rate, results = test_sam_success_rate(
-        sam_model_path=args.sam_model_path or "",
-        sam_checkpoint=args.sam_checkpoint or "",
-        annotations_dir=args.annotations_dir,
-        images_dir=args.images_dir,
-        gt_masks_dir=args.gt_masks_dir,
-        success_threshold=args.success_threshold,
-        use_lora=args.use_lora,
-        output_file=args.output_file,
-        points_per_side=args.points_per_side,
-        points_per_batch=args.points_per_batch,
-        pred_iou_thresh=args.pred_iou_thresh,
-        stability_score_thresh=args.stability_score_thresh,
-        box_nms_thresh=args.box_nms_thresh,
-        max_area_ratio=args.max_area_ratio,
-        vis_output_dir=args.vis_output_dir,
-        compute_only=args.compute_only,
-        use_original_sam=args.use_original_sam,
-        vis_output_dir_original=args.vis_output_dir_original,
-    )
-    
-    print(f"\n测试完成！成功率: {success_rate:.2f}%")
+    # Robot Arm数据集模式（原有逻辑）
+    else:
+        # 如果启用仅计算模式，vis_output_dir必须指定
+        if args.compute_only and not args.vis_output_dir:
+            parser.error("--compute_only模式需要指定--vis_output_dir")
+        
+        # 如果不是仅计算模式，需要模型路径
+        if not args.compute_only:
+            if not args.sam_checkpoint:
+                parser.error("正常模式需要指定--sam_checkpoint")
+            # 如果使用原始SAM，不需要训练权重路径
+            if not args.use_original_sam and not args.sam_model_path:
+                parser.error("正常模式需要指定--sam_model_path（或使用--use_original_sam使用原始SAM）")
+        
+        # 运行测试
+        success_rate, results = test_sam_success_rate(
+            sam_model_path=args.sam_model_path or "",
+            sam_checkpoint=args.sam_checkpoint or "",
+            annotations_dir=args.annotations_dir,
+            images_dir=args.images_dir,
+            gt_masks_dir=args.gt_masks_dir,
+            success_threshold=args.success_threshold,
+            use_lora=args.use_lora,
+            output_file=args.output_file,
+            points_per_side=args.points_per_side,
+            points_per_batch=args.points_per_batch,
+            pred_iou_thresh=args.pred_iou_thresh,
+            stability_score_thresh=args.stability_score_thresh,
+            box_nms_thresh=args.box_nms_thresh,
+            max_area_ratio=args.max_area_ratio,
+            vis_output_dir=args.vis_output_dir,
+            compute_only=args.compute_only,
+            use_original_sam=args.use_original_sam,
+            vis_output_dir_original=args.vis_output_dir_original,
+        )
+        
+        print(f"\n测试完成！成功率: {success_rate:.2f}%")
 
 
 if __name__ == "__main__":

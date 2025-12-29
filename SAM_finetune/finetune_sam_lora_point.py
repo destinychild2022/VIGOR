@@ -1337,7 +1337,8 @@ def main():
     random.shuffle(unique_images)
     
     # 按图像划分训练集和验证集
-    num_val_images = int(len(unique_images) * args.val_split)
+    # ✅ 修改：固定验证集为20张图像（随机选取）
+    num_val_images = min(20, len(unique_images))  # 最多20张，如果总图像数少于20则全部使用
     val_images = set(unique_images[:num_val_images])
     train_images = set(unique_images[num_val_images:])
     
