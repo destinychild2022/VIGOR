@@ -148,7 +148,7 @@ if [ "$DATASET_TYPE" = "vigor" ]; then
             --images_dir "$IMAGES_DIR" \
             --output_dir "$OUTPUT_DIR" \
             --device "cuda" \
-            --batch_size 4 \
+            --batch_size 3 \
             --epochs 200 \
             --lr 1e-4 \
             --weight_decay 1e-4 \
