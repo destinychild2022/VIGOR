@@ -6,13 +6,16 @@ SAM模型LoRA微调脚本
 """
 
 import os
+import sys
 import json
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, BatchSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, BatchSampler, DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import argparse
 from pathlib import Path
@@ -584,8 +587,8 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, loss_weight
     total_loss = 0.0
     loss_dict = {'dice': 0.0, 'focal': 0.0, 'ce': 0.0, 'iou': 0.0}
     
-    # 获取实际模型（处理DataParallel情况）
-    actual_model = model.module if isinstance(model, nn.DataParallel) else model
+    # 获取实际模型（处理DataParallel和DDP情况）
+    actual_model = model.module if isinstance(model, (nn.DataParallel, DDP)) else model
     
     # 使用monai的DiceCELoss（与Sam_LoRA一致）
     # 注意: squared_pred=False 避免梯度变小，提高训练效果
@@ -597,7 +600,15 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, loss_weight
         use_monai_loss = False
         print("Warning: monai not available, using custom loss")
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    # ✅ 设置tqdm参数，减少刷新频率，避免频繁换行
+    pbar = tqdm(
+        dataloader, 
+        desc=f"Epoch {epoch}",
+        mininterval=1.0,  # 至少1秒刷新一次
+        miniters=10,      # 至少10个batch刷新一次
+        file=sys.stdout,  # 确保输出到stdout
+        dynamic_ncols=True  # 动态调整列宽
+    )
     for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
         
@@ -787,8 +798,8 @@ def validate(model, dataloader, device, loss_weights, visualize_dir=None, epoch=
     total_loss = 0.0
     loss_dict = {'dice': 0.0, 'focal': 0.0, 'ce': 0.0, 'iou': 0.0}
     
-    # 获取实际模型（处理DataParallel情况）
-    actual_model = model.module if isinstance(model, nn.DataParallel) else model
+    # 获取实际模型（处理DataParallel和DDP情况）
+    actual_model = model.module if isinstance(model, (nn.DataParallel, DDP)) else model
     
     # 使用monai的DiceCELoss（与Sam_LoRA一致）
     # 注意: squared_pred=False 避免梯度变小，提高训练效果
@@ -813,7 +824,16 @@ def validate(model, dataloader, device, loss_weights, visualize_dir=None, epoch=
         visualize_batch_idx = -1  # 不进行可视化
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
+        # ✅ 设置tqdm参数，减少刷新频率
+        val_pbar = tqdm(
+            dataloader,
+            desc="Validating",
+            mininterval=1.0,  # 至少1秒刷新一次
+            miniters=5,       # 至少5个batch刷新一次（验证集较小）
+            file=sys.stdout,
+            dynamic_ncols=True
+        )
+        for batch_idx, batch in enumerate(val_pbar):
             # 准备batched_input（SAM forward需要的格式）
             batched_input = []
             for i in range(len(batch)):
@@ -1008,6 +1028,25 @@ def validate(model, dataloader, device, loss_weights, visualize_dir=None, epoch=
     return avg_loss, loss_dict
 
 
+def setup_distributed():
+    """初始化分布式训练环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        device = torch.device(f'cuda:{local_rank}')
+        
+        # 初始化进程组
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        
+        # 设置当前进程使用的GPU
+        torch.cuda.set_device(local_rank)
+        
+        return True, rank, local_rank, world_size, device
+    else:
+        return False, 0, 0, 1, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 def main():
     parser = argparse.ArgumentParser(description="SAM模型LoRA微调")
     parser.add_argument("--sam_checkpoint", type=str, required=True,
@@ -1064,16 +1103,25 @@ def main():
     
     args = parser.parse_args()
     
+    # 设置分布式训练
+    is_distributed, rank, local_rank, world_size, device = setup_distributed()
+    
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 检测可用GPU数量（在SwanLab初始化之前，因为需要用到）
-    num_gpus = torch.cuda.device_count()
-    print(f"检测到 {num_gpus} 个GPU")
+    # 只在主进程中初始化SwanLab和打印信息
+    is_main_process = not is_distributed or rank == 0
     
-    # 初始化SwanLab
+    if is_main_process:
+        # 检测可用GPU数量
+        num_gpus = torch.cuda.device_count()
+        print(f"检测到 {num_gpus} 个GPU")
+        if is_distributed:
+            print(f"分布式训练: rank={rank}, world_size={world_size}")
+    
+    # 初始化SwanLab（只在主进程中）
     swanlab_run = None
-    if SWANLAB_AVAILABLE:
+    if is_main_process and SWANLAB_AVAILABLE:
         try:
             # 设置API key（如果提供）
             if args.swanlab_api_key:
@@ -1103,25 +1151,19 @@ def main():
                     'lora_dropout': args.lora_dropout,
                     'lora_target_modules': args.lora_target_modules,
                     'val_split': args.val_split,
-                    'num_gpus': num_gpus,
+                    'num_gpus': world_size if is_distributed else torch.cuda.device_count(),
+                    'distributed': is_distributed,
                 }
             )
             print(f"SwanLab初始化成功，实验名称: {experiment_name}")
         except Exception as e:
             print(f"SwanLab初始化失败: {e}，将继续训练但不记录指标")
             swanlab_run = None
-    else:
+    elif is_main_process:
         print("SwanLab不可用，训练指标将不会记录")
     
-    # 如果指定了device且是cuda，检查是否使用多GPU
-    use_multi_gpu = False
-    if args.device.startswith('cuda') and num_gpus > 1:
-        use_multi_gpu = True
-        print(f"使用多GPU训练: {num_gpus} 个GPU")
-        # 使用第一个GPU作为主设备
-        device = torch.device('cuda:0')
-    else:
-        device = torch.device(args.device)
+    # 设置设备（已在setup_distributed中设置）
+    use_multi_gpu = is_distributed
     
     # 加载SAM模型
     print("加载SAM模型...")
@@ -1359,27 +1401,33 @@ def main():
     print(f"训练集图像: {len(train_images)}, 标注数: {len(train_indices)}")
     print(f"验证集图像: {len(val_images)}, 标注数: {len(val_indices)}")
     
-    # 如果使用多GPU，调整batch_size
+    # 如果使用多GPU，包装模型
     effective_batch_size = args.batch_size
     if use_multi_gpu:
-        # 使用DataParallel包装模型
-        print("使用DataParallel进行多GPU训练...")
-        sam = nn.DataParallel(sam)
-        # 每个GPU的batch_size保持不变，总batch_size = batch_size * num_gpus
-        effective_batch_size = args.batch_size * num_gpus
-        print(f"总batch_size: {effective_batch_size} (每个GPU: {args.batch_size})")
+        if is_distributed:
+            # 使用DistributedDataParallel进行分布式训练
+            print(f"使用DistributedDataParallel进行分布式训练 (rank={rank})...")
+            sam = DDP(sam, device_ids=[local_rank], output_device=local_rank)
+            print(f"DDP包装完成，使用GPU {local_rank}")
+        else:
+            # 使用DataParallel进行多GPU训练
+            print("使用DataParallel进行多GPU训练...")
+            sam = nn.DataParallel(sam)
+            # 每个GPU的batch_size保持不变，总batch_size = batch_size * num_gpus
+            effective_batch_size = args.batch_size * world_size
+            print(f"总batch_size: {effective_batch_size} (每个GPU: {args.batch_size})")
     
     # 创建collate_fn（参考Sam_LoRA，返回list而不是stacked tensor）
     def collate_fn(batch):
         """返回list of dict，而不是stacked tensor"""
         return list(batch)
     
-    # ✅ 创建按图像分组的BatchSampler（确保一个batch包含一张图像的所有标注）
-    def create_image_grouped_batches(dataset, batch_size, shuffle=True):
+    # ✅ 创建按固定batch_size的BatchSampler（不按图像分组，直接按顺序取batch_size个）
+    def create_fixed_size_batches(dataset, batch_size, shuffle=True):
         """
-        创建按图像分组的batch列表
-        确保一个batch包含一张图像的所有标注
-        如果一张图像的标注数量超过batch_size，会分割成多个batch
+        创建固定大小的batch列表
+        不按图像分组，直接按顺序取batch_size个样本进行forward
+        如果最后剩余样本不足batch_size，作为一个小batch
         
         注意：返回的索引是相对于dataset的索引（如果是Subset，则是Subset内的索引）
         """
@@ -1394,7 +1442,7 @@ def main():
             subset_indices = list(range(len(dataset)))
             idx_map = {idx: idx for idx in range(len(dataset))}
         
-        # ✅ 按图像名称和数据集名称分组标注索引（使用原始索引）
+        # ✅ 按图像名称和数据集名称排序，确保顺序一致性
         # 确保一张图像只从它自己归属的数据集中找mask
         annotations_by_image = defaultdict(list)
         for orig_idx in subset_indices:
@@ -1402,55 +1450,61 @@ def main():
             ann = base_dataset.valid_annotations[orig_idx]
             img_name = ann['img_name']
             dataset_name = ann.get('_dataset_name', 'unknown')
-            # ✅ 使用 (img_name, dataset_name) 作为分组键
+            # ✅ 使用 (img_name, dataset_name) 作为分组键，按图像名排序
             group_key = (img_name, dataset_name)
             annotations_by_image[group_key].append(orig_idx)
         
-        # # ✅ 调试：打印前几张图像对应的mask信息
-        # print("\n=== 调试：检查图像分组情况 ===")
-        # sample_count = 0
-        # for (img_name, dataset_name), orig_indices in list(annotations_by_image.items())[:10]:
-        #     gt_paths = []
-        #     for orig_idx in orig_indices:
-        #         ann = base_dataset.valid_annotations[orig_idx]
-        #         gt_paths.append(ann.get('gt_path', 'unknown'))
-        #     print(f"图像: {img_name} [{dataset_name}], 标注数量: {len(orig_indices)}, gt_paths:")
-        #     for i, gt_path in enumerate(gt_paths, 1):
-        #         print(f"  {i}. {gt_path}")
-        #     sample_count += 1
-        # print(f"（仅显示前 {min(sample_count, 10)} 张图像）\n")
+        # 将所有索引按图像顺序展平（不shuffle，保持原顺序）
+        all_orig_indices = []
+        for (img_name, dataset_name) in sorted(annotations_by_image.keys()):
+            # 按照原始标注文件中的顺序
+            all_orig_indices.extend(annotations_by_image[(img_name, dataset_name)])
         
-        # 创建batch列表：每个batch包含一张图像的所有标注
-        # 但需要转换为Subset内的索引
+        # 转换为Subset内的索引
+        all_subset_indices = [idx_map[orig_idx] for orig_idx in all_orig_indices]
+        
+        # 按batch_size分批（不shuffle，保持顺序）
         batches = []
-        image_names = list(annotations_by_image.keys())
+        for i in range(0, len(all_subset_indices), batch_size):
+            batch_indices = all_subset_indices[i:i+batch_size]
+            batches.append(batch_indices)
         
-        if shuffle:
-            random.shuffle(image_names)
+        # ✅ 调试：打印batch信息
+        print(f"\n=== 调试：检查batch分组情况 ===")
+        print(f"总样本数: {len(all_subset_indices)}")
+        print(f"batch_size: {batch_size}")
+        print(f"生成的batch数: {len(batches)}")
+        print(f"batch大小分布: min={min(len(b) for b in batches)}, max={max(len(b) for b in batches)}")
         
-        for (img_name, dataset_name) in image_names:
-            orig_indices_for_image = annotations_by_image[(img_name, dataset_name)]
-            # 转换为Subset内的索引
-            subset_indices_for_image = [idx_map[orig_idx] for orig_idx in orig_indices_for_image]
+        # 显示前几个batch的图像分布
+        print("前5个batch的图像分布:")
+        for batch_idx, batch in enumerate(batches[:5]):
+            img_names_in_batch = []
+            for subset_idx in batch:
+                orig_idx = subset_indices[subset_idx]
+                ann = base_dataset.valid_annotations[orig_idx]
+                img_name = ann['img_name']
+                dataset_name = ann.get('_dataset_name', 'unknown')
+                img_names_in_batch.append(f"{img_name}[{dataset_name}]")
             
-            # ✅ 如果一张图像的标注数量超过batch_size，分割成多个batch
-            if len(subset_indices_for_image) <= batch_size:
-                # 一个batch包含一张图像的所有标注
-                batches.append(subset_indices_for_image)
+            unique_images = list(set(img_names_in_batch))
+            print(f"  Batch {batch_idx+1}: {len(batch)} 样本, {len(unique_images)} 张图像")
+            if len(unique_images) <= 5:
+                for img_info in unique_images:
+                    print(f"    - {img_info}")
             else:
-                # 如果超过batch_size，分割成多个batch
-                for i in range(0, len(subset_indices_for_image), batch_size):
-                    batches.append(subset_indices_for_image[i:i+batch_size])
+                print(f"    - {unique_images[0]}, {unique_images[1]}, ... 还有{len(unique_images)-2}张")
+        print("="*50 + "\n")
         
         return batches
     
     # 创建训练集的batch列表（传入batch_size参数）
-    train_batches = create_image_grouped_batches(train_dataset, args.batch_size, shuffle=True)
+    train_batches = create_fixed_size_batches(train_dataset, args.batch_size, shuffle=False)
     # 创建验证集的batch列表（传入batch_size参数）
-    val_batches = create_image_grouped_batches(val_dataset, args.batch_size, shuffle=False)
+    val_batches = create_fixed_size_batches(val_dataset, args.batch_size, shuffle=False)
     
-    print(f"\n训练集batch数: {len(train_batches)} (每个batch包含一张图像的所有标注，如果超过batch_size={args.batch_size}则分割)")
-    print(f"验证集batch数: {len(val_batches)} (每个batch包含一张图像的所有标注，如果超过batch_size={args.batch_size}则分割)")
+    print(f"\n训练集batch数: {len(train_batches)} (每个batch固定大小或小于batch_size={args.batch_size})")
+    print(f"验证集batch数: {len(val_batches)} (每个batch固定大小或小于batch_size={args.batch_size})")
     # 打印一些统计信息
     train_batch_sizes = [len(b) for b in train_batches]
     val_batch_sizes = [len(b) for b in val_batches]
@@ -1459,8 +1513,8 @@ def main():
     
     # ✅ 创建自定义的BatchSampler，直接返回预定义的batches
     # BatchSampler需要继承torch.utils.data.Sampler，但返回的是batch的索引列表
-    class ImageGroupedBatchSampler:
-        """按图像分组的BatchSampler，确保一个batch包含一张图像的所有标注"""
+    class FixedSizeBatchSampler:
+        """固定大小的BatchSampler，每个batch包含固定数量的样本（跨图像）"""
         def __init__(self, batches):
             self.batches = batches
         
@@ -1471,8 +1525,8 @@ def main():
         def __len__(self):
             return len(self.batches)
     
-    train_batch_sampler = ImageGroupedBatchSampler(train_batches)
-    val_batch_sampler = ImageGroupedBatchSampler(val_batches)
+    train_batch_sampler = FixedSizeBatchSampler(train_batches)
+    val_batch_sampler = FixedSizeBatchSampler(val_batches)
     
     # 创建数据加载器（使用自定义batch_sampler）
     # 注意：使用batch_sampler时，不能同时指定batch_size和sampler
@@ -1489,25 +1543,69 @@ def main():
         def __len__(self):
             return len(self.batch_sampler)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=BatchSamplerWrapper(train_batch_sampler),
-        num_workers=args.num_workers,  # ✅ 使用命令行参数，启用多进程数据加载
-        pin_memory=True,  # ✅ 加速GPU传输
-        prefetch_factor=2 if args.num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
-        persistent_workers=True if args.num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
-        collate_fn=collate_fn
-    )
+    # ✅ 限制num_workers，避免过多的进程导致系统资源耗尽
+    # 设置一个合理的上限，防止用户设置过高的值
+    safe_num_workers = min(args.num_workers, 8)  # 最大8个worker
+    if args.num_workers > safe_num_workers:
+        print(f"⚠️  num_workers从 {args.num_workers} 限制为 {safe_num_workers}，避免过多的进程导致系统资源耗尽")
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_sampler=BatchSamplerWrapper(val_batch_sampler),
-        num_workers=args.num_workers,  # ✅ 使用命令行参数，启用多进程数据加载
-        pin_memory=True,  # ✅ 加速GPU传输
-        prefetch_factor=2 if args.num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
-        persistent_workers=True if args.num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
-        collate_fn=collate_fn
-    )
+    # 创建数据加载器
+    if is_distributed:
+        # ✅ 修复：分布式训练使用DistributedSampler，不使用自定义BatchSampler
+        # 分布式训练时，每个进程处理数据的一部分，不需要自定义batch逻辑
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=safe_num_workers,
+            pin_memory=True,
+            prefetch_factor=2 if safe_num_workers > 0 else None,
+            persistent_workers=True if safe_num_workers > 0 else False,
+            collate_fn=collate_fn,
+            timeout=300,
+            drop_last=True  # 确保每个batch大小一致
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,  # ✅ 修复：使用相同的batch_size
+            sampler=val_sampler,
+            num_workers=min(safe_num_workers, 4),
+            pin_memory=True,
+            prefetch_factor=2 if safe_num_workers > 0 else None,
+            persistent_workers=True if safe_num_workers > 0 else False,
+            collate_fn=collate_fn,
+            timeout=300,
+            drop_last=False  # 验证集不丢弃最后一个batch
+        )
+    else:
+        # 单卡训练使用原有的自定义batch_sampler
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=BatchSamplerWrapper(train_batch_sampler),
+            num_workers=safe_num_workers,  # ✅ 使用安全的num_workers值
+            pin_memory=True,  # ✅ 加速GPU传输
+            prefetch_factor=2 if safe_num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
+            persistent_workers=True if safe_num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
+            collate_fn=collate_fn,
+            # ✅ 添加超时设置，防止worker进程卡死
+            timeout=300  # 5分钟超时
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=BatchSamplerWrapper(val_batch_sampler),
+            num_workers=min(safe_num_workers, 4),  # ✅ 验证集使用更少的worker，避免资源竞争
+            pin_memory=True,  # ✅ 加速GPU传输
+            prefetch_factor=2 if safe_num_workers > 0 else None,  # ✅ 预取2个batch，减少等待时间
+            persistent_workers=True if safe_num_workers > 0 else False,  # ✅ 保持worker进程存活，避免重复创建
+            collate_fn=collate_fn,
+            # ✅ 添加超时设置，防止worker进程卡死
+            timeout=300  # 5分钟超时
+        )
     
     # ✅ 打印数据加载器配置信息
     print(f"\n数据加载器配置:")
@@ -1536,8 +1634,85 @@ def main():
             
             # 加载模型权重
             if 'model_state_dict' in checkpoint:
-                sam.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                print("✅ 模型权重加载成功")
+                # ✅ 检查权重匹配情况
+                model_dict = sam.state_dict()
+                checkpoint_dict = checkpoint['model_state_dict']
+                
+                # ✅ 处理分布式训练的权重键名不匹配问题
+                # 如果当前模型是DDP包装的，但checkpoint中的权重没有module.前缀，需要添加前缀
+                if isinstance(sam, DDP) and not any(k.startswith('module.') for k in checkpoint_dict.keys()):
+                    print("检测到DDP模型但checkpoint权重没有module.前缀，正在添加前缀...")
+                    adapted_checkpoint_dict = {}
+                    for k, v in checkpoint_dict.items():
+                        adapted_checkpoint_dict[f'module.{k}'] = v
+                    checkpoint_dict = adapted_checkpoint_dict
+                    print(f"已为 {len(checkpoint_dict)} 个权重添加module.前缀")
+                
+                # 如果当前模型不是DDP包装的，但checkpoint中的权重有module.前缀，需要移除前缀
+                elif not isinstance(sam, DDP) and any(k.startswith('module.') for k in checkpoint_dict.keys()):
+                    print("检测到非DDP模型但checkpoint权重有module.前缀，正在移除前缀...")
+                    adapted_checkpoint_dict = {}
+                    for k, v in checkpoint_dict.items():
+                        if k.startswith('module.'):
+                            adapted_checkpoint_dict[k[7:]] = v  # 移除'module.'前缀
+                        else:
+                            adapted_checkpoint_dict[k] = v
+                    checkpoint_dict = adapted_checkpoint_dict
+                    print(f"已为 {len(checkpoint_dict)} 个权重移除module.前缀")
+                
+                # 检查缺失的键
+                missing_keys = set(model_dict.keys()) - set(checkpoint_dict.keys())
+                unexpected_keys = set(checkpoint_dict.keys()) - set(model_dict.keys())
+                
+                try:
+                    # 加载权重
+                    load_result = sam.load_state_dict(checkpoint_dict, strict=False)
+                    
+                    if load_result.missing_keys:
+                        print(f"⚠️  缺失的键（模型中有但checkpoint中没有）: {len(load_result.missing_keys)} 个")
+                        if len(load_result.missing_keys) <= 10:
+                            for key in list(load_result.missing_keys)[:10]:
+                                print(f"     - {key}")
+                        else:
+                            for key in list(load_result.missing_keys)[:5]:
+                                print(f"     - {key}")
+                            print(f"     ... 还有 {len(load_result.missing_keys) - 5} 个")
+                    
+                    if load_result.unexpected_keys:
+                        print(f"⚠️  意外的键（checkpoint中有但模型中没有）: {len(load_result.unexpected_keys)} 个")
+                        if len(load_result.unexpected_keys) <= 10:
+                            for key in list(load_result.unexpected_keys)[:10]:
+                                print(f"     - {key}")
+                        else:
+                            for key in list(load_result.unexpected_keys)[:5]:
+                                print(f"     - {key}")
+                            print(f"     ... 还有 {len(load_result.unexpected_keys) - 5} 个")
+                    
+                    # 检查成功加载的键
+                    loaded_keys = set(checkpoint_dict.keys()) - set(load_result.unexpected_keys)
+                    print(f"✅ 成功加载 {len(loaded_keys)} / {len(checkpoint_dict)} 个权重")
+                    
+                    # 特别检查 LoRA 权重是否加载
+                    lora_keys_in_checkpoint = [k for k in checkpoint_dict.keys() if 'lora' in k.lower()]
+                    lora_keys_loaded = [k for k in loaded_keys if 'lora' in k.lower()]
+                    if lora_keys_in_checkpoint:
+                        print(f"✅ LoRA权重: checkpoint中有 {len(lora_keys_in_checkpoint)} 个，成功加载 {len(lora_keys_loaded)} 个")
+                        if len(lora_keys_loaded) < len(lora_keys_in_checkpoint):
+                            print(f"⚠️  警告: 有 {len(lora_keys_in_checkpoint) - len(lora_keys_loaded)} 个 LoRA 权重未加载！")
+                    
+                    # ✅ 关键权重检查：确保核心模型权重已加载
+                    critical_keys = ['image_encoder', 'prompt_encoder', 'mask_decoder']
+                    critical_loaded = [k for k in critical_keys if any(k in key for key in loaded_keys)]
+                    if len(critical_loaded) < len(critical_keys):
+                        print(f"❌ 错误: 关键模型组件缺失！已加载: {critical_loaded}")
+                        print("   这可能是由于模型结构不匹配导致的，无法继续训练")
+                        raise RuntimeError("关键模型权重加载失败，请检查模型结构和checkpoint兼容性")
+                    
+                except Exception as e:
+                    print(f"❌ 权重加载失败: {e}")
+                    print("   这可能是由于模型结构不匹配或checkpoint损坏导致的")
+                    print("   请检查checkpoint文件是否完整，或使用--resume参数指定正确的checkpoint")
+                    raise RuntimeError(f"权重加载失败: {e}")
             
             # 加载LoRA权重（如果使用LoRA）
             if args.use_lora and PEFT_AVAILABLE and 'lora_state_dict' in checkpoint:
@@ -1599,12 +1774,16 @@ def main():
             sam, train_loader, optimizer, scaler, device, epoch, loss_weights, swanlab_run
         )
         
-        # 验证（带可视化）- 根据val_every参数决定是否验证
+        # 验证（带可视化）- 根据val_every参数决定是否验证（只在主进程中进行）
         if epoch % args.val_every == 0 or epoch == args.epochs:
-            visualize_dir = os.path.join(args.output_dir, "val_vis")
-            val_loss, val_loss_dict = validate(
-                sam, val_loader, device, loss_weights, visualize_dir=visualize_dir, epoch=epoch
-            )
+            if is_main_process:
+                visualize_dir = os.path.join(args.output_dir, "val_vis")
+                val_loss, val_loss_dict = validate(
+                    sam, val_loader, device, loss_weights, visualize_dir=visualize_dir, epoch=epoch
+                )
+            else:
+                val_loss = None
+                val_loss_dict = {'dice': 0.0, 'focal': 0.0, 'ce': 0.0, 'iou': 0.0}
         else:
             # 跳过验证，使用上一次的验证损失（或设为None）
             val_loss = None
@@ -1643,8 +1822,8 @@ def main():
                 })
             swanlab_run.log(log_dict, step=epoch)
         
-        # 保存最佳模型（仅在验证时更新）
-        if val_loss is not None and val_loss < best_val_loss:
+        # 保存最佳模型（仅在验证时更新，只在主进程中保存）
+        if is_main_process and val_loss is not None and val_loss < best_val_loss:
             best_val_loss = val_loss
             # 确保输出目录存在
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1653,7 +1832,18 @@ def main():
             model_to_save = sam.module if use_multi_gpu else sam
             
             # 获取模型状态字典
-            model_state_dict = model_to_save.state_dict()
+            # ✅ 处理分布式训练的权重键名问题
+            if isinstance(model_to_save, DDP):
+                # 如果是DDP模型，保存时移除module.前缀，以便在不同训练模式下兼容
+                model_state_dict = {}
+                for k, v in model_to_save.state_dict().items():
+                    if k.startswith('module.'):
+                        model_state_dict[k[7:]] = v  # 移除'module.'前缀
+                    else:
+                        model_state_dict[k] = v
+                print(f"✅ DDP模型权重已移除module.前缀保存 ({len(model_state_dict)} 个权重)")
+            else:
+                model_state_dict = model_to_save.state_dict()
             
             # 如果使用LoRA，需要额外保存LoRA权重
             lora_state_dict = None
@@ -1692,15 +1882,28 @@ def main():
             torch.save(checkpoint, checkpoint_path)
             print(f"保存最佳模型到: {checkpoint_path}")
         
-        # 定期保存
-        if epoch % args.save_every == 0:
+        # ✅ 修改保存逻辑：只保存最好的模型和最新的两个权重文件（只在主进程中保存）
+        if is_main_process and epoch % args.save_every == 0:
             # 确保输出目录存在
             os.makedirs(args.output_dir, exist_ok=True)
-            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
+            
+            # 保存最新的checkpoint（保持最新2个）
+            latest_checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
             model_to_save = sam.module if use_multi_gpu else sam
             
             # 获取模型状态字典
-            model_state_dict = model_to_save.state_dict()
+            # ✅ 处理分布式训练的权重键名问题
+            if isinstance(model_to_save, DDP):
+                # 如果是DDP模型，保存时移除module.前缀，以便在不同训练模式下兼容
+                model_state_dict = {}
+                for k, v in model_to_save.state_dict().items():
+                    if k.startswith('module.'):
+                        model_state_dict[k[7:]] = v  # 移除'module.'前缀
+                    else:
+                        model_state_dict[k] = v
+                print(f"✅ DDP模型权重已移除module.前缀保存 ({len(model_state_dict)} 个权重)")
+            else:
+                model_state_dict = model_to_save.state_dict()
             
             # 如果使用LoRA，需要额外保存LoRA权重
             lora_state_dict = None
@@ -1731,8 +1934,24 @@ def main():
             if lora_state_dict is not None:
                 checkpoint['lora_state_dict'] = lora_state_dict
             
-            torch.save(checkpoint, checkpoint_path)
-            print(f"保存检查点: {checkpoint_path}")
+            # 保存最新checkpoint
+            torch.save(checkpoint, latest_checkpoint_path)
+            print(f"保存最新检查点: {latest_checkpoint_path}")
+            
+            # 清理旧的checkpoint文件，只保留最新的2个
+            import glob
+            checkpoint_pattern = os.path.join(args.output_dir, "checkpoint_epoch_*.pth")
+            all_checkpoints = sorted(glob.glob(checkpoint_pattern), 
+                                 key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            
+            # 如果有超过2个checkpoint，删除最旧的
+            while len(all_checkpoints) > 2:
+                oldest_checkpoint = all_checkpoints.pop(0)  # 删除最旧的
+                try:
+                    os.remove(oldest_checkpoint)
+                    print(f"删除旧检查点: {oldest_checkpoint}")
+                except Exception as e:
+                    print(f"删除旧检查点失败: {oldest_checkpoint}, 错误: {e}")
     
     print("\n训练完成！")
     print(f"最佳验证损失: {best_val_loss:.4f}")
@@ -1746,4 +1965,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

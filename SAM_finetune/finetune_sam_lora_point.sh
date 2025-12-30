@@ -19,10 +19,11 @@ OUTPUT_DIR="./sam_output/sam_finetuned_vigor_point"
 # ✅ 设置是否从checkpoint恢复训练（如果需要继续训练，设置为checkpoint路径）
 # 例如：RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
 # 如果不需要恢复，设置为空字符串 "" 或注释掉
-RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
+# 修复：从第5个epoch的checkpoint恢复（最新的checkpoint）
+RESUME_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point/checkpoint/checkpoint_epoch_4.pth"
 
-# 设置GPU
-GPU_IDS="0"
+# 设置GPU - 使用双GPU分布式训练
+GPU_IDS="0,1"
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 # 检查模型文件是否存在
@@ -132,58 +133,127 @@ if [ "$DATASET_TYPE" = "vigor" ]; then
     echo "Starting SAM LoRA fine-tuning with VIGOR-100K dataset (使用 points)..."
     # 设置PyTorch内存优化（避免内存碎片）
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
-        --sam_checkpoint "$SAM_CHECKPOINT" \
-        --dataset_dir "$DATASET_DIR" \
-        --images_dir "$IMAGES_DIR" \
-        --output_dir "$OUTPUT_DIR" \
-        --device "cuda" \
-        --batch_size 12 \
-        --epochs 200 \
-        --lr 1e-4 \
-        --weight_decay 1e-4 \
-        --use_lora \
-        --lora_r 32 \
-        --lora_alpha 64 \
-        --lora_dropout 0.1 \
-        --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
-        --val_split 0.1 \
-        --num_workers 16 \
-        --save_every 1 \
-        --dataset_type "vigor" \
-        --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
-        $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
-        --swanlab_api_key "$SWANLAB_API_KEY" \
-        --swanlab_project "SAM-Finetune" \
-        --swanlab_experiment_name "SAM-LoRA-vigor-point"
+    
+    # 计算GPU数量
+    NUM_GPUS=$(echo $GPU_IDS | tr ',' '\n' | wc -l)
+    echo "使用 $NUM_GPUS 个GPU进行分布式训练"
+    
+    if [ $NUM_GPUS -gt 1 ]; then
+        # 多GPU分布式训练
+        torchrun --nproc_per_node=$NUM_GPUS \
+            --master_port=29500 \
+            "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+            --sam_checkpoint "$SAM_CHECKPOINT" \
+            --dataset_dir "$DATASET_DIR" \
+            --images_dir "$IMAGES_DIR" \
+            --output_dir "$OUTPUT_DIR" \
+            --device "cuda" \
+            --batch_size 4 \
+            --epochs 200 \
+            --lr 1e-4 \
+            --weight_decay 1e-4 \
+            --use_lora \
+            --lora_r 32 \
+            --lora_alpha 64 \
+            --lora_dropout 0.1 \
+            --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+            --val_split 0.1 \
+            --num_workers 6 \
+            --save_every 5 \
+            --dataset_type "vigor" \
+            --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
+            $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+            --swanlab_api_key "$SWANLAB_API_KEY" \
+            --swanlab_project "SAM-Finetune" \
+            --swanlab_experiment_name "SAM-LoRA-vigor-point"
+    else
+        # 单GPU训练
+        python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+            --sam_checkpoint "$SAM_CHECKPOINT" \
+            --dataset_dir "$DATASET_DIR" \
+            --images_dir "$IMAGES_DIR" \
+            --output_dir "$OUTPUT_DIR" \
+            --device "cuda" \
+            --batch_size 2 \
+            --epochs 200 \
+            --lr 1e-4 \
+            --weight_decay 1e-4 \
+            --use_lora \
+            --lora_r 32 \
+            --lora_alpha 64 \
+            --lora_dropout 0.1 \
+            --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+            --val_split 0.1 \
+            --num_workers 6 \
+            --save_every 5 \
+            --dataset_type "vigor" \
+            --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
+            $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+            --swanlab_api_key "$SWANLAB_API_KEY" \
+            --swanlab_project "SAM-Finetune" \
+            --swanlab_experiment_name "SAM-LoRA-vigor-point"
+    fi
 else
     echo "Starting SAM LoRA fine-tuning with robot_arm dataset (使用 affordance points)..."
-    python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
-        --sam_checkpoint "$SAM_CHECKPOINT" \
-        --dataset_dir "$DATASET_DIR" \
-        --images_dir "$IMAGES_DIR" \
-        --output_dir "$OUTPUT_DIR" \
-        --device "cuda" \
-        --batch_size 8 \
-        --epochs 200 \
-        --lr 1e-4 \
-        --weight_decay 1e-4 \
-        --use_lora \
-        --lora_r 32 \
-        --lora_alpha 64 \
-        --lora_dropout 0.1 \
-        --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
-        --val_split 0.1 \
-        --num_workers 8 \
-        --save_every 20 \
-        --dataset_type "robot_arm" \
-        $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
-        --swanlab_api_key "$SWANLAB_API_KEY" \
-        --swanlab_project "SAM-Finetune" \
-        --swanlab_experiment_name "SAM-LoRA-robot-arm-point"
+    # 计算GPU数量
+    NUM_GPUS=$(echo $GPU_IDS | tr ',' '\n' | wc -l)
+    echo "使用 $NUM_GPUS 个GPU进行分布式训练"
+    
+    if [ $NUM_GPUS -gt 1 ]; then
+        # 多GPU分布式训练
+        torchrun --nproc_per_node=$NUM_GPUS \
+            --master_port=29500 \
+            "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+            --sam_checkpoint "$SAM_CHECKPOINT" \
+            --dataset_dir "$DATASET_DIR" \
+            --images_dir "$IMAGES_DIR" \
+            --output_dir "$OUTPUT_DIR" \
+            --device "cuda" \
+            --batch_size 8 \
+            --epochs 200 \
+            --lr 1e-4 \
+            --weight_decay 1e-4 \
+            --use_lora \
+            --lora_r 32 \
+            --lora_alpha 64 \
+            --lora_dropout 0.1 \
+            --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+            --val_split 0.1 \
+            --num_workers 8 \
+            --save_every 20 \
+            --dataset_type "robot_arm" \
+            $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+            --swanlab_api_key "$SWANLAB_API_KEY" \
+            --swanlab_project "SAM-Finetune" \
+            --swanlab_experiment_name "SAM-LoRA-robot-arm-point"
+    else
+        # 单GPU训练
+        python "$SCRIPT_DIR/finetune_sam_lora_point.py" \
+            --sam_checkpoint "$SAM_CHECKPOINT" \
+            --dataset_dir "$DATASET_DIR" \
+            --images_dir "$IMAGES_DIR" \
+            --output_dir "$OUTPUT_DIR" \
+            --device "cuda" \
+            --batch_size 8 \
+            --epochs 200 \
+            --lr 1e-4 \
+            --weight_decay 1e-4 \
+            --use_lora \
+            --lora_r 32 \
+            --lora_alpha 64 \
+            --lora_dropout 0.1 \
+            --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
+            --val_split 0.1 \
+            --num_workers 8 \
+            --save_every 20 \
+            --dataset_type "robot_arm" \
+            $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
+            --swanlab_api_key "$SWANLAB_API_KEY" \
+            --swanlab_project "SAM-Finetune" \
+            --swanlab_experiment_name "SAM-LoRA-robot-arm-point"
+    fi
 fi
 
 echo ""
 echo "Fine-tuning completed!"
 echo "Model saved to: $OUTPUT_DIR"
-
