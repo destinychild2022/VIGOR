@@ -20,7 +20,7 @@ OUTPUT_DIR="./sam_output/sam_finetuned_vigor_point"
 # 例如：RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
 # 如果不需要恢复，设置为空字符串 "" 或注释掉
 # 修复：从第5个epoch的checkpoint恢复（最新的checkpoint）
-RESUME_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point/checkpoint/checkpoint_epoch_4.pth"
+RESUME_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point/checkpoint_epoch_5.pth"
 
 # 设置GPU - 使用双GPU分布式训练
 GPU_IDS="0,1"
@@ -158,13 +158,14 @@ if [ "$DATASET_TYPE" = "vigor" ]; then
             --lora_dropout 0.1 \
             --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
             --val_split 0.1 \
-            --num_workers 6 \
+            --num_workers 3 \
             --save_every 5 \
             --dataset_type "vigor" \
             --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
             $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
             --swanlab_api_key "$SWANLAB_API_KEY" \
             --swanlab_project "SAM-Finetune" \
+            --train_ratio 0.1 \
             --swanlab_experiment_name "SAM-LoRA-vigor-point"
     else
         # 单GPU训练

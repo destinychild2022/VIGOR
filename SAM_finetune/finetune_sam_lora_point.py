@@ -1100,6 +1100,8 @@ def main():
                        help="VIGOR数据集的all_annotations.json文件路径（当dataset_type=vigor时使用）")
     parser.add_argument("--resume", type=str, default=None,
                        help="从checkpoint恢复训练（checkpoint文件路径，例如：./sam_output/sam_finetuned_vigor_point/best_model.pth）")
+    parser.add_argument("--train_ratio", type=float, default=1.0,
+                       help="训练集比例（除了验证集20张图像外的数据中使用多少比例，0.0-1.0，默认1.0使用全部数据，方便调试）")
     
     args = parser.parse_args()
     
@@ -1382,7 +1384,22 @@ def main():
     # ✅ 修改：固定验证集为20张图像（随机选取）
     num_val_images = min(20, len(unique_images))  # 最多20张，如果总图像数少于20则全部使用
     val_images = set(unique_images[:num_val_images])
-    train_images = set(unique_images[num_val_images:])
+    
+    # ✅ 新增：使用train_ratio控制训练集比例
+    # 除去验证集的图像，按train_ratio比例选取训练集
+    remaining_images = unique_images[num_val_images:]
+    if args.train_ratio < 1.0:
+        # 计算要使用的训练图像数量
+        num_train_images = max(1, int(len(remaining_images) * args.train_ratio))
+        # 使用固定的随机种子确保可重现性
+        random.seed(42)
+        train_images = set(random.sample(remaining_images, num_train_images))
+        random.seed()  # 重置随机种子
+        print(f"✅ 使用训练比例 {args.train_ratio:.2f}：从 {len(remaining_images)} 张可用图像中选择 {len(train_images)} 张用于训练")
+    else:
+        # 使用全部剩余图像进行训练
+        train_images = set(remaining_images)
+        print(f"✅ 使用全部 {len(remaining_images)} 张图像进行训练（train_ratio=1.0）")
     
     # 根据图像分组，确定训练集和验证集的标注索引
     train_indices = []
@@ -1390,7 +1407,7 @@ def main():
     for group_key, indices in annotations_by_image.items():
         if group_key in val_images:
             val_indices.extend(indices)
-        else:
+        elif group_key in train_images:
             train_indices.extend(indices)
     
     # 创建子数据集
