@@ -858,9 +858,9 @@ def validate(model, dataloader, device, loss_weights, visualize_dir=None, epoch=
                 })
             
             with autocast():
-                # 验证时使用forward_train（允许梯度计算，虽然验证时不需要，但保持代码一致性）
-                # 注意：验证函数已经在torch.no_grad()上下文中，所以不会实际计算梯度
-                outputs = actual_model.forward_train(batched_input=batched_input, multimask_output=False)
+                # 验证时使用forward方法（已经带有@torch.no_grad()装饰器，专为推理设计）
+                # 这样可以进一步减少内存使用，避免不必要的计算图构建
+                outputs = actual_model.forward(batched_input=batched_input, multimask_output=False)
                 
                 # 准备ground truth masks和预测的logits
                 # batch是一个list of dict
