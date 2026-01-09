@@ -45,7 +45,7 @@ fi
 
 # 使用单 GPU 训练以降低内存占用
 $DS --include localhost:0 \
-  --master_port=24374 finetune_llmseg_copy2.py \
+  --master_port=24374 finetune_llmseg_vigor.py \
   --version="$llava_path" \
   --vision-tower="$clip_path" \
   --vision_pretrained="$vision_path" \

@@ -46,6 +46,7 @@ SAM_finetune/sam_output/
 swanlog/
 vis_output/
 runs/
+sam2
 
 # Logs and outputs
 *.log

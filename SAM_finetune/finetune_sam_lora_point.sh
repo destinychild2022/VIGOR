@@ -14,16 +14,16 @@ IMAGES_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train"  # VIGOR训练集
 DATASET_DIR="/opt/data/private/LLMSeg/dataset"  # 保留用于兼容性，实际不使用
 
 # 设置输出目录
-OUTPUT_DIR="./sam_output/sam_finetuned_vigor_point"
+OUTPUT_DIR="./sam_output/sam_finetuned_vigor_point2"
 
 # ✅ 设置是否从checkpoint恢复训练（如果需要继续训练，设置为checkpoint路径）
 # 例如：RESUME_CHECKPOINT="./sam_output/sam_finetuned_vigor_point/best_model.pth"
 # 如果不需要恢复，设置为空字符串 "" 或注释掉
 # 修复：从第5个epoch的checkpoint恢复（最新的checkpoint）
-RESUME_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point/checkpoint_epoch_5.pth"
+# RESUME_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point2/checkpoint_epoch_1.pth"
 
 # 设置GPU - 使用双GPU分布式训练
-GPU_IDS="0,1"
+GPU_IDS="0"
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 # 检查模型文件是否存在
@@ -141,14 +141,14 @@ if [ "$DATASET_TYPE" = "vigor" ]; then
     if [ $NUM_GPUS -gt 1 ]; then
         # 多GPU分布式训练
         torchrun --nproc_per_node=$NUM_GPUS \
-            --master_port=29500 \
+            --master_port=29501 \
             "$SCRIPT_DIR/finetune_sam_lora_point.py" \
             --sam_checkpoint "$SAM_CHECKPOINT" \
             --dataset_dir "$DATASET_DIR" \
             --images_dir "$IMAGES_DIR" \
             --output_dir "$OUTPUT_DIR" \
             --device "cuda" \
-            --batch_size 3 \
+            --batch_size 4 \
             --epochs 200 \
             --lr 1e-4 \
             --weight_decay 1e-4 \
@@ -158,14 +158,14 @@ if [ "$DATASET_TYPE" = "vigor" ]; then
             --lora_dropout 0.1 \
             --lora_target_modules "q_proj,v_proj,k_proj,out_proj" \
             --val_split 0.1 \
-            --num_workers 3 \
-            --save_every 5 \
+            --num_workers 6 \
+            --save_every 1 \
             --dataset_type "vigor" \
             --vigor_annotations_file "$VIGOR_ANNOTATIONS_FILE" \
             $([ -n "$RESUME_CHECKPOINT" ] && echo "--resume $RESUME_CHECKPOINT") \
             --swanlab_api_key "$SWANLAB_API_KEY" \
             --swanlab_project "SAM-Finetune" \
-            --train_ratio 0.1 \
+            --train_ratio 1 \
             --swanlab_experiment_name "SAM-LoRA-vigor-point"
     else
         # 单GPU训练

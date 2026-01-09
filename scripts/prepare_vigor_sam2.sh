@@ -10,11 +10,14 @@ SAM_MODEL_PATH="/opt/data/private/model/SAM-vit-h"
 # 或者直接指定checkpoint文件：
 # SAM_MODEL_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
+# 微调后的SAM模型路径
+FINETUNED_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point2/best_model.pth"
+
 # 设置数据集路径
-DATASET_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test"
+DATASET_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train"
 
 # 设置输出目录
-OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/sam_masks3"
+OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.88_0.95"
 
 # 设置GPU
 GPU_IDS="0"
@@ -22,6 +25,9 @@ export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 # 选择使用的模型（sam2 或 sam）
 USE_MODEL="sam"  # 改为 "sam2" 使用SAM2模型
+
+# 是否使用微调后的模型（true/false）
+USE_FINETUNED="false"  # 改为 "true" 使用微调后的SAM模型
 
 # 设置其他参数
 MAX_IMAGES=""  # 留空处理所有图像，或设置数字限制（如100用于测试）
@@ -38,10 +44,22 @@ if [ -d ".venv" ]; then
 fi
 
 # 检查模型路径
-if [ "$USE_MODEL" = "sam2" ]; then
+if [ "$USE_FINETUNED" = "true" ]; then
+    # 使用微调后的模型
+    MODEL_PATH="$FINETUNED_CHECKPOINT"
+    USE_SAM2_FLAG=""
+    FALLBACK_FLAG=""
+    USE_FINETUNED_FLAG="--use_finetuned"
+    if [ ! -f "$MODEL_PATH" ]; then
+        echo "Error: Finetuned model checkpoint not found: $MODEL_PATH"
+        exit 1
+    fi
+    echo "Using finetuned SAM model: $MODEL_PATH"
+elif [ "$USE_MODEL" = "sam2" ]; then
     MODEL_PATH="$SAM2_MODEL_PATH"
     USE_SAM2_FLAG="--use_sam2"
     FALLBACK_FLAG="--fallback_sam_path $SAM_MODEL_PATH"
+    USE_FINETUNED_FLAG=""
     if [ ! -d "$MODEL_PATH" ]; then
         echo "Error: SAM2 model path not found: $MODEL_PATH"
         exit 1
@@ -55,6 +73,7 @@ else
     MODEL_PATH="$SAM_MODEL_PATH"
     USE_SAM2_FLAG=""
     FALLBACK_FLAG=""
+    USE_FINETUNED_FLAG=""
     if [ ! -d "$MODEL_PATH" ]; then
         echo "Error: SAM model path not found: $MODEL_PATH"
         exit 1
@@ -75,6 +94,11 @@ echo "=========================================="
 echo "VIGOR-100K Test Set Mask Generation"
 echo "=========================================="
 echo "Model: $USE_MODEL"
+if [ "$USE_FINETUNED" = "true" ]; then
+    echo "Using Finetuned Model: YES"
+else
+    echo "Using Finetuned Model: NO"
+fi
 echo "Model Path: $MODEL_PATH"
 echo "Dataset Dir: $DATASET_DIR"
 echo "Output Dir: $OUTPUT_DIR"
@@ -95,6 +119,7 @@ python prepare_datasets/prepare_vigor_sam2.py \
     --save_format "$SAVE_FORMAT" \
     $USE_SAM2_FLAG \
     $FALLBACK_FLAG \
+    $USE_FINETUNED_FLAG \
     $([ -n "$MAX_IMAGES" ] && echo "--max_images $MAX_IMAGES") \
 
 echo ""
@@ -102,4 +127,3 @@ echo "=========================================="
 echo "Mask generation completed!"
 echo "Output directory: $OUTPUT_DIR"
 echo "=========================================="
-

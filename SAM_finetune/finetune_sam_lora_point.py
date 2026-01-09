@@ -587,6 +587,11 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, loss_weight
     total_loss = 0.0
     loss_dict = {'dice': 0.0, 'focal': 0.0, 'ce': 0.0, 'iou': 0.0}
     
+    # ✅ 检测是否为主进程（用于SwanLab日志记录）
+    is_main_process = True
+    if dist.is_initialized():
+        is_main_process = dist.get_rank() == 0
+    
     # 获取实际模型（处理DataParallel和DDP情况）
     actual_model = model.module if isinstance(model, (nn.DataParallel, DDP)) else model
     
@@ -754,13 +759,49 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, loss_weight
         })
         
         # 记录到SwanLab（每10个batch记录一次，避免记录过于频繁）
-        if swanlab_run is not None and batch_idx % 10 == 0:
-            global_step = (epoch - 1) * len(dataloader) + batch_idx
-            dice_val = losses['dice'].item() if isinstance(losses['dice'], torch.Tensor) else losses['dice']
-            swanlab_run.log({
-                'train/batch_loss': loss.item(),
-                'train/batch_dice_loss': dice_val,
-            }, step=global_step)
+        # ✅ 修复：只在主进程中记录日志，避免多进程冲突
+        if swanlab_run is not None and is_main_process and batch_idx % 10 == 0:
+            try:
+                global_step = (epoch - 1) * len(dataloader) + batch_idx
+                dice_val = losses['dice'].item() if isinstance(losses['dice'], torch.Tensor) else losses['dice']
+                
+                # ✅ 增强异常处理：确保SwanLab目录存在
+                try:
+                    swanlab_run.log({
+                        'train/batch_loss': loss.item(),
+                        'train/batch_dice_loss': dice_val,
+                    }, step=global_step)
+                except Exception as swanlab_error:
+                    # 如果是目录相关的错误，尝试重新初始化SwanLab
+                    if "directory" in str(swanlab_error).lower() or "exist" in str(swanlab_error).lower():
+                        print(f"⚠️  SwanLab目录错误，尝试重新初始化: {swanlab_error}")
+                        try:
+                            # 尝试重新初始化SwanLab
+                            import swanlab
+                            if swanlab.run.get_current() is None:
+                                swanlab_run = swanlab.init(
+                                    project="SAM-Finetune-Recovery",
+                                    experiment_name=f"recovery-epoch-{epoch}",
+                                    config={'recovery': True}
+                                )
+                                print("✅ SwanLab重新初始化成功")
+                                # 重试日志记录
+                                swanlab_run.log({
+                                    'train/batch_loss': loss.item(),
+                                    'train/batch_dice_loss': dice_val,
+                                }, step=global_step)
+                            else:
+                                raise swanlab_error
+                        except Exception as retry_error:
+                            print(f"⚠️  SwanLab重新初始化失败: {retry_error}")
+                            raise swanlab_error
+                    else:
+                        raise swanlab_error
+                        
+            except Exception as e:
+                # 如果SwanLab日志记录失败，只打印警告而不中断训练
+                print(f"⚠️  SwanLab日志记录失败: {e}")
+                print("   训练将继续，但指标可能不会被记录")
     
     avg_loss = total_loss / len(dataloader)
     for k in loss_dict:
@@ -1135,6 +1176,15 @@ def main():
                 from datetime import datetime
                 experiment_name = f"SAM-LoRA-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             
+            # ✅ 增强SwanLab初始化：确保工作目录存在且可写
+            import tempfile
+            import shutil
+            
+            # 创建临时工作目录，确保权限正确
+            temp_work_dir = tempfile.mkdtemp(prefix="swanlab_sam_")
+            os.environ['SWANLAB_WORK_DIR'] = temp_work_dir
+            print(f"SwanLab工作目录: {temp_work_dir}")
+            
             # 初始化SwanLab
             swanlab_run = swanlab.init(
                 project=args.swanlab_project,
@@ -1155,12 +1205,30 @@ def main():
                     'val_split': args.val_split,
                     'num_gpus': world_size if is_distributed else torch.cuda.device_count(),
                     'distributed': is_distributed,
+                    'work_dir': temp_work_dir,
                 }
             )
-            print(f"SwanLab初始化成功，实验名称: {experiment_name}")
+            print(f"✅ SwanLab初始化成功，实验名称: {experiment_name}")
+            
+            # 测试日志记录功能
+            try:
+                swanlab_run.log({'test': 1.0}, step=0)  # 修复：使用float而不是string
+                print("✅ SwanLab日志记录测试成功")
+            except Exception as test_error:
+                print(f"⚠️  SwanLab日志记录测试失败: {test_error}")
+                raise test_error
+                
         except Exception as e:
-            print(f"SwanLab初始化失败: {e}，将继续训练但不记录指标")
+            print(f"❌ SwanLab初始化失败: {e}")
+            print("   将继续训练但不记录指标")
             swanlab_run = None
+            
+            # 清理临时目录
+            if 'temp_work_dir' in locals():
+                try:
+                    shutil.rmtree(temp_work_dir, ignore_errors=True)
+                except:
+                    pass
     elif is_main_process:
         print("SwanLab不可用，训练指标将不会记录")
     
@@ -1168,7 +1236,8 @@ def main():
     use_multi_gpu = is_distributed
     
     # 加载SAM模型
-    print("加载SAM模型...")
+    if is_main_process:
+        print("加载SAM模型...")
     sam = sam_model_registry["vit_h"](checkpoint=args.sam_checkpoint)
     sam.to(device=device)
     
@@ -1185,7 +1254,8 @@ def main():
     
     # 应用LoRA（如果启用）
     if args.use_lora and PEFT_AVAILABLE:
-        print("应用LoRA微调...")
+        if is_main_process:
+            print("应用LoRA微调...")
         lora_config = {
             'r': args.lora_r,
             'lora_alpha': args.lora_alpha,
@@ -1196,17 +1266,20 @@ def main():
         }
         sam = apply_lora_to_sam(sam, lora_config)
         
-        # 打印可训练参数
-        trainable_params = sum(p.numel() for p in sam.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in sam.parameters())
-        print(f"可训练参数: {trainable_params:,} / {total_params:,} "
-              f"({100 * trainable_params / total_params:.2f}%)")
+        # 只在主进程中打印参数信息
+        if is_main_process:
+            # 打印可训练参数
+            trainable_params = sum(p.numel() for p in sam.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in sam.parameters())
+            print(f"可训练参数: {trainable_params:,} / {total_params:,} "
+                  f"({100 * trainable_params / total_params:.2f}%)")
     else:
-        print("使用全量微调（仅mask_decoder）")
-        trainable_params = sum(p.numel() for p in sam.mask_decoder.parameters())
-        total_params = sum(p.numel() for p in sam.parameters())
-        print(f"可训练参数: {trainable_params:,} / {total_params:,} "
-              f"({100 * trainable_params / total_params:.2f}%)")
+        if is_main_process:
+            print("使用全量微调（仅mask_decoder）")
+            trainable_params = sum(p.numel() for p in sam.mask_decoder.parameters())
+            total_params = sum(p.numel() for p in sam.parameters())
+            print(f"可训练参数: {trainable_params:,} / {total_params:,} "
+                  f"({100 * trainable_params / total_params:.2f}%)")
     
     # ✅ 初始化训练状态变量（将在checkpoint加载时更新）
     start_epoch = 1
