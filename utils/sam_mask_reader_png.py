@@ -103,9 +103,10 @@ class SAM_Mask_Reader_PNG:
             if mask is None:
                 continue
             
-            # ✅ 重要：黑色（值为0）是掩码区域(前景)，白色（>0）是背景
-            # 统一约定：0=掩码(前景)，1=背景（与可视化/验证逻辑一致）
-            mask_binary = (mask > 0).astype(np.uint8)  # 黑0->0(前景)，白255->1(背景)
+            # ✅ 修正：确保与GT mask格式一致（0=掩码(前景)，1=背景）
+            # 假设：低值（黑色）为掩码区域，高值（白色）为背景
+            # 但是某些mask文件可能值范围不同，所以使用<128作为背景的阈值
+            mask_binary = (mask < 128).astype(np.uint8)  # 低值(黑色)->1(背景)，高值(白色)->0(前景)
             seg_list.append(mask_binary)
             used_mask_paths.append(mask_path)
             
@@ -149,4 +150,3 @@ class SAM_Mask_Reader_PNG:
             # 与 segs_origin 的 K 维一一对应的候选 mask 文件路径
             "mask_paths": used_mask_paths,
         }
-

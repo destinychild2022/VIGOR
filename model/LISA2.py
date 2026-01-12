@@ -253,8 +253,22 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 torch.cuda.empty_cache()
                 image_embeddings_dict = self.model.visual_model_dinov2.forward_features(pixel_values[i].unsqueeze(0))
                 image_embeddings = image_embeddings_dict['x_norm_patchtokens']
-                # 1*4096*1024 -> 1*1024*256*256
-                image_embeddings = image_embeddings.permute(0, 2, 1).reshape(1, 1024, 64, 64)
+                # Debug: 打印实际形状以确认
+                # print(f"[DINOv2 Debug] image_embeddings shape: {image_embeddings.shape}")
+                
+                # 根据实际形状计算正确的reshape参数
+                batch_size = image_embeddings.shape[0]
+                num_patches = image_embeddings.shape[1]  # 应该是 H*W
+                embed_dim = image_embeddings.shape[2]     # 应该是1024
+                
+                # 计算图像的尺寸：假设是正方形，则 H = W = sqrt(num_patches)
+                import math
+                patch_size = int(math.sqrt(num_patches))
+                
+                # print(f"[DINOv2 Debug] batch_size={batch_size}, num_patches={num_patches}, embed_dim={embed_dim}, patch_size={patch_size}")
+                
+                # 重新排列：从 (batch, num_patches, embed_dim) 到 (batch, embed_dim, patch_size, patch_size)
+                image_embeddings = image_embeddings.permute(0, 2, 1).reshape(batch_size, embed_dim, patch_size, patch_size)
                 image_embeddings_list.append(image_embeddings)
             torch.cuda.empty_cache()
             image_embeddings = torch.cat(image_embeddings_list, 0)
@@ -386,10 +400,14 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             dim=1,
         )
         # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
-        seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
-            dim=1,
-        )
+        # Only add padding if we're indexing into a tensor that has the IMAGE_TOKEN_INDEX at the front
+        # The padding should match the actual length of input_ids, not a fixed 255
+        if input_ids.shape[1] > seg_token_mask.shape[1]:
+            padding_needed = input_ids.shape[1] - seg_token_mask.shape[1]
+            seg_token_mask = torch.cat(
+                [torch.zeros((seg_token_mask.shape[0], padding_needed)).bool().cuda(), seg_token_mask],
+                dim=1,
+            )
 
         if inference:
             # 推理阶段也需要支持 batch>1（训练可视化会用 batch_size>1）。
@@ -483,12 +501,9 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         seg_mask = seg_token_mask
         if last_hidden_state.dim() == 2 and seg_mask.dim() == 2 and seg_mask.shape[0] == 1:
             seg_mask = seg_mask[0]
-        print(f"DEBUG: input_ids.shape={input_ids.shape}")
-        print(f"DEBUG: seg_token_mask.shape={seg_token_mask.shape}")
-        print(f"DEBUG: last_hidden_state.shape={last_hidden_state.shape}")
-        print(f"DEBUG: seg_mask.shape={seg_mask.shape}")
-
-        pred_embeddings = last_hidden_state[seg_mask]
+            pred_embeddings = last_hidden_state[seg_mask].unsqueeze(0)  # Add batch dimension back
+        else:
+            pred_embeddings = last_hidden_state[seg_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
         seg_token_offset = seg_token_counts.cumsum(-1)
@@ -921,9 +936,21 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
             for round_idx in range(number_rounds):
                 gt_iou_round = gt_iou[round_idx] # (K)
+                gt_iop_round = gt_iop[round_idx] # (K)
+                
+                # Ensure gt_iou_round and gt_iop_round are tensors and move to correct device
+                if not isinstance(gt_iou_round, torch.Tensor):
+                    gt_iou_round = torch.tensor(gt_iou_round, dtype=pred_iou.dtype)
+                if not isinstance(gt_iop_round, torch.Tensor):
+                    gt_iop_round = torch.tensor(gt_iop_round, dtype=pred_iou.dtype)
+                
+                # Move to the same device as segs_feature
+                device = segs_feature.device
+                gt_iou_round = gt_iou_round.to(device)
+                gt_iop_round = gt_iop_round.to(device)
+                
                 gt_iou_round = gt_iou_round.unsqueeze(1) # (K, 1)
-                gt_iou_round = gt_iou_round.to(dtype = pred_iou.dtype)
-                gt_iop_round = gt_iop[round_idx].unsqueeze(1).to(dtype = pred_iou.dtype) # (K, 1
+                gt_iop_round = gt_iop_round.unsqueeze(1) # (K, 1)
 
                 target_embedding = pred_embeddings[batch_idx][round_idx].unsqueeze(0)  # (1, D)
                 # align_loss_round += sigmoid_align_loss(segs_feature, target_embedding, gt_iou_round, 

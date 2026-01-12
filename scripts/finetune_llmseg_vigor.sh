@@ -9,7 +9,6 @@ vision_path="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # VIGOR-100K数据集路径
 vigor_data_base_dir="/opt/data/private/LLMSeg/dataset/VIGOR-100K"
-vigor_json_file="open_vocab_grasp_easy.json"
 vigor_split="train"  # train/test/unseen
 vigor_val_split="test"  # 验证集使用test split
 
@@ -33,45 +32,97 @@ resume_path=""
 #   关闭调试模式：bash scripts/finetune_llmseg_vigor.sh （默认）
 ENABLE_DEBUG="${ENABLE_DEBUG:-0}"
 
+# ========== CPU 调试模式 ==========
+# 设置为 "1" 开启CPU模式（绕过DeepSpeed，使用纯Python运行）
+# 注意：CPU模式只用于快速调试数据加载逻辑，不适合实际训练
+# 
+# 使用方法：
+#   CPU调试模式：CPU_ONLY=1 bash scripts/finetune_llmseg_vigor.sh
+CPU_ONLY="${CPU_ONLY:-0}"
+
 cd "$(dirname "$0")/.." || exit 1
 
-# Prefer the project's venv deepspeed if available (avoids PATH/activation issues)
+# Prefer the project's venv python/deepspeed if available
+PYTHON_BIN="./.venv/bin/python"
 DEEPSPEED_BIN="./.venv/bin/deepspeed"
-if [ -x "$DEEPSPEED_BIN" ]; then
-  DS="$DEEPSPEED_BIN"
-else
-  DS="deepspeed"
+
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="python"
 fi
 
-# 使用单 GPU 训练以降低内存占用
-$DS --include localhost:0 \
-  --master_port=24374 finetune_llmseg_vigor.py \
-  --version="$llava_path" \
-  --vision-tower="$clip_path" \
-  --vision_pretrained="$vision_path" \
-  --dataset="vigor" \
-  --sample_rates="1" \
-  --vigor_data_base_dir="$vigor_data_base_dir" \
-  --vigor_json_file="$vigor_json_file" \
-  --vigor_split="$vigor_split" \
-  --vigor_val_split="$vigor_val_split" \
-  --exp_name="$exp_name" \
-  --log_base_dir="$log_path" \
-  --steps_per_epoch=35 \
-  --lr=1e-5 \
-  --epochs=70 \
-  --batch_size=4 \
-  --grad_accumulation_steps=2 \
-  --workers=4 \
-  --lora_r=8 \
-  --lora_alpha=16 \
-  --lora_dropout=0.1 \
-  --lora_target_modules="q_proj,k_proj,v_proj,out_proj" \
-  --precision="bf16" \
-  --visualize \
-  --resume="$resume_path" \
-  --train_vis_dir="train_vis" \
-  --val_vis_dir="val_vis" \
-  --eval_vis_dir="eval_vis_iop" \
-  --align_temperature=0.05 \
-  $([ "$ENABLE_DEBUG" = "1" ] || [ "$ENABLE_DEBUG" = "true" ] && echo "--debug_epoch_shapes")
+if [ ! -x "$DEEPSPEED_BIN" ]; then
+  DEEPSPEED_BIN="deepspeed"
+fi
+
+# 根据CPU_ONLY选择运行方式
+if [ "$CPU_ONLY" = "1" ] || [ "$CPU_ONLY" = "true" ]; then
+  echo "=========================================="
+  echo "  CPU调试模式 (无GPU)"
+  echo "  注意: DeepSpeed已禁用, 使用fp32精度"
+  echo "=========================================="
+  
+  # 设置环境变量禁用CUDA
+  export CUDA_VISIBLE_DEVICES=""
+  
+  $PYTHON_BIN finetune_llmseg_vigor.py \
+    --version="$llava_path" \
+    --vision-tower="$clip_path" \
+    --vision_pretrained="$vision_path" \
+    --dataset="vigor" \
+    --sample_rates="1" \
+    --vigor_data_base_dir="$vigor_data_base_dir" \
+    --vigor_split="$vigor_split" \
+    --vigor_val_split="$vigor_val_split" \
+    --exp_name="${exp_name}_cpu_debug" \
+    --log_base_dir="$log_path" \
+    --steps_per_epoch=2 \
+    --lr=1e-5 \
+    --epochs=1 \
+    --batch_size=1 \
+    --grad_accumulation_steps=1 \
+    --workers=4 \
+    --lora_r=8 \
+    --lora_alpha=16 \
+    --lora_dropout=0.1 \
+    --lora_target_modules="q_proj,k_proj,v_proj,out_proj" \
+    --precision="fp32" \
+    --resume="$resume_path" \
+    --train_vis_dir="train_vis" \
+    --val_vis_dir="val_vis" \
+    --eval_vis_dir="eval_vis_iop" \
+    --align_temperature=0.05 \
+    --debug_epoch_shapes
+else
+  # 正常GPU训练模式 (DeepSpeed)
+  $DEEPSPEED_BIN --include localhost:0,1 \
+    --master_port=24374 finetune_llmseg_vigor.py \
+    --version="$llava_path" \
+    --vision-tower="$clip_path" \
+    --vision_pretrained="$vision_path" \
+    --dataset="vigor" \
+    --sample_rates="1" \
+    --vigor_data_base_dir="$vigor_data_base_dir" \
+    --vigor_split="$vigor_split" \
+    --vigor_val_split="$vigor_val_split" \
+    --exp_name="$exp_name" \
+    --log_base_dir="$log_path" \
+    --steps_per_epoch=250 \
+    --lr=2e-5 \
+    --epochs=100 \
+    --batch_size=16 \
+    --grad_accumulation_steps=1 \
+    --workers=4 \
+    --lora_r=8 \
+    --lora_alpha=16 \
+    --lora_dropout=0.1 \
+    --lora_target_modules="q_proj,k_proj,v_proj,out_proj" \
+    --precision="bf16" \
+    --visualize \
+    --resume="$resume_path" \
+    --train_vis_dir="train_vis" \
+    --val_vis_dir="val_vis" \
+    --eval_vis_dir="eval_vis_iop" \
+    --align_temperature=0.05 \
+    $([ "$ENABLE_DEBUG" = "1" ] || [ "$ENABLE_DEBUG" = "true" ] && echo "--debug_epoch_shapes")
+fi
+

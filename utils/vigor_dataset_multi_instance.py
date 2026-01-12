@@ -46,7 +46,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         sam_mask_helper: SAM_Mask_Reader_PNG = None,
         max_samples: int = None,
         is_train: bool = True,
-        samples: List[Dict] = None,
+        samples: List[Dict] = None,  # 改为 raw_samples，但保持向后兼容
         debug_meta: bool = False,
     ):
         self.json_path = json_path
@@ -68,9 +68,9 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         self.debug_meta = bool(debug_meta)
         self.sam_mask_helper = sam_mask_helper
         
-        # 加载所有样本
+        # 加载并标准化所有样本
         if samples is not None:
-            self.samples = samples
+            self.samples = self.normalize_samples(samples)
         else:
             self.samples = self.load_all_samples()
         
@@ -131,8 +131,52 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         
         return samples
     
+    def normalize_samples(self, raw_samples):
+        """
+        将原始样本（可能来自JSON文件的原始格式）标准化为Dataset期望的格式
+        确保所有样本都包含必要的键：image_path, gt_mask_path, instructions等
+        """
+        samples = []
+        if self.max_samples is not None:
+            raw_samples = raw_samples[:self.max_samples]
+        
+        for ann in raw_samples:
+            # 处理不同的样本格式
+            image_path_rel = ann.get('image', ann.get('image_path', ''))
+            gt_mask_path_rel = ann.get('gt_mask_path', '')
+            object_name = ann.get('object', 'object')
+            instructions = ann.get('instructions', [])
+            
+            if not gt_mask_path_rel:
+                continue
+            
+            # 构建完整的绝对路径
+            mask_filename = os.path.basename(gt_mask_path_rel)
+            match = re.match(r'(\d+)_', mask_filename)
+            if not match:
+                print(f"Warning: Cannot extract image number from mask filename: {mask_filename}")
+                continue
+            
+            img_num = match.group(1)
+            img_name = f"{img_num}.png"
+            
+            image_path = os.path.join(self.data_base_dir, self.split, img_name)
+            gt_mask_path = os.path.join(self.data_base_dir, self.split, gt_mask_path_rel)
+            
+            samples.append({
+                'image_path': image_path,  # 这是关键：完整的绝对路径
+                'gt_mask_path': gt_mask_path,
+                'instructions': instructions,
+                'object': object_name,
+                'scene': ann.get('scene', ''),
+                'img_name': img_name,
+            })
+        
+        return samples
+    
     def __len__(self):
-        return len(self.samples)
+        # 修改：返回总实例数（每个样本有3条指令）
+        return len(self.samples) * 3
     
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
@@ -144,7 +188,11 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         return x
     
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        # 修改：根据idx计算样本索引和指令索引
+        sample_idx = idx // 3  # 每个样本有3条指令
+        instruction_idx = idx % 3  # 0, 1, 2 对应3条指令
+        
+        sample = self.samples[sample_idx]
         image_path = sample['image_path']
         gt_mask_path = sample['gt_mask_path']
         img_name = sample['img_name']
@@ -244,45 +292,48 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         image = self.transform.apply_image(image)
         resize = image.shape[:2]
         
-        # 获取所有3条指令（关键修改：不再随机选择1条）
+        # 按照robot_arm_dataset.py的方式添加预处理（归一化 + padding到正方形）
+        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
+        
+        # 获取指令列表，并根据instruction_idx选择对应指令
         instructions = sample.get('instructions', [])
         if not instructions:
-            instructions = [f"segment the {sample.get('object', 'object')}"]
+            instructions = [f"segment {sample.get('object', 'object')}"]
         
-        # 为每条指令创建一个训练实例
-        instances = []
-        for i, instruction in enumerate(instructions):
-            question = f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"
-            
-            # 生成对话
-            conversation_list = [self._build_conversation(instruction)]
-            
-            instance = {
-                'image_path': image_path,
-                'images': image,
-                'images_clip': image_clip,
-                'conversations': conversation_list,
-                'masks': segs,
-                'label': torch.ones(segs.shape[1], segs.shape[2]) * self.ignore_label,
-                'resize': resize,
-                'questions': [question],
-                'sampled_classes': [instruction],
-                'segs': segs,
-                'ious': sampled_ious,
-                'iops': sampled_iops,
-                'segs_origin': segs_origin,
-                'bbox': segs_dict.get('bbox', []),
-                'inference': False,
-                'segmentation_paths': gt_mask_path,
-                'conversation_list': conversation_list,
-                'origin_segs_list': segs_origin,
-                'sam_ious_list': sampled_ious.tolist() if isinstance(sampled_ious, torch.Tensor) else sampled_ious,
-                'candidate_mask_paths_list': segs_dict.get("mask_paths", []),
-                'debug_meta': None,
-            }
-            instances.append(instance)
+        # 确保instruction_idx不超出范围
+        if instruction_idx >= len(instructions):
+            instruction_idx = 0
         
-        return instances
+        instruction = instructions[instruction_idx]
+        question = f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"
+        
+        # 生成对话
+        conversation_list = [self._build_conversation(instruction)]
+        
+        # 返回单个实例（不再是列表）
+        return {
+            'image_path': image_path,
+            'images': image,  # 现在是tensor
+            'images_clip': image_clip,
+            'conversations': conversation_list,
+            'masks': segs,
+            'label': torch.ones(segs.shape[1], segs.shape[2]) * self.ignore_label,
+            'resize': resize,
+            'questions': [question],
+            'sampled_classes': [instruction],
+            'segs': segs,
+            'ious': sampled_ious,
+            'iops': sampled_iops,
+            'segs_origin': segs_origin,
+            'bbox': segs_dict.get('bbox', []),
+            'inference': False,
+            'segmentation_paths': gt_mask_path,
+            'conversation_list': conversation_list,
+            'origin_segs_list': segs_origin,
+            'sam_ious_list': sampled_ious.tolist() if isinstance(sampled_ious, torch.Tensor) else sampled_ious,
+            'candidate_mask_paths_list': segs_dict.get("mask_paths", []),
+            'debug_meta': None,
+        }
     
     def _build_conversation(self, instruction):
         """构建单条指令的对话"""
