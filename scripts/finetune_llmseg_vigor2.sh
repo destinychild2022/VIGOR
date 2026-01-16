@@ -12,6 +12,10 @@ vigor_data_base_dir="/opt/data/private/LLMSeg/dataset/VIGOR-100K"
 vigor_split="train"  # train/test/unseen
 vigor_val_split="test"  # 验证集使用test split
 
+# SAM候选masks路径 (明确指定,不自动搜索)
+vigor_train_sam_masks="${vigor_data_base_dir}/train_masks_sam_0.8_0.8"
+vigor_val_sam_masks="${vigor_data_base_dir}//test_mask/sam_masks"
+
 log_path="./runs"
 exp_name="finetune_llmseg_vigor"
 # 权重保存路径（训练过程中自动保存）
@@ -104,12 +108,14 @@ else
     --vigor_data_base_dir="$vigor_data_base_dir" \
     --vigor_split="$vigor_split" \
     --vigor_val_split="$vigor_val_split" \
+    --vigor_train_sam_masks_dir="$vigor_train_sam_masks" \
+    --vigor_val_sam_masks_dir="$vigor_val_sam_masks" \
     --exp_name="$exp_name" \
     --log_base_dir="$log_path" \
-    --steps_per_epoch=250 \
+    --steps_per_epoch=3 \
     --lr=2e-5 \
-    --epochs=100 \
-    --batch_size=16 \
+    --epochs=3 \
+    --batch_size=8 \
     --grad_accumulation_steps=1 \
     --workers=4 \
     --lora_r=8 \
@@ -123,6 +129,7 @@ else
     --val_vis_dir="val_vis" \
     --eval_vis_dir="eval_vis_iop" \
     --align_temperature=0.05 \
+    --save_every=1 \
     $([ "$ENABLE_DEBUG" = "1" ] || [ "$ENABLE_DEBUG" = "true" ] && echo "--debug_epoch_shapes")
 fi
 

@@ -76,8 +76,10 @@ def parse_args(args):
     parser.add_argument("--vigor_data_base_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K", type=str, help="VIGOR-100K数据集根目录")
     parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
     parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
-    parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR验证集划分（train/test/unseen）")
-    parser.add_argument("--vigor_max_samples", default=None, type=int, help="VIGOR数据集最多使用多少个样本（None表示使用全部）")
+    parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR validation split (train/test/unseen)")
+    parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
+    parser.add_argument("--vigor_train_sam_masks_dir", default=None, type=str, help="VIGOR train SAM masks directory")
+    parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
     
     parser.add_argument("--sample_rates", default="10, 1", type=str)
 
@@ -346,62 +348,6 @@ def init_LISA_model(args, tokenizer):
         args.conv_type
     ]
 
-    # 修复mm_projector权重加载问题
-    def fix_mm_projector_weights(model):
-        """修复mm_projector权重加载问题"""
-        import torch.nn as nn
-        
-        if hasattr(model.model, 'mm_projector') and isinstance(model.model.mm_projector, nn.Linear):
-            # 检查是否有meta tensor
-            has_meta = any(param.is_meta for param in model.model.mm_projector.parameters())
-            
-            if has_meta:
-                print("🔧 检测到mm_projector参数为meta tensor，应用修复...")
-                
-                # 获取配置信息
-                mm_hidden_size = model.config.mm_hidden_size
-                hidden_size = model.config.hidden_size
-                intermediate_size = hidden_size
-                
-                # 重新构建为Sequential结构
-                new_mm_projector = nn.Sequential(
-                    nn.Linear(mm_hidden_size, intermediate_size),
-                    nn.GELU(),
-                    nn.Linear(intermediate_size, hidden_size)
-                )
-                
-                # 加载预训练权重
-                checkpoint_path = "/opt/data/private/model/LISA_Plus_7b/pytorch_model-00002-of-00002.bin"
-                
-                try:
-                    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-                    
-                    # 加载权重
-                    state_dict = {
-                        '0.weight': checkpoint['model.mm_projector.0.weight'],
-                        '0.bias': checkpoint['model.mm_projector.0.bias'],
-                        '2.weight': checkpoint['model.mm_projector.2.weight'], 
-                        '2.bias': checkpoint['model.mm_projector.2.bias']
-                    }
-                    
-                    new_mm_projector.load_state_dict(state_dict, strict=True)
-                    
-                    # 替换原有的mm_projector
-                    model.model.mm_projector = new_mm_projector
-                    
-                    print("✅ mm_projector权重修复完成")
-                    
-                    # 验证修复结果
-                    for name, param in model.model.mm_projector.named_parameters():
-                        print(f"  - {name}: is_meta={param.is_meta}, device={param.device}")
-                        
-                except Exception as e:
-                    print(f"❌ mm_projector权重修复失败: {e}")
-                    raise e
-
-    # 应用修复
-    fix_mm_projector_weights(model)
-
     # init LoRA
     lora_r = args.lora_r
     if lora_r > 0:
@@ -469,48 +415,32 @@ def init_training_dataset(args, tokenizer):
 
     world_size = torch.cuda.device_count()
 
-    # 根据数据集类型选择不同的数据集
+    # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
-        # 使用 VIGOR 数据集
+        # VIGOR dataset
         vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_json_file)
         
-        # 创建 SAM mask helper（如果存在）
+        # Create SAM mask helper
         sam_mask_helper = None
-        # 尝试多个可能的SAM候选masks目录
-        possible_sam_dirs = [
-            os.path.join(args.vigor_data_base_dir, f"{args.vigor_split}_masks_sam_0.8_0.8"),
-            os.path.join(args.vigor_data_base_dir, f"{args.vigor_split}_masks_sam_0.88_0.95"),
-            os.path.join(args.vigor_data_base_dir, "train_masks_sam_0.88_0.95"),  # 训练集固定路径
-            os.path.join(args.vigor_data_base_dir, "sam_masks_0.8_0.8"),  # 根目录
-        ]
         
-        sam_masks_dir = None
-        for possible_dir in possible_sam_dirs:
-            if os.path.exists(possible_dir):
-                sam_masks_dir = possible_dir
-                break
-        
-        if sam_masks_dir is not None:
-            sam_mask_helper = SAM_Mask_Reader_PNG(sam_masks_dir)
-            print(f"使用SAM候选masks: {sam_masks_dir}")
+        if args.vigor_train_sam_masks_dir is not None:
+            if os.path.exists(args.vigor_train_sam_masks_dir):
+                sam_mask_helper = SAM_Mask_Reader_PNG(args.vigor_train_sam_masks_dir)
+                print(f"Using SAM masks: {args.vigor_train_sam_masks_dir}")
+            else:
+                raise FileNotFoundError(f"SAM masks dir not found: {args.vigor_train_sam_masks_dir}")
         else:
-            print(f"警告: SAM候选masks目录不存在，尝试过的路径: {possible_sam_dirs}，将不使用候选masks")
+            print("Warning: --vigor_train_sam_masks_dir not specified")
         
-        # 创建 VIGOR 训练数据集（使用多实例版本）
-        # 总是使用混合数据集（包含easy和hard）并使用多实例模式
-        print(f"模式：混合训练 (Easy + Hard) - 多实例模式 (3 instructions/image)")
+        # Load Easy + Hard data
+        print(f"Mode: Mixed training (Easy + Hard) - Multi-instance (3 instructions/image)")
         
-        # 加载 Easy 和 Hard 数据
         easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy.json")
         hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard.json")
         
         print(f"Loading Easy samples from: {easy_json_path}")
         print(f"Loading Hard samples from: {hard_json_path}")
 
-        # 预先加载并合并 samples
-        combined_samples = []
-        
-        # Helper function to load samples from a specific JSON
         def load_vigor_samples(json_file):
             if not os.path.exists(json_file):
                 print(f"Warning: File not found {json_file}")
@@ -529,15 +459,13 @@ def init_training_dataset(args, tokenizer):
         print(f"Original Samples Loaded: Easy={len(easy_samples)}, Hard={len(hard_samples)}")
         print(f"Total Combined Raw Samples: {len(easy_samples) + len(hard_samples)}")
         
-        # 合并 raw samples (注意：这里只是原始标注的列表，具体的展开在 Dataset 类中处理)
         all_raw_samples = easy_samples + hard_samples
         
         if args.vigor_max_samples is not None:
              all_raw_samples = all_raw_samples[:args.vigor_max_samples]
 
-        # 使用多实例VIGORDataset（内部会自动将1个raw sample展开为3个training instances）
         train_dataset = VIGORDatasetMultiInstance(
-            json_path=None, # 我们直接传入 samples，不需要 json_path
+            json_path=None,
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
@@ -547,20 +475,18 @@ def init_training_dataset(args, tokenizer):
             sam_mask_helper=sam_mask_helper,
             max_samples=args.vigor_max_samples,
             is_train=True,
-            samples=all_raw_samples, # 传入合并后的 list
+            samples=all_raw_samples,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
         
-        print(f"VIGOR训练集加载完成: {len(train_dataset)} 个样本 (Total Instances)")
+        print(f"VIGOR train dataset loaded: {len(train_dataset)} instances")
         
     else:
-        # 使用 RobotArm 数据集（原有逻辑）
-        # 使用命令行参数传入的数据集路径
+        # RobotArm dataset (original logic)
         raw_pic_base_dir = args.dataset_base_dir
         gt_mask_base_dir = args.gt_mask_base_dir
         sam_candidate_base_dir = args.sam_masks_base_dir
         
-        # 准备多个 JSON 文件路径列表（三个视角）
         json_paths = []
         sam_mask_helpers = {}
         
@@ -569,14 +495,12 @@ def init_training_dataset(args, tokenizer):
             if os.path.exists(annotations_path):
                 json_paths.append(annotations_path)
                 
-                # 为每个视角创建SAM mask helper
                 sam_mask_dir = os.path.join(sam_candidate_base_dir, view_name)
                 if os.path.exists(sam_mask_dir):
                     sam_mask_helpers[view_name] = SAM_Mask_Reader_PNG(sam_mask_dir)
                 else:
                     print(f"Warning: SAM candidate directory not found: {sam_mask_dir}")
         
-        # 先构建"每视角前N张"的样本池，再按9:1随机划分（可复现）
         pooled_samples = _build_robotarm_samples(
             gt_mask_base_dir=gt_mask_base_dir,
             raw_pic_base_dir=raw_pic_base_dir,
@@ -588,7 +512,6 @@ def init_training_dataset(args, tokenizer):
             seed=args.robotarm_split_seed,
         )
 
-        # 使用 RobotArmDataset（传入切分后的 samples，确保训练/验证不重叠）
         train_dataset = RobotArmDataset(
             json_paths=json_paths,
             tokenizer=tokenizer,
@@ -605,7 +528,7 @@ def init_training_dataset(args, tokenizer):
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
             
-        print(f"RobotArm训练集加载完成: {len(train_dataset)} 个样本")
+        print(f"RobotArm train dataset loaded: {len(train_dataset)} samples")
 
     return train_dataset
 
@@ -614,76 +537,46 @@ def init_validation_dataset(args, tokenizer):
     if args.no_eval:
         return None
 
-    # 根据数据集类型选择不同的数据集
+    # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
-        # 使用 VIGOR 数据集
+        # VIGOR validation dataset
         vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, args.vigor_json_file)
         
-        # 创建 SAM mask helper（如果存在）
+        # Create SAM mask helper
         sam_mask_helper = None
-        # 验证集优先使用对应的验证集mask目录，避免与训练集混用
-        possible_sam_dirs = [
-            os.path.join(args.vigor_data_base_dir, f"{args.vigor_val_split}_masks_sam_0.88_0.95"),
-            os.path.join(args.vigor_data_base_dir, f"{args.vigor_val_split}_masks_sam_0.8_0.8"),
-            os.path.join(args.vigor_data_base_dir, "train_masks_sam_0.88_0.95"),  # 训练集固定路径（作为fallback）
-            os.path.join(args.vigor_data_base_dir, "sam_masks_0.8_0.8"),  # 根目录（作为fallback）
-        ]
         
-        sam_masks_dir = None
-        for possible_dir in possible_sam_dirs:
-            if os.path.exists(possible_dir):
-                sam_masks_dir = possible_dir
-                break
-        
-        if sam_masks_dir is not None:
-            sam_mask_helper = SAM_Mask_Reader_PNG(sam_masks_dir)
-            print(f"使用SAM候选masks: {sam_masks_dir}")
+        if args.vigor_val_sam_masks_dir is not None:
+            if os.path.exists(args.vigor_val_sam_masks_dir):
+                sam_mask_helper = SAM_Mask_Reader_PNG(args.vigor_val_sam_masks_dir)
+                print(f"Using SAM masks for validation: {args.vigor_val_sam_masks_dir}")
+            else:
+                raise FileNotFoundError(f"SAM masks dir not found: {args.vigor_val_sam_masks_dir}")
         else:
-            print(f"警告: SAM候选masks目录不存在，尝试过的路径: {possible_sam_dirs}，将不使用候选masks")
+            print("Warning: --vigor_val_sam_masks_dir not specified")
         
-        # 创建 VIGOR 验证数据集
-        # 检查是否需要使用混合数据集（包含easy和hard）
-        if "mixed" in args.vigor_json_file or "easy" in args.vigor_json_file and "hard" not in args.vigor_json_file:
-            # 使用标准VIGORDataset（单实例，随机选择指令）
-            val_dataset = VIGORDataset(
-                json_path=vigor_json_path,
-                tokenizer=tokenizer,
-                vision_tower=args.vision_tower,
-                precision=args.precision,
-                image_size=args.image_size,
-                data_base_dir=args.vigor_data_base_dir,
-                split=args.vigor_val_split,
-                sam_mask_helper=sam_mask_helper,
-                max_samples=args.vigor_max_samples,
-                is_train=False,
-                debug_meta=getattr(args, "debug_epoch_shapes", False),
-            )
-        else:
-            # 使用多实例VIGORDataset（每个样本返回3个指令实例）
-            val_dataset = VIGORDatasetMultiInstance(
-                json_path=vigor_json_path,
-                tokenizer=tokenizer,
-                vision_tower=args.vision_tower,
-                precision=args.precision,
-                image_size=args.image_size,
-                data_base_dir=args.vigor_data_base_dir,
-                split=args.vigor_val_split,
-                sam_mask_helper=sam_mask_helper,
-                max_samples=args.vigor_max_samples,
-                is_train=False,
-                debug_meta=getattr(args, "debug_epoch_shapes", False),
-            )
+        # Use VIGORDatasetMultiInstance for validation
+        val_dataset = VIGORDatasetMultiInstance(
+            json_path=vigor_json_path,
+            tokenizer=tokenizer,
+            vision_tower=args.vision_tower,
+            precision=args.precision,
+            image_size=args.image_size,
+            data_base_dir=args.vigor_data_base_dir,
+            split=args.vigor_val_split,
+            sam_mask_helper=sam_mask_helper,
+            max_samples=100,  # Limit validation set size for faster validation
+            is_train=False,
+            debug_meta=getattr(args, "debug_epoch_shapes", False),
+        )
         
-        print(f"VIGOR验证集加载完成: {len(val_dataset)} 个样本")
+        print(f"VIGOR validation dataset loaded: {len(val_dataset)} instances")
         
     else:
-        # 使用 RobotArm 数据集（原有逻辑）
-        # 使用命令行参数传入的数据集路径（与训练集相同）
+        # RobotArm validation dataset (original logic)
         raw_pic_base_dir = args.dataset_base_dir
         gt_mask_base_dir = args.gt_mask_base_dir
         sam_candidate_base_dir = args.sam_masks_base_dir
         
-        # 准备多个 JSON 文件路径列表（三个视角）
         json_paths = []
         sam_mask_helpers = {}
         
@@ -692,14 +585,12 @@ def init_validation_dataset(args, tokenizer):
             if os.path.exists(annotations_path):
                 json_paths.append(annotations_path)
                 
-                # 为每个视角创建SAM mask helper
                 sam_mask_dir = os.path.join(sam_candidate_base_dir, view_name)
                 if os.path.exists(sam_mask_dir):
                     sam_mask_helpers[view_name] = SAM_Mask_Reader_PNG(sam_mask_dir)
                 else:
                     print(f"Warning: SAM candidate directory not found: {sam_mask_dir}")
         
-        # 与训练集使用同一套"样本池 + 随机切分"，保证严格不重叠
         pooled_samples = _build_robotarm_samples(
             gt_mask_base_dir=gt_mask_base_dir,
             raw_pic_base_dir=raw_pic_base_dir,
@@ -711,7 +602,6 @@ def init_validation_dataset(args, tokenizer):
             seed=args.robotarm_split_seed,
         )
 
-        # 使用 RobotArmDataset（传入切分后的 samples）
         val_dataset = RobotArmDataset(
             json_paths=json_paths,
             tokenizer=tokenizer,
@@ -728,7 +618,7 @@ def init_validation_dataset(args, tokenizer):
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
         
-        print(f"RobotArm验证集加载完成: {len(val_dataset)} 个样本")
+        print(f"RobotArm validation dataset loaded: {len(val_dataset)} samples")
 
     return val_dataset
 
@@ -1438,21 +1328,21 @@ def train(
                                 sim_scores_temp = sim_scores / temperature
                                 sim_dis = torch.nn.functional.softmax(sim_scores_temp, dim=0)
                                 
-                                # # 打印IoU相关信息
-                                # K = gt_ious_round.shape[0]
-                                # print(f"\n  候选mask数量 (K): {K}")
-                                # print(f"\n  1. 原始 gt_ious (IoU值):")
-                                # for i in range(K):
-                                #     print(f"     mask[{i:2d}]: {gt_ious_round[i, 0].item():.6f}")
-                                # print(f"\n  2. gt_ious 经过 softmax 后的分布 (gt_dis):")
-                                # for i in range(K):
-                                #     print(f"     mask[{i:2d}]: {gt_dis[i, 0].item():.10f}")
-                                # print(f"\n  3. 原始 pred_similarity (相似度分数):")
-                                # for i in range(K):
-                                #     print(f"     mask[{i:2d}]: {sim_scores[i, 0].item():.6f}")
-                                # print(f"\n  4. pred_similarity 经过 softmax 后的分布 (sim_dis):")
-                                # for i in range(K):
-                                #     print(f"     mask[{i:2d}]: {sim_dis[i, 0].item():.10f}")
+                                # 打印IoU相关信息
+                                K = gt_ious_round.shape[0]
+                                print(f"\n  候选mask数量 (K): {K}")
+                                print(f"\n  1. 原始 gt_ious (IoU值):")
+                                for i in range(K):
+                                    print(f"     mask[{i:2d}]: {gt_ious_round[i, 0].item():.6f}")
+                                print(f"\n  2. gt_ious 经过 softmax 后的分布 (gt_dis):")
+                                for i in range(K):
+                                    print(f"     mask[{i:2d}]: {gt_dis[i, 0].item():.10f}")
+                                print(f"\n  3. 原始 pred_similarity (相似度分数):")
+                                for i in range(K):
+                                    print(f"     mask[{i:2d}]: {sim_scores[i, 0].item():.6f}")
+                                print(f"\n  4. pred_similarity 经过 softmax 后的分布 (sim_dis):")
+                                for i in range(K):
+                                    print(f"     mask[{i:2d}]: {sim_dis[i, 0].item():.10f}")
                                 
                                 # 诊断：pred_similarity 值差异小的原因分析
                                 sim_scores_min = sim_scores.min().item()

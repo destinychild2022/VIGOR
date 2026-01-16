@@ -459,7 +459,7 @@ def init_mask_generator(model_path: str, use_sam2: bool = False, device: str = "
         )
     else:
         print("use SAM origin")
-        mask_generator = SamAutomaticMaskGenerator(sam, pred_iou_thresh=0.88, stability_score_thresh=0.95)
+        mask_generator = SamAutomaticMaskGenerator(sam, pred_iou_thresh=0.8, stability_score_thresh=0.8)
     
     print("✅ SAM model loaded successfully")
     return mask_generator

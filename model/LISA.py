@@ -4,6 +4,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -62,28 +63,73 @@ class LisaMetaModel:
                 dinov2_weight_path = pth_files[0]
                 print(f"Found local DINOv2 weight: {dinov2_weight_path}")
         
+        # ✅ 防止多进程同时下载 DINOv2 代码仓库导致冲突
+        # 获取当前进程的 rank，只有 rank 0 才下载，其他进程等待
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        
         # 加载模型结构（从 torch.hub，这会下载代码但可能失败）
         # 如果本地有权重文件，使用 pretrained=False 避免下载权重
         use_pretrained = dinov2_weight_path is None
-        try:
-            dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
-            if use_pretrained:
-                print("Loaded DINOv2 from torch.hub (with pretrained weights)")
-            else:
-                print("Loaded DINOv2 model structure from torch.hub")
-        except Exception as e:
-            print(f"Warning: Failed to load DINOv2 from torch.hub ({e})")
-            # 如果 torch.hub 失败，尝试从缓存加载（如果之前下载过）
-            cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
-            if os.path.exists(cache_dir):
+        
+        dinov2_vitl14 = None
+        cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+        
+        # 如果是多 GPU 训练，使用文件锁机制
+        import torch.distributed as dist
+        if dist.is_initialized():
+            if local_rank == 0:
+                # Rank 0 负责下载/加载
+                try:
+                    # 先清理可能损坏的缓存
+                    import shutil
+                    broken_cache = os.path.expanduser("~/.cache/torch/hub/facebookresearch-dinov2-b194f00")
+                    if os.path.exists(broken_cache):
+                        shutil.rmtree(broken_cache, ignore_errors=True)
+                    
+                    dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
+                    print(f"[Rank 0] Loaded DINOv2 model structure from torch.hub")
+                except Exception as e:
+                    print(f"[Rank 0] Warning: Failed to load DINOv2 from torch.hub ({e})")
+                    if os.path.exists(cache_dir):
+                        try:
+                            dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
+                            print("[Rank 0] Loaded DINOv2 model structure from local cache")
+                        except Exception as e2:
+                            print(f"[Rank 0] Error: Cannot load DINOv2 from cache: {e2}")
+                            raise e2
+                    else:
+                        raise e
+            
+            # 等待 Rank 0 完成下载
+            dist.barrier()
+            
+            if local_rank != 0:
+                # 其他 Rank 从缓存加载
                 try:
                     dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
-                    print("Loaded DINOv2 model structure from local cache")
-                except Exception as e2:
-                    print(f"Error: Cannot load DINOv2 model structure from cache. Please ensure the model is available.")
-                    raise e2
-            else:
-                raise e
+                    print(f"[Rank {local_rank}] Loaded DINOv2 model structure from local cache")
+                except Exception as e:
+                    print(f"[Rank {local_rank}] Error: Cannot load DINOv2 from cache: {e}")
+                    raise e
+        else:
+            # 单 GPU 训练，直接加载
+            try:
+                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
+                if use_pretrained:
+                    print("Loaded DINOv2 from torch.hub (with pretrained weights)")
+                else:
+                    print("Loaded DINOv2 model structure from torch.hub")
+            except Exception as e:
+                print(f"Warning: Failed to load DINOv2 from torch.hub ({e})")
+                if os.path.exists(cache_dir):
+                    try:
+                        dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
+                        print("Loaded DINOv2 model structure from local cache")
+                    except Exception as e2:
+                        print(f"Error: Cannot load DINOv2 model structure from cache.")
+                        raise e2
+                else:
+                    raise e
         
         # 如果本地有权重文件，加载本地权重
         if dinov2_weight_path and os.path.exists(dinov2_weight_path):
@@ -94,7 +140,6 @@ class LisaMetaModel:
                 print(f"Successfully loaded DINOv2 weights from local path")
             except Exception as e:
                 print(f"Warning: Failed to load weights from local path ({e}), using pretrained weights")
-                # 如果本地权重加载失败，使用预训练权重
                 dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
         
         self.visual_model_dinov2 = dinov2_vitl14
@@ -483,10 +528,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         seg_mask = seg_token_mask
         if last_hidden_state.dim() == 2 and seg_mask.dim() == 2 and seg_mask.shape[0] == 1:
             seg_mask = seg_mask[0]
-        print(f"DEBUG: input_ids.shape={input_ids.shape}")
-        print(f"DEBUG: seg_token_mask.shape={seg_token_mask.shape}")
-        print(f"DEBUG: last_hidden_state.shape={last_hidden_state.shape}")
-        print(f"DEBUG: seg_mask.shape={seg_mask.shape}")
+        # print(f"DEBUG: input_ids.shape={input_ids.shape}")
+        # print(f"DEBUG: seg_token_mask.shape={seg_token_mask.shape}")
+        # print(f"DEBUG: last_hidden_state.shape={last_hidden_state.shape}")
+        # print(f"DEBUG: seg_mask.shape={seg_mask.shape}")
 
         pred_embeddings = last_hidden_state[seg_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
@@ -907,7 +952,13 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             segs_feature = sam_segs_feature_list[batch_idx]  # (C, K, D) D=256
             gt_iou = sam_ious_list[batch_idx]            # (R,K)
             gt_iop = sam_iops_list[batch_idx]            # (R,K)
-            pred_iou = sam_pred_ious_list[batch_idx] 
+            pred_iou = sam_pred_ious_list[batch_idx]
+            
+            # Convert to tensor if numpy array
+            if isinstance(gt_iou, np.ndarray):
+                gt_iou = torch.from_numpy(gt_iou)
+            if isinstance(gt_iop, np.ndarray):
+                gt_iop = torch.from_numpy(gt_iop) 
             # # multiple conversations
             # assert gt_iou.shape[0] == pred_embeddings[batch_idx].shape[0], "number of rounds mismatch, gt_iou.shape: {}, pred_embeddings.shape: {}".format(gt_iou.shape, pred_embeddings[batch_idx].shape)
             # assert gt_iou.shape[0] != 0, "number of rounds = 0; gt_iou.shape: {}".format(gt_iou.shape)
@@ -921,9 +972,17 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
             for round_idx in range(number_rounds):
                 gt_iou_round = gt_iou[round_idx] # (K)
+                gt_iop_round = gt_iop[round_idx] # (K)
+                
+                # Ensure they are tensors (indexing may return numpy in some cases)
+                if isinstance(gt_iou_round, np.ndarray):
+                    gt_iou_round = torch.from_numpy(gt_iou_round)
+                if isinstance(gt_iop_round, np.ndarray):
+                    gt_iop_round = torch.from_numpy(gt_iop_round)
+                
                 gt_iou_round = gt_iou_round.unsqueeze(1) # (K, 1)
-                gt_iou_round = gt_iou_round.to(dtype = pred_iou.dtype)
-                gt_iop_round = gt_iop[round_idx].unsqueeze(1).to(dtype = pred_iou.dtype) # (K, 1
+                gt_iou_round = gt_iou_round.to(dtype=pred_iou.dtype, device=pred_iou.device)
+                gt_iop_round = gt_iop_round.unsqueeze(1).to(dtype=pred_iou.dtype, device=pred_iou.device) # (K, 1)
 
                 target_embedding = pred_embeddings[batch_idx][round_idx].unsqueeze(0)  # (1, D)
                 # align_loss_round += sigmoid_align_loss(segs_feature, target_embedding, gt_iou_round, 

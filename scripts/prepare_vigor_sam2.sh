@@ -17,7 +17,7 @@ FINETUNED_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finet
 DATASET_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train"
 
 # 设置输出目录
-OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.88_0.95"
+OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
 
 # 设置GPU
 GPU_IDS="0"

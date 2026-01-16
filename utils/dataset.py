@@ -53,6 +53,7 @@ def collate_fn_new(
     segmentation_paths_list = []
     candidate_mask_paths_list = []
     debug_meta_list = []
+    object_name_list = []  # ✅ 添加物体名称列表
     
     for data in batch:
         image_path_list.append(data.get('image_path'))
@@ -85,6 +86,7 @@ def collate_fn_new(
         # candidate_mask_paths_list 应该是列表
         candidate_mask_paths_list.append(data.get('candidate_mask_paths_list', []))  # optional
         debug_meta_list.append(data.get("debug_meta", None))
+        object_name_list.append(data.get('object_name', 'object'))  # ✅ 收集物体名称
 
     if use_mm_start_end:
         # replace <image> token
@@ -162,6 +164,10 @@ def collate_fn_new(
             input_ids = input_ids[:, :truncate_len]
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
+    
+    # # 🔍 调试: 打印收集到的物体名称
+    # if len(object_name_list) > 0:
+    #     print(f"[Collate Debug] Batch size: {len(object_name_list)}, Object names: {object_name_list}")
 
     return {
         "image_paths": image_path_list,
@@ -186,6 +192,7 @@ def collate_fn_new(
         "segmentation_paths": segmentation_paths_list,  # GT mask paths
         "candidate_mask_paths_list": candidate_mask_paths_list,  # SAM candidate mask paths
         "debug_meta_list": debug_meta_list,  # 每个样本的维度追踪信息（非tensor）
+        "object_name_list": object_name_list,  # ✅ GT物体名称列表
     }
 
 

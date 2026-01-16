@@ -101,15 +101,28 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         
         for ann in annotations:
             scene = ann.get('scene', '')
-            object_name = ann.get('object', 'object')
+            # ✅ 优先使用 gt_object，如果没有则使用 object
+            object_name = ann.get('gt_object', ann.get('object', 'object'))
             gt_mask_path_rel = ann.get('gt_mask_path', '')
             instructions = ann.get('instructions', [])
+            
+            # 🔍 调试: 打印JSON中的字段
+            # 只打印Hard样本(object != gt_object)
+            if ann.get('object') != ann.get('gt_object'):
+                hard_count = sum(1 for s in samples if s.get('object') != s.get('gt_object'))
+                if hard_count < 5:  # 只打印前5个Hard样本
+                    print(f"\n[Hard Sample #{hard_count + 1}]:", flush=True)
+                    print(f"  - object (被遮挡): {ann.get('object', 'N/A')}", flush=True)
+                    print(f"  - gt_object (要抓取): {ann.get('gt_object', 'N/A')}", flush=True)
+                    print(f"  - 使用: {object_name}", flush=True)
+            
             
             if not gt_mask_path_rel:
                 continue
             
             mask_filename = os.path.basename(gt_mask_path_rel)
-            match = re.match(r'(\d+)_', mask_filename)
+            # ✅ 修复: 使用 \d+ 匹配任意位数的数字 (1位、2位、3位都可以)
+            match = re.match(r'^(\d+)_', mask_filename)
             if not match:
                 print(f"Warning: Cannot extract image number from mask filename: {mask_filename}")
                 continue
@@ -124,7 +137,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
                 'image_path': image_path,
                 'gt_mask_path': gt_mask_path,
                 'instructions': instructions,
-                'object': object_name,
+                'object': object_name,      # 保持兼容性
+                'gt_object': object_name,   # ✅ 添加gt_object键,值来自JSON的gt_object字段
                 'scene': scene,
                 'img_name': img_name,
             })
@@ -144,7 +158,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             # 处理不同的样本格式
             image_path_rel = ann.get('image', ann.get('image_path', ''))
             gt_mask_path_rel = ann.get('gt_mask_path', '')
-            object_name = ann.get('object', 'object')
+            # ✅ 优先使用 gt_object
+            object_name = ann.get('gt_object', ann.get('object', 'object'))
             instructions = ann.get('instructions', [])
             
             if not gt_mask_path_rel:
@@ -167,7 +182,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
                 'image_path': image_path,  # 这是关键：完整的绝对路径
                 'gt_mask_path': gt_mask_path,
                 'instructions': instructions,
-                'object': object_name,
+                'object': object_name,      # 保持兼容性
+                'gt_object': object_name,   # ✅ 添加gt_object键
                 'scene': ann.get('scene', ''),
                 'img_name': img_name,
             })
@@ -216,6 +232,15 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             gt_mask = np.ones(ori_size, dtype=np.uint8)
         else:
             gt_mask = (gt_mask > 0).astype(np.float32)
+        
+        # # 🔍 调试: 打印GT mask和物体信息 (每100个样本打印一次)
+        # if idx % 1 == 0:
+        #     print(f"[Dataset Debug] Sample {idx}:", flush=True)
+        #     print(f"  - Object name: {sample.get('object', 'N/A')}", flush=True)
+        #     print(f"  - GT mask path: {gt_mask_path}", flush=True)
+        #     print(f"  - Original image size: {ori_size}", flush=True)
+        #     print(f"  - GT mask original shape: {gt_mask.shape}", flush=True)
+        #     print(f"  - GT mask value range: [{gt_mask.min():.2f}, {gt_mask.max():.2f}]", flush=True)
         
         # 获取SAM候选segments（如果有）
         if self.sam_mask_helper is not None:
@@ -288,27 +313,39 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         elif self.precision == "bf16":
             precision_type = torch.bfloat16
         segs = segs.to(precision_type)
-        
+
         image = self.transform.apply_image(image)
         resize = image.shape[:2]
-        
+
+        # ❌ 删除GT mask预处理 - 可视化需要原始尺寸的mask
+        # 直接返回原始GT mask (H_orig, W_orig),让可视化代码自己resize
+        # 这与 vigor_dataset.py 的行为一致
+
         # 按照robot_arm_dataset.py的方式添加预处理（归一化 + padding到正方形）
         image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
-        
+
         # 获取指令列表，并根据instruction_idx选择对应指令
         instructions = sample.get('instructions', [])
         if not instructions:
             instructions = [f"segment {sample.get('object', 'object')}"]
-        
+
         # 确保instruction_idx不超出范围
         if instruction_idx >= len(instructions):
             instruction_idx = 0
-        
+
         instruction = instructions[instruction_idx]
         question = f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"
-        
+
         # 生成对话
-        conversation_list = [self._build_conversation(instruction)]
+        conversation_list = [self._build_conversation(question)]
+
+        # # 🔍 调试: 打印返回的object_name
+        # if idx < 3:
+        #     print(f"\n[__getitem__ Debug] idx={idx}:", flush=True)
+        #     print(f"  - sample dict keys: {list(sample.keys())}", flush=True)
+        #     print(f"  - sample.get('object'): {sample.get('object', 'N/A')}", flush=True)
+        #     print(f"  - sample.get('gt_object'): {sample.get('gt_object', 'N/A')}", flush=True)
+        #     print(f"  - 返回的 object_name: {sample.get('gt_object', sample.get('object', 'object'))}", flush=True)
         
         # 返回单个实例（不再是列表）
         return {
@@ -316,8 +353,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             'images': image,  # 现在是tensor
             'images_clip': image_clip,
             'conversations': conversation_list,
-            'masks': segs,
-            'label': torch.ones(segs.shape[1], segs.shape[2]) * self.ignore_label,
+            'masks': torch.from_numpy(gt_mask).unsqueeze(0),  # ✅ 返回原始尺寸的GT mask
+            'label': torch.ones(gt_mask.shape[0], gt_mask.shape[1]) * self.ignore_label,
             'resize': resize,
             'questions': [question],
             'sampled_classes': [instruction],
@@ -333,6 +370,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             'sam_ious_list': sampled_ious.tolist() if isinstance(sampled_ious, torch.Tensor) else sampled_ious,
             'candidate_mask_paths_list': segs_dict.get("mask_paths", []),
             'debug_meta': None,
+            'object_name': sample['gt_object'],  # ✅ 直接使用 gt_object (已在第138行添加)
         }
     
     def _build_conversation(self, instruction):
