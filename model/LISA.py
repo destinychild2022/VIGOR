@@ -114,6 +114,20 @@ class LisaMetaModel:
         else:
             # 单 GPU 训练，直接加载
             try:
+                # 先清理可能损坏的缓存（与多 GPU 逻辑一致）
+                import shutil
+                for broken_cache_pattern in [
+                    "~/.cache/torch/hub/facebookresearch-dinov2*",
+                    "~/.cache/torch/hub/facebookresearch_dinov2_main",
+                ]:
+                    import glob
+                    for broken_cache in glob.glob(os.path.expanduser(broken_cache_pattern)):
+                        try:
+                            shutil.rmtree(broken_cache, ignore_errors=True)
+                            print(f"Cleaned up broken cache: {broken_cache}")
+                        except Exception:
+                            pass
+                
                 dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
                 if use_pretrained:
                     print("Loaded DINOv2 from torch.hub (with pretrained weights)")

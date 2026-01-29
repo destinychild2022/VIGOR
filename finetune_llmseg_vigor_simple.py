@@ -46,6 +46,58 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          intersectionAndUnionGPU)
 
 
+def release_model_weight_cache(args):
+    """
+    释放模型权重文件的 page cache，避免内存持续增长。
+    在模型加载到 GPU 后调用，此时磁盘文件的缓存已不再需要。
+    """
+    import os
+    
+    weight_paths = [
+        args.vision_pretrained,  # SAM 权重
+        args.version,  # LISA/LLaMA 模型目录
+        args.vision_tower,  # CLIP 模型目录
+        "/opt/data/private/model/dinov2_vitl14",  # DINOv2 权重（如果存在）
+        os.path.expanduser("~/.cache/torch/hub"),  # torch hub 缓存
+    ]
+    
+    def release_path_cache(path):
+        if path is None or not os.path.exists(path):
+            return 0
+        count = 0
+        try:
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            fd = os.open(fp, os.O_RDONLY)
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            os.close(fd)
+                            count += 1
+                        except Exception:
+                            pass
+            elif os.path.isfile(path):
+                fd = os.open(path, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+                count = 1
+        except Exception as e:
+            print(f"  [警告] 释放缓存失败 {path}: {e}")
+        return count
+    
+    total_count = 0
+    for path in weight_paths:
+        if path:
+            released = release_path_cache(path)
+            if released > 0:
+                print(f"  [缓存释放] {path}: {released} 个文件")
+            total_count += released
+    
+    if total_count > 0:
+        print(f"  [缓存释放] 共释放 {total_count} 个文件的 page cache")
+
+
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
@@ -564,7 +616,7 @@ def init_validation_dataset(args, tokenizer):
             data_base_dir=args.vigor_data_base_dir,
             split=args.vigor_val_split,
             sam_mask_helper=sam_mask_helper,
-            max_samples=100,  # Limit validation set size for faster validation
+            max_samples=2,  # Limit validation set size for faster validation
             is_train=False,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
@@ -740,6 +792,15 @@ def main(args):
         model_parameters=model.parameters(),
         config=ds_config,
     )
+    
+    # ✅ 模型已加载到 GPU，释放权重文件的 page cache
+    if args.local_rank == 0:
+        print("[信息] 模型加载完成，开始释放权重文件的 page cache...")
+        release_model_weight_cache(args)
+    # 同步所有进程
+    if args.distributed:
+        torch.distributed.barrier()
+    
     sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
     train_loader = DataLoader(
         train_dataset,batch_size=args.batch_size, sampler=sampler, 
@@ -841,6 +902,7 @@ def main(args):
             if args.no_eval or is_best:
                 # pass
                 save_dir = os.path.join(args.log_dir, "ckpt_model")
+                temp_save_dir = os.path.join(args.log_dir, "ckpt_model_new")  # 临时保存目录
                 if args.local_rank == 0:
                     torch.save(
                         {"epoch": epoch},
@@ -851,37 +913,33 @@ def main(args):
                             ),
                         ),
                     )
-                    # ✅ 修复：使用更安全的方式删除checkpoint目录
-                    # 问题：DeepSpeed会在checkpoint目录下创建global_step*子目录，直接删除可能失败
-                    # 解决：先等待所有进程同步，然后重命名旧checkpoint为备份，最后删除
-                    if os.path.exists(save_dir):
+                    # ✅ 保存前：清理可能存在的临时目录（上次保存中断残留）
+                    if os.path.exists(temp_save_dir):
                         try:
-                            # 方案1：重命名旧checkpoint为备份（更安全，不会丢失数据）
-                            backup_dir = save_dir + f"_backup_epoch{epoch}"
-                            if os.path.exists(backup_dir):
-                                shutil.rmtree(backup_dir, ignore_errors=True)
-                            os.rename(save_dir, backup_dir)
-                            # 异步删除备份目录（不阻塞训练）
-                            import threading
-                            def delete_backup():
-                                try:
-                                    shutil.rmtree(backup_dir, ignore_errors=True)
-                                except:
-                                    pass
-                            threading.Thread(target=delete_backup, daemon=True).start()
+                            shutil.rmtree(temp_save_dir, ignore_errors=True)
                         except Exception as e:
-                            # 如果重命名失败，尝试直接删除（使用ignore_errors确保不会崩溃）
-                            print(f"  [警告] 重命名checkpoint目录失败: {e}，尝试直接删除")
-                            try:
-                                shutil.rmtree(save_dir, ignore_errors=True)
-                            except Exception as e2:
-                                print(f"  [警告] 删除checkpoint目录也失败: {e2}，DeepSpeed将覆盖保存")
-                # ✅ 关键：等待所有进程同步，确保删除操作完成后再保存
+                            print(f"  [警告] 清理临时目录失败: {e}")
+                
+                # ✅ 关键：等待所有进程同步
                 torch.distributed.barrier()
-                # DeepSpeed会自动创建新的checkpoint目录和global_step*子目录
-                model_engine.save_checkpoint(save_dir)
+                
+                # ✅ 第1步：先保存到临时目录（保证旧权重安全）
+                model_engine.save_checkpoint(temp_save_dir)
+                
+                # ✅ 第2步：保存成功后，删除旧权重，再重命名临时目录为正式目录
                 if args.local_rank == 0:
-                    print("checkpoint saved in {}".format(save_dir))
+                    try:
+                        # 删除旧的 checkpoint 目录
+                        if os.path.exists(save_dir):
+                            shutil.rmtree(save_dir, ignore_errors=True)
+                        # 重命名临时目录为正式目录
+                        os.rename(temp_save_dir, save_dir)
+                        print("checkpoint saved in {}".format(save_dir))
+                    except Exception as e:
+                        print(f"  [警告] 重命名checkpoint目录失败: {e}，权重已保存在 {temp_save_dir}")
+                
+                # ✅ 等待主进程完成重命名
+                torch.distributed.barrier()
     except KeyboardInterrupt:
         if args.local_rank == 0:
             print("\n[信息] 收到中断信号（Ctrl+C），正在优雅退出...")
