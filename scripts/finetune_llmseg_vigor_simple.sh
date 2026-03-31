@@ -69,12 +69,13 @@ if [ ! -x "$DEEPSPEED_BIN" ]; then
 fi
 
 echo "========================================================================"
-echo "  VIGOR 简化版微调训练"
+echo "  VIGOR 简化版微调训练 (双权重保存版)"
 echo "========================================================================"
 echo "模型路径: ${MODEL_PATH}"
-echo "数据集: ${VIGOR_DATA_DIR}"
-echo "GPU: ${GPU_IDS}"
+echo "数据目录: ${VIGOR_DATA_DIR}"
+echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
+echo "权重保存: ckpt_model/best (最优) 和 newest (最新)"
 echo "验证样本数: ${VAL_MAX_SAMPLES}"
 echo "可视化样本数: ${MAX_VIS_SAMPLES}"
 echo "========================================================================"

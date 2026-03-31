@@ -134,7 +134,6 @@ def parse_args(args):
     parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
     parser.add_argument("--vigor_val_max_samples", default=2, type=int, help="Max samples for VIGOR validation set")
     parser.add_argument("--vigor_only_hard", action="store_true", default=False, help="Only load hard samples for VIGOR dataset (skip easy samples)")
-    parser.add_argument("--vigor_max_instructions", default=None, type=int, help="一张图最多加载前 N 条指令（如 2 代表不加载第 3 条指令）")
     
     parser.add_argument("--sample_rates", default="10, 1", type=str)
 
@@ -523,13 +522,6 @@ def init_training_dataset(args, tokenizer):
         if args.vigor_max_samples is not None:
              all_raw_samples = all_raw_samples[:args.vigor_max_samples]
 
-        # --- 【核心新增】：根据参数过滤每个样本的指令数量（如只保留前两条入选） ---
-        if args.vigor_max_instructions is not None:
-            print(f"   -> [过滤] 限制每张图最多指令数: {args.vigor_max_instructions}")
-            for sample in all_raw_samples:
-                if "objects" in sample:
-                    sample["objects"] = sample["objects"][:args.vigor_max_instructions]
-
         train_dataset = VIGORDatasetMultiInstance(
             json_path=None,
             tokenizer=tokenizer,
@@ -624,21 +616,9 @@ def init_validation_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_val_sam_masks_dir not specified")
         
-        # 为了统一过滤逻辑，如果是 VIGOR 数据集，我们先手动加载并切片指令
-        all_raw_val_samples = None
-        if args.vigor_max_instructions is not None:
-             print(f"   -> [验证集过滤] 限制每张图最多指令数: {args.vigor_max_instructions}")
-             if os.path.exists(vigor_json_path):
-                 with open(vigor_json_path, 'r') as f:
-                     content = json.load(f)
-                 all_raw_val_samples = content["samples"] if isinstance(content, dict) else content
-                 for sample in all_raw_val_samples:
-                     if "objects" in sample:
-                         sample["objects"] = sample["objects"][:args.vigor_max_instructions]
-        
         # Use VIGORDatasetMultiInstance for validation
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=vigor_json_path if all_raw_val_samples is None else None,
+            json_path=vigor_json_path,
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
@@ -648,7 +628,6 @@ def init_validation_dataset(args, tokenizer):
             sam_mask_helper=sam_mask_helper,
             max_samples=args.vigor_val_max_samples,  # Limit validation set size for faster validation
             is_train=False,
-            samples=all_raw_val_samples,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
         
@@ -867,9 +846,12 @@ def main(args):
 
     # resume deepspeed checkpoint
     if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir, "ckpt_model")
+        # ✅ 现在自动恢复指向最新的权重最新的子目录
+        resume = os.path.join(args.log_dir, "ckpt_model", "newest")
         if os.path.exists(resume):
             args.resume = resume
+            if args.local_rank == 0:
+                print(f"[信息] 发现现有权重，将从 {resume} 自动恢复训练...")
 
     if args.resume:
         load_path, client_state = model_engine.load_checkpoint(args.resume, load_optimizer_states=False, load_lr_scheduler_states=False)
@@ -929,48 +911,74 @@ def main(args):
                 cur_ciou = ciou if is_best else cur_ciou
 
             
-            # save checkpoint
-            if args.no_eval or is_best:
-                # pass
-                save_dir = os.path.join(args.log_dir, "ckpt_model")
-                temp_save_dir = os.path.join(args.log_dir, "ckpt_model_new")  # 临时保存目录
+            # ========== 保存权重逻辑 (newest & best) ==========
+            # 定义保存路径
+            newest_save_dir = os.path.join(args.log_dir, "ckpt_model", "newest")
+            best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
+            
+            # 第一步：每个 Epoch 结束都保存一次 "newest"
+            # 我们先保存到临时目录，再 rename 以确保原子性
+            temp_save_dir = os.path.join(args.log_dir, "ckpt_model", "newest_temp")
+            
+            # 清理残留的 temp
+            if args.local_rank == 0 and os.path.exists(temp_save_dir):
+                shutil.rmtree(temp_save_dir, ignore_errors=True)
+            
+            torch.distributed.barrier()
+            
+            # 记录保存开始
+            if args.local_rank == 0:
+                print(f"\n[Epoch {epoch}] 正在保存最新权重 (newest) 到: {newest_save_dir}...")
+            
+            # 调用 DeepSpeed 保存
+            model_engine.save_checkpoint(temp_save_dir)
+            
+            # 主进程负责重命名操作
+            if args.local_rank == 0:
+                try:
+                    # 确保父目录存在
+                    os.makedirs(os.path.dirname(newest_save_dir), exist_ok=True)
+                    # 删除旧的 newest
+                    if os.path.exists(newest_save_dir):
+                        shutil.rmtree(newest_save_dir, ignore_errors=True)
+                    # 重命名
+                    os.rename(temp_save_dir, newest_save_dir)
+                    print(f"  [成功] 最新权重已更新: {newest_save_dir}")
+                except Exception as e:
+                    print(f"  [警告] newest 重命名失败: {e}，权重暂留在 {temp_save_dir}")
+
+            # 第二步：如果当前是历史最高分，则同步更新 "best"
+            if not args.no_eval and is_best:
                 if args.local_rank == 0:
+                    print(f"  [🎉 创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
+                    # 同时也保存一个对应的 meta log
                     torch.save(
-                        {"epoch": epoch},
+                        {"epoch": epoch, "giou": best_score, "ciou": cur_ciou},
                         os.path.join(
                             args.log_dir,
-                            "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
-                                best_score, cur_ciou
-                            ),
+                            "meta_log_BEST_epoch{}_giou{:.3f}.pth".format(epoch, best_score),
                         ),
                     )
-                    # ✅ 保存前：清理可能存在的临时目录（上次保存中断残留）
-                    if os.path.exists(temp_save_dir):
-                        try:
-                            shutil.rmtree(temp_save_dir, ignore_errors=True)
-                        except Exception as e:
-                            print(f"  [警告] 清理临时目录失败: {e}")
                 
-                # ✅ 关键：等待所有进程同步
+                # 同样采用 temp 方式保存 best，避免保存一半挂了
+                best_temp_save_dir = os.path.join(args.log_dir, "ckpt_model", "best_temp")
+                if args.local_rank == 0 and os.path.exists(best_temp_save_dir):
+                    shutil.rmtree(best_temp_save_dir, ignore_errors=True)
+                
                 torch.distributed.barrier()
-                
-                # ✅ 第1步：先保存到临时目录（保证旧权重安全）
-                model_engine.save_checkpoint(temp_save_dir)
-                
-                # ✅ 第2步：保存成功后，删除旧权重，再重命名临时目录为正式目录
+                model_engine.save_checkpoint(best_temp_save_dir)
+
                 if args.local_rank == 0:
                     try:
-                        # 删除旧的 checkpoint 目录
-                        if os.path.exists(save_dir):
-                            shutil.rmtree(save_dir, ignore_errors=True)
-                        # 重命名临时目录为正式目录
-                        os.rename(temp_save_dir, save_dir)
-                        print("checkpoint saved in {}".format(save_dir))
+                        if os.path.exists(best_save_dir):
+                            shutil.rmtree(best_save_dir, ignore_errors=True)
+                        os.rename(best_temp_save_dir, best_save_dir)
+                        print(f"  [成功] 最好权重已更新: {best_save_dir}")
                     except Exception as e:
-                        print(f"  [警告] 重命名checkpoint目录失败: {e}，权重已保存在 {temp_save_dir}")
-                
-                # ✅ 等待主进程完成重命名
-                torch.distributed.barrier()
+                        print(f"  [警告] best 重命名失败: {e}")
+
+            torch.distributed.barrier()
+            # ================================================
     except KeyboardInterrupt:
         if args.local_rank == 0:
             print("\n[信息] 收到中断信号（Ctrl+C），正在优雅退出...")
