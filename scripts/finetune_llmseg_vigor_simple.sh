@@ -7,25 +7,58 @@
 # - 只使用 DeepSpeed 原生的 checkpoint 保存
 # ========================================================================
 
-# 基础模型路径
-llava_path="/opt/data/private/model/LISA_Plus_7b"
-clip_path="/opt/data/private/model/clip-vit-large-patch14"
-vision_path="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+# ========== 模型路径配置 ==========
+MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
+CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
+VISION_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
-# VIGOR-100K数据集路径
-vigor_data_base_dir="/opt/data/private/LLMSeg/dataset/VIGOR-100K"
-vigor_split="train"
-vigor_val_split="test"
-
+# ========== VIGOR 数据集配置 ==========
+VIGOR_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K"
+VIGOR_TRAIN_SPLIT="train"
+VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
-vigor_train_sam_masks="${vigor_data_base_dir}/train_masks_sam_0.8_0.8"
-vigor_val_sam_masks="${vigor_data_base_dir}/test_mask/sam_masks"
+VIGOR_TRAIN_SAM_MASKS="${VIGOR_DATA_DIR}/train_masks_sam_0.8_0.8"
+VIGOR_VAL_SAM_MASKS="${VIGOR_DATA_DIR}/test_mask/sam_masks"
+# 是否只使用 hard 样本 (不使用 easy 样本)
+VIGOR_ONLY_HARD=true
 
-log_path="./runs"
-exp_name="finetune_llmseg_vigor_simple"
+# ========== 输出配置 ==========
+LOG_DIR="./runs"
+EXP_NAME="finetune_llmseg_vigor_simple-hard_7times_2instru"
+TRAIN_VIS_DIR="train_vis"
+VAL_VIS_DIR="val_vis"
+EVAL_VIS_DIR="eval_vis_iop"
 
-# DeepSpeed checkpoint 路径
-resume_path=""
+# ========== 训练超参数 ==========
+EPOCHS=24  #70*14*3/2
+STEPS_PER_EPOCH=1000
+BATCH_SIZE=8
+GRAD_ACCUMULATION_STEPS=1
+LR=2e-5
+PRECISION="bf16"
+ALIGN_TEMP=0.05
+VIGOR_MAX_INSTRUCTIONS=2
+
+# ========== 验证配置 ==========
+# 验证集最大样本数（instances）
+VAL_MAX_SAMPLES=50
+# 每个 epoch 可视化样本数
+MAX_VIS_SAMPLES=4
+
+# ========== LoRA 配置 ==========
+LORA_R=8
+LORA_ALPHA=16
+LORA_DROPOUT=0.1
+LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
+
+# ========== GPU 配置 ==========
+GPU_IDS="0,1"
+MASTER_PORT=24375
+
+# ========== Checkpoint 配置 ==========
+RESUME_PATH=""
+
+# ========================================================================
 
 cd "$(dirname "$0")/.." || exit 1
 
@@ -35,35 +68,60 @@ if [ ! -x "$DEEPSPEED_BIN" ]; then
   DEEPSPEED_BIN="deepspeed"
 fi
 
-# 双卡训练
-$DEEPSPEED_BIN --include localhost:0,1 \
-  --master_port=24374 finetune_llmseg_vigor_simple.py \
-  --version="$llava_path" \
-  --vision-tower="$clip_path" \
-  --vision_pretrained="$vision_path" \
+echo "========================================================================"
+echo "  VIGOR 简化版微调训练"
+echo "========================================================================"
+echo "模型路径: ${MODEL_PATH}"
+echo "数据集: ${VIGOR_DATA_DIR}"
+echo "GPU: ${GPU_IDS}"
+echo "实验名称: ${EXP_NAME}"
+echo "验证样本数: ${VAL_MAX_SAMPLES}"
+echo "可视化样本数: ${MAX_VIS_SAMPLES}"
+echo "========================================================================"
+
+# 额外的可选参数
+EXTRA_ARGS=""
+if [ "${VIGOR_ONLY_HARD}" = true ]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --vigor_only_hard"
+fi
+
+# 执行训练
+$DEEPSPEED_BIN --include localhost:${GPU_IDS} \
+  --master_port=${MASTER_PORT} finetune_llmseg_vigor_simple.py \
+  --version="${MODEL_PATH}" \
+  --vision-tower="${CLIP_PATH}" \
+  --vision_pretrained="${VISION_PATH}" \
   --dataset="vigor" \
   --sample_rates="1" \
-  --vigor_data_base_dir="$vigor_data_base_dir" \
-  --vigor_split="$vigor_split" \
-  --vigor_val_split="$vigor_val_split" \
-  --vigor_train_sam_masks_dir="$vigor_train_sam_masks" \
-  --vigor_val_sam_masks_dir="$vigor_val_sam_masks" \
-  --exp_name="$exp_name" \
-  --log_base_dir="$log_path" \
-  --steps_per_epoch=1000 \
-  --lr=2e-5 \
-  --epochs=70 \
-  --batch_size=8 \
-  --grad_accumulation_steps=1 \
+  --vigor_data_base_dir="${VIGOR_DATA_DIR}" \
+  --vigor_split="${VIGOR_TRAIN_SPLIT}" \
+  --vigor_val_split="${VIGOR_VAL_SPLIT}" \
+  --vigor_train_sam_masks_dir="${VIGOR_TRAIN_SAM_MASKS}" \
+  --vigor_val_sam_masks_dir="${VIGOR_VAL_SAM_MASKS}" \
+  --vigor_val_max_samples=${VAL_MAX_SAMPLES} \
+  --max_vis_samples=${MAX_VIS_SAMPLES} \
+  --exp_name="${EXP_NAME}" \
+  --log_base_dir="${LOG_DIR}" \
+  --steps_per_epoch=${STEPS_PER_EPOCH} \
+  --lr=${LR} \
+  --epochs=${EPOCHS} \
+  --batch_size=${BATCH_SIZE} \
+  --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
   --workers=4 \
-  --lora_r=8 \
-  --lora_alpha=16 \
-  --lora_dropout=0.1 \
-  --lora_target_modules="q_proj,k_proj,v_proj,out_proj" \
-  --precision="bf16" \
+  --lora_r=${LORA_R} \
+  --lora_alpha=${LORA_ALPHA} \
+  --lora_dropout=${LORA_DROPOUT} \
+  --lora_target_modules="${LORA_TARGET_MODULES}" \
+  --precision="${PRECISION}" \
   --visualize \
-  --resume="$resume_path" \
-  --train_vis_dir="train_vis" \
-  --val_vis_dir="val_vis" \
-  --eval_vis_dir="eval_vis_iop" \
-  --align_temperature=0.05
+  --resume="${RESUME_PATH}" \
+  --train_vis_dir="${TRAIN_VIS_DIR}" \
+  --val_vis_dir="${VAL_VIS_DIR}" \
+  --eval_vis_dir="${EVAL_VIS_DIR}" \
+  --align_temperature=${ALIGN_TEMP} \
+  --vigor_max_instructions=${VIGOR_MAX_INSTRUCTIONS} \
+  ${EXTRA_ARGS}
+
+echo "========================================================================"
+echo "  训练结束"
+echo "========================================================================"

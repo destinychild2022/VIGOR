@@ -19,6 +19,7 @@ import json
 import time
 import re
 from typing import Dict, List, Tuple
+from collections import defaultdict
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -76,6 +77,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--conv_type", default="llava_v1", type=str)
+    parser.add_argument("--device", default="cuda:0", type=str, help="使用的 GPU 设备")
     
     # LoRA 配置（需要与训练时一致）
     parser.add_argument("--lora_r", default=8, type=int, help="LoRA rank")
@@ -98,6 +100,8 @@ def parse_args(args):
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--max_samples", default=None, type=int,
                         help="最大测试样本数（用于调试）")
+    parser.add_argument("--split", default="both", type=str,
+                        choices=["easy", "hard", "both"], help="测试的数据子集")
     
     return parser.parse_args(args)
 
@@ -187,7 +191,8 @@ def save_visualization(
     vis_dir: str,
     sample_info: dict,
     instruction_idx: int,
-    iou: float
+    iou: float,
+    obj_count: int = 1
 ):
     """保存可视化结果 - 左侧 GT mask（绿色），右侧预测 mask（红色）
     
@@ -199,6 +204,7 @@ def save_visualization(
         sample_info: 包含 gt_object, difficulty, img_name 等信息
         instruction_idx: 指令索引 (0, 1, 2)
         iou: IoU 值
+        obj_count: 同一图片中同一物体名称的实例计数
     """
     h, w = image_np.shape[:2]
     
@@ -271,7 +277,7 @@ def save_visualization(
     
     # 清理 gt_object 名称中可能存在的特殊字符（用于文件名）
     gt_object_clean = gt_object.replace('/', '_').replace('\\', '_').replace(' ', '_')
-    output_filename = f"{img_name}_{gt_object_clean}_instr{instruction_idx}_iou{iou:.3f}.png"
+    output_filename = f"{img_name}_{gt_object_clean}_{obj_count}_instr{instruction_idx}_iou{iou:.3f}.png"
 
     output_path = os.path.join(difficulty_dir, output_filename)
     
@@ -349,7 +355,7 @@ def load_model(args):
     model_args_obj = ModelArgs()
     model.get_model().initialize_vision_modules(model_args_obj)
     vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype, device="cuda")
+    vision_tower.to(dtype=torch_dtype, device=args.device)
     model.get_model().initialize_lisa_modules(model.get_model().config)
     
     model.resize_token_embeddings(len(tokenizer))
@@ -506,9 +512,8 @@ def load_model(args):
     else:
         print(f"  [警告] 未找到微调权重: {args.checkpoint}")
     
-    # 将整个模型转换为指定精度并移到 GPU
-    # 这样可以确保所有组件（DINOv2, lisa_dino_conv, lisa_attention_layers 等）都使用相同精度
-    model = model.to(dtype=torch_dtype, device="cuda")
+    # 将整个模型转换为指定精度并移到设备
+    model = model.to(dtype=torch_dtype, device=args.device)
     model.eval()
     print(f"  ✅ 模型精度已转换为: {torch_dtype}")
     
@@ -678,7 +683,7 @@ def predict_mask_llmseg(
 
 def evaluate_sample(
     model, tokenizer, clip_image_processor, transform,
-    sample: Dict, sam_mask_helper, args
+    sample: Dict, sam_mask_helper, args, obj_count: int = 1
 ) -> Dict:
     """评估单个样本"""
     image_path = sample['image_path']
@@ -740,7 +745,8 @@ def evaluate_sample(
                 vis_dir=args.vis_dir,
                 sample_info=sample_info,
                 instruction_idx=instr_idx,
-                iou=iou
+                iou=iou,
+                obj_count=obj_count
             )
     
     # 计算平均 IC-IoU
@@ -794,12 +800,19 @@ def main(args):
     model, tokenizer, clip_image_processor, transform, seg_token_idx = load_model(args)
     
     # 加载测试数据
-    print("\n" + "=" * 60)
+    print("=" * 60)
     print("  加载测试数据...")
     print("=" * 60)
     
-    easy_samples = load_samples(args.data_dir, "easy")
-    hard_samples = load_samples(args.data_dir, "hard")
+    print(f"  测试模式 (Split): {args.split}")
+    
+    easy_samples = []
+    hard_samples = []
+    
+    if args.split in ["easy", "both"]:
+        easy_samples = load_samples(args.data_dir, "easy")
+    if args.split in ["hard", "both"]:
+        hard_samples = load_samples(args.data_dir, "hard")
     
     if args.max_samples:
         easy_samples = easy_samples[:args.max_samples]
@@ -819,12 +832,17 @@ def main(args):
     print("\n" + "=" * 60)
     print("  测试 Easy 样本")
     print("=" * 60)
-    
+    easy_seen_counts = defaultdict(int)
     for sample in tqdm(easy_samples, desc="Easy"):
         try:
+            img_name = sample['img_name']
+            obj_name = sample['gt_object']
+            easy_seen_counts[(img_name, obj_name)] += 1
+            curr_count = easy_seen_counts[(img_name, obj_name)]
+            
             result = evaluate_sample(
                 model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args
+                sample, sam_mask_helper, args, obj_count=curr_count
             )
             if result:
                 results['easy'].append(result)
@@ -836,12 +854,17 @@ def main(args):
     print("\n" + "=" * 60)
     print("  测试 Hard 样本")
     print("=" * 60)
-    
+    hard_seen_counts = defaultdict(int)
     for sample in tqdm(hard_samples, desc="Hard"):
         try:
+            img_name = sample['img_name']
+            obj_name = sample['gt_object']
+            hard_seen_counts[(img_name, obj_name)] += 1
+            curr_count = hard_seen_counts[(img_name, obj_name)]
+            
             result = evaluate_sample(
                 model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args
+                sample, sam_mask_helper, args, obj_count=curr_count
             )
             if result:
                 results['hard'].append(result)

@@ -20,7 +20,7 @@ SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"
-VIS_DIR="./vis_output2"  # 可视化输出目录
+VIS_DIR="./vis_output2_hard"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
@@ -30,6 +30,8 @@ ICR_THRESHOLDS="0.3,0.4,0.5,0.6,0.7,0.8,0.9"
 # ========== 调试配置 ==========
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
+GPU_ID="${GPU_ID:-0}"
+SPLIT="${SPLIT:-hard}"  # 可选: both, easy, hard
 
 # ========================================================================
 
@@ -58,6 +60,8 @@ ARGS="
     --vis_dir=${VIS_DIR}
     --precision=${PRECISION}
     --icr_thresholds=${ICR_THRESHOLDS}
+    --device="cuda:${GPU_ID}"
+    --split=${SPLIT}
     --use_mm_start_end
 "
 

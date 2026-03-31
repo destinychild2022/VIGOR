@@ -132,6 +132,9 @@ def parse_args(args):
     parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
     parser.add_argument("--vigor_train_sam_masks_dir", default=None, type=str, help="VIGOR train SAM masks directory")
     parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
+    parser.add_argument("--vigor_val_max_samples", default=2, type=int, help="Max samples for VIGOR validation set")
+    parser.add_argument("--vigor_only_hard", action="store_true", default=False, help="Only load hard samples for VIGOR dataset (skip easy samples)")
+    parser.add_argument("--vigor_max_instructions", default=None, type=int, help="一张图最多加载前 N 条指令（如 2 代表不加载第 3 条指令）")
     
     parser.add_argument("--sample_rates", default="10, 1", type=str)
 
@@ -206,6 +209,7 @@ def parse_args(args):
     parser.add_argument("--train_vis_dir", default="train_vis", type=str, help="训练可视化保存目录（相对于log_dir）")
     parser.add_argument("--val_vis_dir", default="val_vis", type=str, help="验证可视化保存目录（相对于log_dir）")
     parser.add_argument("--eval_vis_dir", default="eval_vis_iop", type=str, help="评估可视化保存目录（相对于log_dir）")
+    parser.add_argument("--max_vis_samples", default=4, type=int, help="Number of samples to visualize per epoch")
     parser.add_argument(
         "--debug_epoch_shapes",
         action="store_true",
@@ -484,14 +488,8 @@ def init_training_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_train_sam_masks_dir not specified")
         
-        # Load Easy + Hard data
-        print(f"Mode: Mixed training (Easy + Hard) - Multi-instance (3 instructions/image)")
-        
         easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy.json")
         hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard.json")
-        
-        print(f"Loading Easy samples from: {easy_json_path}")
-        print(f"Loading Hard samples from: {hard_json_path}")
 
         def load_vigor_samples(json_file):
             if not os.path.exists(json_file):
@@ -506,8 +504,17 @@ def init_training_dataset(args, tokenizer):
             else:
                 return []
 
-        easy_samples = load_vigor_samples(easy_json_path)
+        if args.vigor_only_hard:
+            print(f"Mode: Hard-only training - Multi-instance (3 instructions/image)")
+            easy_samples = []
+        else:
+            print(f"Mode: Mixed training (Easy + Hard) - Multi-instance (3 instructions/image)")
+            print(f"Loading Easy samples from: {easy_json_path}")
+            easy_samples = load_vigor_samples(easy_json_path)
+
+        print(f"Loading Hard samples from: {hard_json_path}")
         hard_samples = load_vigor_samples(hard_json_path)
+        
         print(f"Original Samples Loaded: Easy={len(easy_samples)}, Hard={len(hard_samples)}")
         print(f"Total Combined Raw Samples: {len(easy_samples) + len(hard_samples)}")
         
@@ -515,6 +522,13 @@ def init_training_dataset(args, tokenizer):
         
         if args.vigor_max_samples is not None:
              all_raw_samples = all_raw_samples[:args.vigor_max_samples]
+
+        # --- 【核心新增】：根据参数过滤每个样本的指令数量（如只保留前两条入选） ---
+        if args.vigor_max_instructions is not None:
+            print(f"   -> [过滤] 限制每张图最多指令数: {args.vigor_max_instructions}")
+            for sample in all_raw_samples:
+                if "objects" in sample:
+                    sample["objects"] = sample["objects"][:args.vigor_max_instructions]
 
         train_dataset = VIGORDatasetMultiInstance(
             json_path=None,
@@ -592,7 +606,11 @@ def init_validation_dataset(args, tokenizer):
     # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
         # VIGOR validation dataset
-        vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, args.vigor_json_file)
+        if args.vigor_only_hard:
+            vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, "open_vocab_grasp_hard.json")
+            print(f"Mode: Hard-only validation")
+        else:
+            vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, args.vigor_json_file)
         
         # Create SAM mask helper
         sam_mask_helper = None
@@ -606,9 +624,21 @@ def init_validation_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_val_sam_masks_dir not specified")
         
+        # 为了统一过滤逻辑，如果是 VIGOR 数据集，我们先手动加载并切片指令
+        all_raw_val_samples = None
+        if args.vigor_max_instructions is not None:
+             print(f"   -> [验证集过滤] 限制每张图最多指令数: {args.vigor_max_instructions}")
+             if os.path.exists(vigor_json_path):
+                 with open(vigor_json_path, 'r') as f:
+                     content = json.load(f)
+                 all_raw_val_samples = content["samples"] if isinstance(content, dict) else content
+                 for sample in all_raw_val_samples:
+                     if "objects" in sample:
+                         sample["objects"] = sample["objects"][:args.vigor_max_instructions]
+        
         # Use VIGORDatasetMultiInstance for validation
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=vigor_json_path,
+            json_path=vigor_json_path if all_raw_val_samples is None else None,
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
@@ -616,8 +646,9 @@ def init_validation_dataset(args, tokenizer):
             data_base_dir=args.vigor_data_base_dir,
             split=args.vigor_val_split,
             sam_mask_helper=sam_mask_helper,
-            max_samples=2,  # Limit validation set size for faster validation
+            max_samples=args.vigor_val_max_samples,  # Limit validation set size for faster validation
             is_train=False,
+            samples=all_raw_val_samples,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
         
@@ -1691,9 +1722,9 @@ def validate(val_loader, model_engine, epoch, writer, args, swanlab_logger=None)
     elif args.precision == "bf16":
         torch_dtype = torch.bfloat16
 
-    # ✅ 随机选择3张图片进行可视化
+    # ✅ 随机选择图片进行可视化
     import random
-    max_vis_samples = 4
+    max_vis_samples = args.max_vis_samples
     # 先获取验证集的总长度（用于随机选择）
     try:
         total_samples = len(val_loader.dataset)
@@ -1985,9 +2016,9 @@ def validate_threshold(val_loader, model_engine, epoch, writer, args, threshold=
     elif args.precision == "bf16":
         torch_dtype = torch.bfloat16
 
-    # ✅ 随机选择3张图片进行可视化
+    # ✅ 随机选择图片进行可视化
     import random
-    max_vis_samples = 3
+    max_vis_samples = args.max_vis_samples
     # 先获取验证集的总长度（用于随机选择）
     try:
         total_samples = len(val_loader.dataset)
