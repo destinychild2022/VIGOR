@@ -45,6 +45,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         split: str = "train",
         sam_mask_helper: SAM_Mask_Reader_PNG = None,
         max_samples: int = None,
+        max_instructions: int = 3, # 每个样本使用的最大指令数 (默认3)
         is_train: bool = True,
         samples: List[Dict] = None,  # 改为 raw_samples，但保持向后兼容
         debug_meta: bool = False,
@@ -64,6 +65,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         )
         
         self.max_samples = max_samples
+        self.max_instructions = max_instructions
         self.is_train = is_train
         self.debug_meta = bool(debug_meta)
         self.sam_mask_helper = sam_mask_helper
@@ -191,8 +193,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         return samples
     
     def __len__(self):
-        # 修改：返回总实例数（每个样本有3条指令）
-        return len(self.samples) * 3
+        # 修改：返回总任务数（每个样本有 N 条指令参与）
+        return len(self.samples) * self.max_instructions
     
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
@@ -205,8 +207,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         # 修改：根据idx计算样本索引和指令索引
-        sample_idx = idx // 3  # 每个样本有3条指令
-        instruction_idx = idx % 3  # 0, 1, 2 对应3条指令
+        sample_idx = idx // self.max_instructions  
+        instruction_idx = idx % self.max_instructions
         
         sample = self.samples[sample_idx]
         image_path = sample['image_path']

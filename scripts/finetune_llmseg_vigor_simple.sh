@@ -30,7 +30,7 @@ VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
 
 # ========== 训练超参数 ==========
-EPOCHS=24  #70*14*3/2
+EPOCHS=20  #70*14*3/2
 STEPS_PER_EPOCH=1000
 BATCH_SIZE=8
 GRAD_ACCUMULATION_STEPS=1
@@ -39,9 +39,8 @@ PRECISION="bf16"
 ALIGN_TEMP=0.05
 VIGOR_MAX_INSTRUCTIONS=2
 
-# ========== 验证配置 ==========
-# 验证集最大样本数（instances）
-VAL_MAX_SAMPLES=50
+# 验证集配置 (test 分片中 scene ID <= 1000 的所有 Easy+Hard 样本)
+VAL_MAX_SCENE_ID=1000
 # 每个 epoch 可视化样本数
 MAX_VIS_SAMPLES=4
 
@@ -69,15 +68,15 @@ if [ ! -x "$DEEPSPEED_BIN" ]; then
 fi
 
 echo "========================================================================"
-echo "  VIGOR 简化版微调训练 (双权重保存版)"
+echo "  VIGOR 简化版微调训练"
 echo "========================================================================"
 echo "模型路径: ${MODEL_PATH}"
 echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
-echo "权重保存: ckpt_model/best (最优) 和 newest (最新)"
-echo "验证样本数: ${VAL_MAX_SAMPLES}"
-echo "可视化样本数: ${MAX_VIS_SAMPLES}"
+echo "权重保存: ckpt_model/best (最优) + epoch_5/10/15/20 (每5轮定期存档)"
+echo "最大验证场景 ID: ${VAL_MAX_SCENE_ID}"
+echo "验证数据: Easy + Hard 混合验证"
 echo "========================================================================"
 
 # 额外的可选参数
@@ -99,7 +98,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --vigor_val_split="${VIGOR_VAL_SPLIT}" \
   --vigor_train_sam_masks_dir="${VIGOR_TRAIN_SAM_MASKS}" \
   --vigor_val_sam_masks_dir="${VIGOR_VAL_SAM_MASKS}" \
-  --vigor_val_max_samples=${VAL_MAX_SAMPLES} \
+  --vigor_val_max_samples=${VAL_MAX_SCENE_ID} \
   --max_vis_samples=${MAX_VIS_SAMPLES} \
   --exp_name="${EXP_NAME}" \
   --log_base_dir="${LOG_DIR}" \

@@ -532,6 +532,7 @@ def init_training_dataset(args, tokenizer):
             split=args.vigor_split,
             sam_mask_helper=sam_mask_helper,
             max_samples=args.vigor_max_samples,
+            max_instructions=args.vigor_max_instructions,  # 使用配置的 1/2/3
             is_train=True,
             samples=all_raw_samples,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
@@ -597,28 +598,45 @@ def init_validation_dataset(args, tokenizer):
 
     # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
-        # VIGOR validation dataset
-        if args.vigor_only_hard:
-            vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, "open_vocab_grasp_hard.json")
-            print(f"Mode: Hard-only validation")
-        else:
-            vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_val_split, args.vigor_json_file)
-        
+        # VIGOR validation dataset: 同时加载 Easy 和 Hard，并过滤 scene <= 1000
+        import re
+        def extract_scene_id(scene_val):
+            try:
+                nums = re.findall(r'\d+', str(scene_val))
+                return int(nums[0]) if nums else 999999
+            except:
+                return 999999
+
+        combined_raw_samples = []
+        val_json_dir = os.path.join(args.vigor_data_base_dir, args.vigor_val_split)
+        for json_name in ["open_vocab_grasp_easy.json", "open_vocab_grasp_hard.json"]:
+            path = os.path.join(val_json_dir, json_name)
+            if not os.path.exists(path):
+                print(f"[警告] 找不到验证文件: {path}")
+                continue
+            
+            with open(path, "r") as f:
+                data = json.load(f)
+                # 处理 VIGOR JSON 的不同格式
+                samples = data.get("samples", data) if isinstance(data, dict) else data
+                
+                # 过滤场景序号 <= args.vigor_val_max_samples 的所有样本
+                filtered = [s for s in samples if extract_scene_id(s.get("scene", "")) <= args.vigor_val_max_samples]
+                combined_raw_samples.extend(filtered)
+                print(f"  - 从 {json_name} 加载并过滤出 {len(filtered)} 个场景序号 <= {args.vigor_val_max_samples} 的样本")
+
         # Create SAM mask helper
         sam_mask_helper = None
-        
-        if args.vigor_val_sam_masks_dir is not None:
-            if os.path.exists(args.vigor_val_sam_masks_dir):
-                sam_mask_helper = SAM_Mask_Reader_PNG(args.vigor_val_sam_masks_dir)
-                print(f"Using SAM masks for validation: {args.vigor_val_sam_masks_dir}")
-            else:
-                raise FileNotFoundError(f"SAM masks dir not found: {args.vigor_val_sam_masks_dir}")
+        if args.vigor_val_sam_masks_dir and os.path.exists(args.vigor_val_sam_masks_dir):
+            sam_mask_helper = SAM_Mask_Reader_PNG(args.vigor_val_sam_masks_dir)
+            print(f"Using SAM masks for validation: {args.vigor_val_sam_masks_dir}")
         else:
-            print("Warning: --vigor_val_sam_masks_dir not specified")
-        
-        # Use VIGORDatasetMultiInstance for validation
+            print("Warning: SAM masks dir not specified or not found")
+
+        # 使用 VIGORDatasetMultiInstance 并传入我们过滤好的 samples
+        # 并禁用 max_samples 限制（即使用全部满足条件的样本）
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=vigor_json_path,
+            json_path=os.path.join(val_json_dir, "open_vocab_grasp_hard.json"), # 仅路径占位
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
@@ -626,12 +644,13 @@ def init_validation_dataset(args, tokenizer):
             data_base_dir=args.vigor_data_base_dir,
             split=args.vigor_val_split,
             sam_mask_helper=sam_mask_helper,
-            max_samples=args.vigor_val_max_samples,  # Limit validation set size for faster validation
+            samples=combined_raw_samples, # 关键：传入合并后的样本
+            max_samples=None,             # 不再限制前50个，使用所有过滤出来的样本
+            max_instructions=args.vigor_max_instructions,  # 验证集也保持一致
             is_train=False,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
-        
-        print(f"VIGOR validation dataset loaded: {len(val_dataset)} instances")
+        print(f"VIGOR combined validation dataset loaded: {len(val_dataset)} total instances ({len(combined_raw_samples)} images * 3)")
         
     else:
         # RobotArm validation dataset (original logic)
@@ -846,12 +865,18 @@ def main(args):
 
     # resume deepspeed checkpoint
     if args.auto_resume and len(args.resume) == 0:
-        # ✅ 现在自动恢复指向最新的权重最新的子目录
-        resume = os.path.join(args.log_dir, "ckpt_model", "newest")
-        if os.path.exists(resume):
-            args.resume = resume
-            if args.local_rank == 0:
-                print(f"[信息] 发现现有权重，将从 {resume} 自动恢复训练...")
+        # 自动寻找最新的 epoch_X 存档
+        ckpt_base = os.path.join(args.log_dir, "ckpt_model")
+        if os.path.exists(ckpt_base):
+            import re
+            epoch_dirs = [d for d in os.listdir(ckpt_base) if re.match(r"epoch_\d+$", d)]
+            if epoch_dirs:
+                # 按 epoch 数字排序，取最大的
+                epoch_dirs.sort(key=lambda x: int(x.split("_")[1]))
+                resume = os.path.join(ckpt_base, epoch_dirs[-1])
+                args.resume = resume
+                if args.local_rank == 0:
+                    print(f"[信息] 自动恢复：找到最新存档 {resume}")
 
     if args.resume:
         load_path, client_state = model_engine.load_checkpoint(args.resume, load_optimizer_states=False, load_lr_scheduler_states=False)
@@ -911,47 +936,40 @@ def main(args):
                 cur_ciou = ciou if is_best else cur_ciou
 
             
-            # ========== 保存权重逻辑 (newest & best) ==========
-            # 定义保存路径
-            newest_save_dir = os.path.join(args.log_dir, "ckpt_model", "newest")
+            # ========== 保存权重逻辑 (best + 每5轮定期存档) ==========
+            SAVE_INTERVAL = 5  # 每 5 个 epoch 保存一次定期存档
             best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
             
-            # 第一步：每个 Epoch 结束都保存一次 "newest"
-            # 我们先保存到临时目录，再 rename 以确保原子性
-            temp_save_dir = os.path.join(args.log_dir, "ckpt_model", "newest_temp")
-            
-            # 清理残留的 temp
-            if args.local_rank == 0 and os.path.exists(temp_save_dir):
-                shutil.rmtree(temp_save_dir, ignore_errors=True)
-            
-            torch.distributed.barrier()
-            
-            # 记录保存开始
-            if args.local_rank == 0:
-                print(f"\n[Epoch {epoch}] 正在保存最新权重 (newest) 到: {newest_save_dir}...")
-            
-            # 调用 DeepSpeed 保存
-            model_engine.save_checkpoint(temp_save_dir)
-            
-            # 主进程负责重命名操作
-            if args.local_rank == 0:
-                try:
-                    # 确保父目录存在
-                    os.makedirs(os.path.dirname(newest_save_dir), exist_ok=True)
-                    # 删除旧的 newest
-                    if os.path.exists(newest_save_dir):
-                        shutil.rmtree(newest_save_dir, ignore_errors=True)
-                    # 重命名
-                    os.rename(temp_save_dir, newest_save_dir)
-                    print(f"  [成功] 最新权重已更新: {newest_save_dir}")
-                except Exception as e:
-                    print(f"  [警告] newest 重命名失败: {e}，权重暂留在 {temp_save_dir}")
+            # 第一步：每 5 轮保存一个定期存档，按 epoch_X 命名
+            real_epoch = epoch + 1  # epoch 从 0 开始，显示时 +1
+            if real_epoch % SAVE_INTERVAL == 0:
+                epoch_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}")
+                temp_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}_temp")
+                
+                if args.local_rank == 0 and os.path.exists(temp_save_dir):
+                    shutil.rmtree(temp_save_dir, ignore_errors=True)
+                
+                torch.distributed.barrier()
+                
+                if args.local_rank == 0:
+                    print(f"\n[Epoch {real_epoch}] 定期存档 -> {epoch_save_dir}")
+                
+                model_engine.save_checkpoint(temp_save_dir)
+                
+                if args.local_rank == 0:
+                    try:
+                        os.makedirs(os.path.dirname(epoch_save_dir), exist_ok=True)
+                        if os.path.exists(epoch_save_dir):
+                            shutil.rmtree(epoch_save_dir, ignore_errors=True)
+                        os.rename(temp_save_dir, epoch_save_dir)
+                        print(f"  [成功] 定期存档已保存: {epoch_save_dir}")
+                    except Exception as e:
+                        print(f"  [警告] 存档重命名失败: {e}，权重暂留在 {temp_save_dir}")
 
             # 第二步：如果当前是历史最高分，则同步更新 "best"
             if not args.no_eval and is_best:
                 if args.local_rank == 0:
                     print(f"  [🎉 创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
-                    # 同时也保存一个对应的 meta log
                     torch.save(
                         {"epoch": epoch, "giou": best_score, "ciou": cur_ciou},
                         os.path.join(
@@ -960,7 +978,6 @@ def main(args):
                         ),
                     )
                 
-                # 同样采用 temp 方式保存 best，避免保存一半挂了
                 best_temp_save_dir = os.path.join(args.log_dir, "ckpt_model", "best_temp")
                 if args.local_rank == 0 and os.path.exists(best_temp_save_dir):
                     shutil.rmtree(best_temp_save_dir, ignore_errors=True)
