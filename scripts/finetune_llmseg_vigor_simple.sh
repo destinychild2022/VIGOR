@@ -24,7 +24,7 @@ VIGOR_ONLY_HARD=true
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-hard_7times_2instru"
+EXP_NAME="finetune_llmseg_vigor_simple-hard_7times_2instru_test"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"

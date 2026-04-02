@@ -134,6 +134,7 @@ def parse_args(args):
     parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
     parser.add_argument("--vigor_val_max_samples", default=2, type=int, help="Max samples for VIGOR validation set")
     parser.add_argument("--vigor_only_hard", action="store_true", default=False, help="Only load hard samples for VIGOR dataset (skip easy samples)")
+    parser.add_argument("--vigor_max_instructions", default=3, type=int, help="Max instructions per sample (1, 2, or 3)")
     
     parser.add_argument("--sample_rates", default="10, 1", type=str)
 
