@@ -626,6 +626,12 @@ def init_validation_dataset(args, tokenizer):
                 combined_raw_samples.extend(filtered)
                 print(f"  - 从 {json_name} 加载并过滤出 {len(filtered)} 个场景序号 <= {args.vigor_val_max_samples} 的样本")
 
+        if combined_raw_samples:
+            all_ids = [extract_scene_id(s.get("scene", "")) for s in combined_raw_samples]
+            print(f"[验证集确认] 发现的场景 ID 范围: {min(all_ids)} ~ {max(all_ids)} (总计 {len(combined_raw_samples)} 张图)")
+        else:
+            print("[警告] 过滤后验证集为空，请检查场景序号格式或路径。")
+
         # Create SAM mask helper
         sam_mask_helper = None
         if args.vigor_val_sam_masks_dir and os.path.exists(args.vigor_val_sam_masks_dir):
@@ -1810,25 +1816,32 @@ def validate(val_loader, model_engine, epoch, writer, args, swanlab_logger=None)
         gt_mask = gt_mask.to(device=device)
 
         # resize if shape is not equal
-        if pred_seg.shape != gt_mask.shape:
+        if pred_seg.shape[1:] != gt_mask.shape[1:]:
             pred_seg = torch.nn.functional.interpolate(
                 pred_seg.unsqueeze(0), size=gt_mask.shape[1:], mode="nearest"
             ).squeeze(0)
 
-        assert pred_seg.shape == gt_mask.shape
+        best_acc_iou = None
+        best_intersection = None
+        best_union = None
+        best_n_i = 0
 
-        # compute IoU
-        # Be careful, wrong result for uint8
-        intersection, union, _ = intersectionAndUnionGPU(
-            pred_seg.int().contiguous(), gt_mask.int().contiguous(), 2
-        )
+        for n_i in range(gt_mask.shape[0]):
+            gt_m = gt_mask[n_i:n_i+1] # shape (1, H, W)
+            intersection, union, _ = intersectionAndUnionGPU(
+                pred_seg.int().contiguous(), gt_m.int().contiguous(), 2
+            )
+            acc_iou = intersection / (union + 1e-8)
+            acc_iou[union == 0] += 1.0  # no-object target
+            
+            if best_acc_iou is None or acc_iou[0].item() > best_acc_iou[0].item():
+                best_acc_iou = acc_iou
+                best_intersection = intersection
+                best_union = union
+                best_n_i = n_i
 
-        acc_iou = intersection / (union + 1e-8)
-
-        acc_iou[union == 0] += 1.0  # no-object target
-
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy()
+        intersection, union = best_intersection.cpu().numpy(), best_union.cpu().numpy()
+        acc_iou = best_acc_iou.cpu().numpy()
         intersection_meter.update(intersection)
         union_meter.update(union)
         acc_iou_meter.update(acc_iou, n=1)
@@ -1860,7 +1873,7 @@ def validate(val_loader, model_engine, epoch, writer, args, swanlab_logger=None)
                     # 转换为numpy数组
                     # ✅ 修正：mask的黑色部分（值为0）才是掩码区域，白色部分（值为1）保持原图
                     pred_mask_np = pred_seg.detach().cpu().numpy()[0]
-                    gt_mask_np = gt_mask.detach().cpu().numpy()[0]
+                    gt_mask_np = gt_mask[best_n_i].detach().cpu().numpy()
                     if len(gt_mask_np.shape) == 2:
                         pass  # 已经是2D
                     
@@ -2111,25 +2124,34 @@ def validate_threshold(val_loader, model_engine, epoch, writer, args, threshold=
         gt_mask = gt_mask.to(device=device)
 
         # resize if shape is not equal
-        if pred_seg.shape != gt_mask.shape:
+        if pred_seg.shape[1:] != gt_mask.shape[1:]:
             pred_seg = torch.nn.functional.interpolate(
                 pred_seg.unsqueeze(0), size=gt_mask.shape[1:], mode="nearest"
             ).squeeze(0)
 
-        assert pred_seg.shape == gt_mask.shape
-
         # compute IoU
         # Be careful, wrong result for uint8
-        intersection, union, _ = intersectionAndUnionGPU(
-            pred_seg.int().contiguous(), gt_mask.int().contiguous(), 2
-        )
+        best_acc_iou = None
+        best_intersection = None
+        best_union = None
+        best_n_i = 0
 
-        acc_iou = intersection / (union + 1e-8)
+        for n_i in range(gt_mask.shape[0]):
+            gt_m = gt_mask[n_i:n_i+1] # shape (1, H, W)
+            intersection, union, _ = intersectionAndUnionGPU(
+                pred_seg.int().contiguous(), gt_m.int().contiguous(), 2
+            )
+            acc_iou = intersection / (union + 1e-8)
+            acc_iou[union == 0] += 1.0  # no-object target
+            
+            if best_acc_iou is None or acc_iou[0].item() > best_acc_iou[0].item():
+                best_acc_iou = acc_iou
+                best_intersection = intersection
+                best_union = union
+                best_n_i = n_i
 
-        acc_iou[union == 0] += 1.0  # no-object target
-
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy()
+        intersection, union = best_intersection.cpu().numpy(), best_union.cpu().numpy()
+        acc_iou = best_acc_iou.cpu().numpy()
         intersection_meter.update(intersection)
         union_meter.update(union)
         acc_iou_meter.update(acc_iou, n=1)
@@ -2157,8 +2179,7 @@ def validate_threshold(val_loader, model_engine, epoch, writer, args, threshold=
             pred_mask = pred_mask[0]      
             pred_mask = pred_mask > 0      
 
-            gt_mask = gt_mask.detach().cpu().numpy()
-            gt_mask = gt_mask[0]
+            gt_mask = gt_mask[best_n_i].detach().cpu().numpy()
             gt_mask[gt_mask == 255] = 0  # ignored label
             gt_mask = gt_mask > 0
 
@@ -2308,25 +2329,34 @@ def validate_iou_iop(val_loader, model_engine, epoch, writer, args, threshold=0.
         gt_mask = gt_mask.to(device=device)
 
         # resize if shape is not equal
-        if pred_seg.shape != gt_mask.shape:
+        if pred_seg.shape[1:] != gt_mask.shape[1:]:
             pred_seg = torch.nn.functional.interpolate(
                 pred_seg.unsqueeze(0), size=gt_mask.shape[1:], mode="nearest"
             ).squeeze(0)
 
-        assert pred_seg.shape == gt_mask.shape
-
         # compute IoU
         # Be careful, wrong result for uint8
-        intersection, union, _ = intersectionAndUnionGPU(
-            pred_seg.int().contiguous(), gt_mask.int().contiguous(), 2
-        )
+        best_acc_iou = None
+        best_intersection = None
+        best_union = None
+        best_n_i = 0
 
-        acc_iou = intersection / (union + 1e-8)
+        for n_i in range(gt_mask.shape[0]):
+            gt_m = gt_mask[n_i:n_i+1] # shape (1, H, W)
+            intersection, union, _ = intersectionAndUnionGPU(
+                pred_seg.int().contiguous(), gt_m.int().contiguous(), 2
+            )
+            acc_iou = intersection / (union + 1e-8)
+            acc_iou[union == 0] += 1.0  # no-object target
+            
+            if best_acc_iou is None or acc_iou[0].item() > best_acc_iou[0].item():
+                best_acc_iou = acc_iou
+                best_intersection = intersection
+                best_union = union
+                best_n_i = n_i
 
-        acc_iou[union == 0] += 1.0  # no-object target
-
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy()
+        intersection, union = best_intersection.cpu().numpy(), best_union.cpu().numpy()
+        acc_iou = best_acc_iou.cpu().numpy()
         intersection_meter.update(intersection)
         union_meter.update(union)
         acc_iou_meter.update(acc_iou, n=1)
@@ -2425,25 +2455,34 @@ def validate_threshold_from_topIoU(val_loader, model_engine, epoch, writer, args
         gt_mask = gt_mask.to(device=device)
 
         # resize if shape is not equal
-        if pred_seg.shape != gt_mask.shape:
+        if pred_seg.shape[1:] != gt_mask.shape[1:]:
             pred_seg = torch.nn.functional.interpolate(
                 pred_seg.unsqueeze(0), size=gt_mask.shape[1:], mode="nearest"
             ).squeeze(0)
 
-        assert pred_seg.shape == gt_mask.shape
-
         # compute IoU
         # Be careful, wrong result for uint8
-        intersection, union, _ = intersectionAndUnionGPU(
-            pred_seg.int().contiguous(), gt_mask.int().contiguous(), 2
-        )
+        best_acc_iou = None
+        best_intersection = None
+        best_union = None
+        best_n_i = 0
 
-        acc_iou = intersection / (union + 1e-8)
+        for n_i in range(gt_mask.shape[0]):
+            gt_m = gt_mask[n_i:n_i+1] # shape (1, H, W)
+            intersection, union, _ = intersectionAndUnionGPU(
+                pred_seg.int().contiguous(), gt_m.int().contiguous(), 2
+            )
+            acc_iou = intersection / (union + 1e-8)
+            acc_iou[union == 0] += 1.0  # no-object target
+            
+            if best_acc_iou is None or acc_iou[0].item() > best_acc_iou[0].item():
+                best_acc_iou = acc_iou
+                best_intersection = intersection
+                best_union = union
+                best_n_i = n_i
 
-        acc_iou[union == 0] += 1.0  # no-object target
-
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy()
+        intersection, union = best_intersection.cpu().numpy(), best_union.cpu().numpy()
+        acc_iou = best_acc_iou.cpu().numpy()
         intersection_meter.update(intersection)
         union_meter.update(union)
         acc_iou_meter.update(acc_iou, n=1)

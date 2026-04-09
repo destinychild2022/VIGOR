@@ -227,13 +227,19 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             "pixel_values"
         ][0]
         
-        # 读取GT mask
-        gt_mask = cv2.imread(gt_mask_path, cv2.IMREAD_GRAYSCALE)
-        if gt_mask is None:
-            print(f"Warning: GT mask not found: {gt_mask_path}, using empty mask")
-            gt_mask = np.ones(ori_size, dtype=np.uint8)
-        else:
-            gt_mask = (gt_mask > 0).astype(np.float32)
+        # 读取GT mask(可能有多个，使用逗号分隔)
+        gt_mask_paths = [p.strip() for p in gt_mask_path.split(',')]
+        gt_masks = []
+        for p in gt_mask_paths:
+            mask = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                gt_masks.append((mask > 0).astype(np.float32))
+            else:
+                print(f"Warning: GT mask not found: {p}")
+        
+        if not gt_masks:
+            print(f"Warning: No valid GT masks found for {image_path}, using empty mask")
+            gt_masks = [np.ones(ori_size, dtype=np.uint8)]
         
         # # 🔍 调试: 打印GT mask和物体信息 (每100个样本打印一次)
         # if idx % 1 == 0:
@@ -300,14 +306,17 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         ).squeeze(0)
         
         # 计算IoU和IoP
-        gt_fg = (gt_mask == 0).astype(np.uint8)
         segs_fg = (segs_origin == 0).astype(np.uint8)
-        sampled_ious = [
-            compute_all_iou(segs_fg, gt_fg) for _ in [gt_mask]
-        ]
-        sampled_iops = [
-            compute_all_iop(segs_fg, gt_fg) for _ in [gt_mask]
-        ]
+        all_ious = []
+        all_iops = []
+        for mask in gt_masks:
+            gt_fg = (mask == 0).astype(np.uint8)
+            all_ious.append(compute_all_iou(segs_fg, gt_fg))
+            all_iops.append(compute_all_iop(segs_fg, gt_fg))
+            
+        sampled_ious = [np.max(np.stack(all_ious), axis=0)]
+        sampled_iops = [np.max(np.stack(all_iops), axis=0)]
+        gt_mask_cat = np.stack(gt_masks) # (N, H, W)
         
         precision_type = torch.float32
         if self.precision == "fp16":
@@ -355,8 +364,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             'images': image,  # 现在是tensor
             'images_clip': image_clip,
             'conversations': conversation_list,
-            'masks': torch.from_numpy(gt_mask).unsqueeze(0),  # ✅ 返回原始尺寸的GT mask
-            'label': torch.ones(gt_mask.shape[0], gt_mask.shape[1]) * self.ignore_label,
+            'masks': torch.from_numpy(gt_mask_cat),  # ✅ 返回所有原始尺寸的GT mask 
+            'label': torch.ones(gt_mask_cat.shape[1], gt_mask_cat.shape[2]) * self.ignore_label,
             'resize': resize,
             'questions': [question],
             'sampled_classes': [instruction],

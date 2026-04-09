@@ -2,6 +2,8 @@
 
 # GraspNet 服务启动脚本 (graspnet_service.py)
 # 运行环境: conda (graspnet)
+#apt-get update && apt-get install -y libgl1-mesa-glx
+
 
 # 1. 配置
 PORT="5556"

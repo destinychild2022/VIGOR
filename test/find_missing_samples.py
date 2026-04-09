@@ -3,7 +3,7 @@ import os
 
 # 1. 配置路径 (请根据服务器实际路径修改)
 JSON_PATH = "/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/open_vocab_grasp_hard.json"
-VIS_DIR = "/opt/data/private/LLMSeg/vis_output2/hard"
+VIS_DIR = "/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/train/masks_new"
 REPORT_PATH = "/tmp/missing_samples_report.txt"
 
 def find_missing():
