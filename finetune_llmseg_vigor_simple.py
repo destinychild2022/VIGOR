@@ -610,7 +610,7 @@ def init_validation_dataset(args, tokenizer):
 
         combined_raw_samples = []
         val_json_dir = os.path.join(args.vigor_data_base_dir, args.vigor_val_split)
-        for json_name in ["open_vocab_grasp_easy.json", "open_vocab_grasp_hard.json"]:
+        for json_name in ["open_vocab_grasp_easy_new_1.json", "open_vocab_grasp_hard_new_1.json"]:
             path = os.path.join(val_json_dir, json_name)
             if not os.path.exists(path):
                 print(f"[警告] 找不到验证文件: {path}")
@@ -643,7 +643,7 @@ def init_validation_dataset(args, tokenizer):
         # 使用 VIGORDatasetMultiInstance 并传入我们过滤好的 samples
         # 并禁用 max_samples 限制（即使用全部满足条件的样本）
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=os.path.join(val_json_dir, "open_vocab_grasp_hard.json"), # 仅路径占位
+            json_path=os.path.join(val_json_dir, "open_vocab_grasp_hard_new_1.json"), # 仅路径占位
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
