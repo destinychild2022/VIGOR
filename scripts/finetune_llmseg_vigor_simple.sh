@@ -120,6 +120,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --eval_vis_dir="${EVAL_VIS_DIR}" \
   --align_temperature=${ALIGN_TEMP} \
   --vigor_max_instructions=${VIGOR_MAX_INSTRUCTIONS} \
+  --iou_selection_only \
   ${EXTRA_ARGS}
 
 echo "========================================================================"
