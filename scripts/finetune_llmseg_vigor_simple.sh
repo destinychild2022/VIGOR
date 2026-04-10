@@ -20,7 +20,7 @@ VIGOR_VAL_SPLIT="test"
 VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
 VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks"
 # 是否只使用 hard 样本 (不使用 easy 样本)
-VIGOR_ONLY_HARD=true
+VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
