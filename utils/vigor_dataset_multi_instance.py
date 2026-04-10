@@ -133,7 +133,10 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             img_name = f"{img_num}.png"
             
             image_path = os.path.join(self.data_base_dir, self.split, img_name)
-            gt_mask_path = os.path.join(self.data_base_dir, self.split, gt_mask_path_rel)
+            # ✅ 修复: 处理逗号分隔的多个相对路径，确保每个都拼上绝对路径前缀
+            rel_paths = [p.strip() for p in gt_mask_path_rel.split(',')]
+            abs_paths = [os.path.join(self.data_base_dir, self.split, p) for p in rel_paths]
+            gt_mask_path = ",".join(abs_paths)
             
             samples.append({
                 'image_path': image_path,
@@ -178,7 +181,10 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             img_name = f"{img_num}.png"
             
             image_path = os.path.join(self.data_base_dir, self.split, img_name)
-            gt_mask_path = os.path.join(self.data_base_dir, self.split, gt_mask_path_rel)
+            # ✅ 修复: 处理逗号分隔的多个相对路径，确保每个都拼上绝对路径前缀
+            rel_paths = [p.strip() for p in gt_mask_path_rel.split(',')]
+            abs_paths = [os.path.join(self.data_base_dir, self.split, p) for p in rel_paths]
+            gt_mask_path = ",".join(abs_paths)
             
             samples.append({
                 'image_path': image_path,  # 这是关键：完整的绝对路径

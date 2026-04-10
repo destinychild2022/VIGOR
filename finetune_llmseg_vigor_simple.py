@@ -488,8 +488,8 @@ def init_training_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_train_sam_masks_dir not specified")
         
-        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy.json")
-        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard.json")
+        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy_new_1.json")
+        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard_new_1.json")
 
         def load_vigor_samples(json_file):
             if not os.path.exists(json_file):
