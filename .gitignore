@@ -90,6 +90,7 @@ eval_vis*/
 # Results
 *.txt
 !requirements.txt
+!requirements_fixed_new.txt
 !README.md
 success_rate_results.txt
 test_results*.txt

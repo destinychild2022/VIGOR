@@ -17,6 +17,45 @@ from .segment_anything import build_sam_vit_h
 from .loss import sigmoid_align_loss, softmax_align_loss, iou_regression_loss
 from .transformer import Attention, MLPBlock, LISA_TwoWayAttentionBlock
 
+class Ego3DPositionEmbeddingMLP(nn.Module):
+    def __init__(self, in_channels=3, num_pos_feats=1024, n_freqs=8, logscale=True):
+        super().__init__()
+        self.n_freqs = n_freqs
+        self.freq_out_channels = in_channels * (2 * n_freqs + 1)
+        if logscale:
+            freq_bands = 2 ** torch.linspace(0, n_freqs - 1, n_freqs)
+        else:
+            freq_bands = torch.linspace(1, 2 ** (n_freqs - 1), n_freqs)
+
+        center = torch.tensor([0.0, 0.0, 2.0]).repeat(in_channels // 3)
+        self.register_buffer("freq_bands", freq_bands, persistent=False)
+        self.register_buffer("center", center, persistent=False)
+
+        self.position_embedding_head = nn.Sequential(
+            nn.Linear(self.freq_out_channels, num_pos_feats),
+            nn.LayerNorm(num_pos_feats),
+            nn.ReLU(),
+            nn.Linear(num_pos_feats, num_pos_feats),
+        )
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p, gain=0.01)
+
+    @torch.no_grad()
+    def frequency_encoding(self, xyz):
+        xyz_n = ((xyz - self.center) / 2.0).to(self.freq_bands.dtype)
+        xyz_freq = xyz_n.unsqueeze(-1) * self.freq_bands
+        sin_xyz, cos_xyz = torch.sin(xyz_freq), torch.cos(xyz_freq)
+        return torch.cat([xyz_n.unsqueeze(-1), sin_xyz, cos_xyz], dim=-1).reshape(*xyz.shape[:2], -1)
+
+    def forward(self, xyz):
+        freq_encoding = self.frequency_encoding(xyz)
+        freq_encoding = freq_encoding.to(dtype=self.position_embedding_head[0].weight.dtype)
+        return self.position_embedding_head(freq_encoding)
+
 class LisaMetaModel:
     def __init__(
         self,
@@ -39,7 +78,7 @@ class LisaMetaModel:
             self.initialize_lisa_modules(self.config)
 
     def initialize_lisa_modules(self, config):
-        print("Initializing LISA modules...")        
+        print("Initializing LISA modules...")
         # SAM
         self.visual_model = build_sam_vit_h(self.vision_pretrained)
         for param in self.visual_model.parameters():
@@ -200,6 +239,11 @@ class LisaMetaModel:
 
         # 1x1 conv to reduce the dimension of the image feature to 256
         self.lisa_dino_conv = nn.Conv2d(1024, 256, kernel_size=1, stride=1, padding=0)
+        self.lisa_ego3d_pos_embed = Ego3DPositionEmbeddingMLP(
+            in_channels=3,
+            num_pos_feats=1024,
+            n_freqs=getattr(config, "lisa_ego3d_n_freqs", 8),
+        )
 
         self.lisa_attention_layers = nn.ModuleList()
         depth = 2
@@ -304,8 +348,60 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             image_embeddings = torch.cat(image_embeddings_list, 0)
         return image_embeddings
     
-    def get_dinov2_visual_embs(self, pixel_values: torch.FloatTensor):
+    def _backproject_depth_to_dino_patches(
+        self,
+        depths: torch.FloatTensor,
+        intrinsics: torch.FloatTensor,
+        patch_hw,
+    ):
+        if depths.dim() == 3:
+            depths = depths.unsqueeze(1)
+        depths = depths.float()
+        intrinsics = intrinsics.float()
+        if intrinsics.dim() == 2:
+            intrinsics = intrinsics.unsqueeze(0).expand(depths.shape[0], -1, -1)
 
+        patch_h, patch_w = patch_hw
+        depth_h, depth_w = depths.shape[-2:]
+        patch_depth = F.interpolate(depths, size=(patch_h, patch_w), mode="area").squeeze(1)
+        patch_depth = torch.nan_to_num(patch_depth, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+        ys = (torch.arange(patch_h, device=depths.device, dtype=torch.float32) + 0.5) * (depth_h / patch_h)
+        xs = (torch.arange(patch_w, device=depths.device, dtype=torch.float32) + 0.5) * (depth_w / patch_w)
+        v, u = torch.meshgrid(ys, xs, indexing="ij")
+        u = u.unsqueeze(0)
+        v = v.unsqueeze(0)
+
+        fx = intrinsics[:, 0, 0].view(-1, 1, 1).clamp_min(1e-6)
+        fy = intrinsics[:, 1, 1].view(-1, 1, 1).clamp_min(1e-6)
+        cx = intrinsics[:, 0, 2].view(-1, 1, 1)
+        cy = intrinsics[:, 1, 2].view(-1, 1, 1)
+
+        z = patch_depth
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+        xyz = torch.stack([x, y, z], dim=-1).reshape(depths.shape[0], patch_h * patch_w, 3)
+        return xyz
+
+    def get_ego3d_position_embs(
+        self,
+        depths: torch.FloatTensor,
+        intrinsics: torch.FloatTensor,
+        patch_hw,
+        dtype: torch.dtype,
+    ):
+        xyz = self._backproject_depth_to_dino_patches(depths, intrinsics, patch_hw)
+        pos_embeds = self.model.lisa_ego3d_pos_embed(xyz)
+        b, n, c = pos_embeds.shape
+        patch_h, patch_w = patch_hw
+        return pos_embeds.transpose(1, 2).reshape(b, c, patch_h, patch_w).to(dtype=dtype)
+
+    def get_dinov2_visual_embs(
+        self,
+        pixel_values: torch.FloatTensor,
+        depths: torch.FloatTensor = None,
+        intrinsics: torch.FloatTensor = None,
+    ):
         with torch.no_grad():
             image_embeddings_list = []
             for i in range(pixel_values.shape[0]):
@@ -317,6 +413,14 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 image_embeddings_list.append(image_embeddings)
             torch.cuda.empty_cache()
             image_embeddings = torch.cat(image_embeddings_list, 0)
+        if depths is not None and intrinsics is not None:
+            pos_embeds = self.get_ego3d_position_embs(
+                depths=depths.to(device=image_embeddings.device),
+                intrinsics=intrinsics.to(device=image_embeddings.device),
+                patch_hw=image_embeddings.shape[-2:],
+                dtype=image_embeddings.dtype,
+            )
+            image_embeddings = image_embeddings + pos_embeds
         return image_embeddings
 
     def mask_pooling(self, image_embeddings: torch.FloatTensor, weight_maps: torch.FloatTensor):
@@ -423,10 +527,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         return_vis = bool(kwargs.pop("return_vis", False))
         debug_train_shapes = bool(kwargs.pop("debug_train_shapes", False))
         debug_epoch = kwargs.pop("debug_epoch", None)
+        depths = kwargs.pop("depths", None)
+        intrinsics = kwargs.pop("intrinsics", None)
         # image_embeddings = self.get_visual_embs(images)
 
         # === 原图 -> 视觉特征（供 mask_pooling 使用） ===
-        dino_embeds = self.get_dinov2_visual_embs(images)
+        dino_embeds = self.get_dinov2_visual_embs(images, depths=depths, intrinsics=intrinsics)
         image_embeddings = self.model.lisa_dino_conv(dino_embeds)
 
         #import pdb; pdb.set_trace()
@@ -610,6 +716,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     print(f"[debug] 第2步-模型输入(CLIP图像) | images_clip.shape={tuple(images_clip.shape)} | dtype={images_clip.dtype}", flush=True)
                     print(f"[debug] 第3步-模型输入(文本) | input_ids.shape={tuple(input_ids.shape)} | attention_masks.shape={tuple(attention_masks.shape)}", flush=True)
                     print(f"[debug] 第4步-offset展开 | offset={offset.detach().cpu().tolist() if isinstance(offset, torch.Tensor) else offset}", flush=True)
+                    if depths is not None and intrinsics is not None:
+                        print(f"[debug] 第4.5步-模型输入(depth/K) | depths.shape={tuple(depths.shape)} | intrinsics.shape={tuple(intrinsics.shape)}", flush=True)
                     # 原图->dinov2->conv 的输出（插值前）
                     try:
                         print(f"[debug] 第5步-视觉特征(dinov2输出) | shape={tuple(dino_embeds.shape)} | dtype={dino_embeds.dtype}", flush=True)

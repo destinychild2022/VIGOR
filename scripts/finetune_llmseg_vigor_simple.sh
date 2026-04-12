@@ -24,13 +24,13 @@ VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-new-20epochs"
+EXP_NAME="finetune_llmseg_vigor_simple-spatial"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
 
 # ========== 训练超参数 ==========
-EPOCHS=20  #70*14*3/2
+EPOCHS=20
 STEPS_PER_EPOCH=1000
 BATCH_SIZE=8
 GRAD_ACCUMULATION_STEPS=1
@@ -55,7 +55,11 @@ GPU_IDS="0,1"
 MASTER_PORT=24375
 
 # ========== Checkpoint 配置 ==========
-RESUME_PATH=""
+RESUME_PATH="./runs/finetune_llmseg_vigor_simple-spatial/ckpt_model/best"
+
+# ========== 分布式超时配置 ==========
+# 60 minutes, to avoid validation all-reduce timeout when ranks finish unevenly.
+export NCCL_TIMEOUT=7200
 
 # ========================================================================
 

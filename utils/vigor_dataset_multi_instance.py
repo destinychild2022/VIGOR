@@ -69,6 +69,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         self.is_train = is_train
         self.debug_meta = bool(debug_meta)
         self.sam_mask_helper = sam_mask_helper
+        self.depth_dir = os.path.join(self.data_base_dir, self.split, "depth")
+        self.camera_intrinsic, self.camera_size = self._load_camera_intrinsic()
         
         # 加载并标准化所有样本
         if samples is not None:
@@ -210,6 +212,58 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         padw = self.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
+
+    def _load_camera_intrinsic(self):
+        camera_paths = [
+            os.path.join(self.data_base_dir, self.split, "depth", "camera.json"),
+            os.path.join(self.data_base_dir, "train", "depth", "camera.json"),
+        ]
+        for camera_path in camera_paths:
+            if not os.path.exists(camera_path):
+                continue
+            with open(camera_path, "r") as f:
+                camera = json.load(f)
+            intr = camera.get("intrinsics", {})
+            if all(k in intr for k in ("fx", "fy", "cx", "cy")):
+                K = np.array(
+                    [[intr["fx"], 0.0, intr["cx"]], [0.0, intr["fy"], intr["cy"]], [0.0, 0.0, 1.0]],
+                    dtype=np.float32,
+                )
+            else:
+                K = np.array(intr.get("intrinsic", np.eye(3)), dtype=np.float32)
+            size = (int(camera.get("height", 0)), int(camera.get("width", 0)))
+            return K, size
+        return None, None
+
+    def _load_depth_and_intrinsic(self, img_name: str, resize):
+        if self.camera_intrinsic is None:
+            return None, None
+        depth_path = os.path.join(self.depth_dir, os.path.splitext(img_name)[0] + ".npy")
+        if not os.path.exists(depth_path):
+            return None, None
+
+        depth = np.load(depth_path)
+        depth = np.squeeze(depth)
+        if depth.ndim != 2:
+            raise ValueError(f"Unexpected depth shape for {depth_path}: {depth.shape}")
+        depth = np.nan_to_num(depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        depth = np.maximum(depth, 0.0)
+
+        resized_h, resized_w = resize
+        depth_resized = cv2.resize(depth, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+        padh = self.image_size - resized_h
+        padw = self.image_size - resized_w
+        if padh < 0 or padw < 0:
+            raise ValueError(f"depth_resized larger than image_size={self.image_size}: {(resized_h, resized_w)}")
+        depth_square = np.pad(depth_resized, ((0, padh), (0, padw)), mode="constant", constant_values=0.0)
+
+        cam_h, cam_w = self.camera_size if self.camera_size is not None else depth.shape
+        if cam_h <= 0 or cam_w <= 0:
+            cam_h, cam_w = depth.shape
+        K = self.camera_intrinsic.copy()
+        K[0, :] *= resized_w / float(cam_w)
+        K[1, :] *= resized_h / float(cam_h)
+        return torch.from_numpy(depth_square).unsqueeze(0).float(), torch.from_numpy(K).float()
     
     def __getitem__(self, idx):
         # 修改：根据idx计算样本索引和指令索引
@@ -333,6 +387,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
 
         image = self.transform.apply_image(image)
         resize = image.shape[:2]
+        depth, intrinsic = self._load_depth_and_intrinsic(img_name, resize)
 
         # ❌ 删除GT mask预处理 - 可视化需要原始尺寸的mask
         # 直接返回原始GT mask (H_orig, W_orig),让可视化代码自己resize
@@ -369,6 +424,8 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
             'image_path': image_path,
             'images': image,  # 现在是tensor
             'images_clip': image_clip,
+            'depth': depth,
+            'intrinsic': intrinsic,
             'conversations': conversation_list,
             'masks': torch.from_numpy(gt_mask_cat),  # ✅ 返回所有原始尺寸的GT mask 
             'label': torch.ones(gt_mask_cat.shape[1], gt_mask_cat.shape[2]) * self.ignore_label,

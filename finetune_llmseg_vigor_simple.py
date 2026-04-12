@@ -427,6 +427,7 @@ def init_LISA_model(args, tokenizer):
                                 "lisa_iou_head",
                                 "lisa_embedding_head",
                                 "lisa_dino_conv",
+                                "lisa_ego3d_pos_embed",
                             ]
                         ]
                     )
@@ -459,7 +460,8 @@ def init_LISA_model(args, tokenizer):
                 x in n
                 for x in ["lm_head", "embed_tokens", "text_hidden_fcs",
                           "lisa_attention_layers", "lisa_final_attn", "lisa_norm_final_attn",
-                          "lisa_iou_head", "lisa_embedding_head", "lisa_dino_conv"]
+                          "lisa_iou_head", "lisa_embedding_head", "lisa_dino_conv",
+                          "lisa_ego3d_pos_embed"]
             ]
         ):
             # print("n: ", n, "p.shape: ", p.shape)  # 注释掉：打印每个参数的名称和形状
@@ -765,9 +767,10 @@ def main(args):
         # 初始化 SwanLab
         if SWANLAB_AVAILABLE and swanlab is not None:
             try:
-                # 设置环境变量（参考 finetune_sam_lora_point.py）
-                os.environ['SWANLAB_API_KEY'] = "BBd5HKuM6sIhTwyWmgZ6Z"
-                # 直接初始化（不需要先 login）
+                if os.environ.get("SWANLAB_API_KEY"):
+                    print("Using SwanLab API key from SWANLAB_API_KEY.")
+                else:
+                    print("Using SwanLab CLI login state.")
                 swanlab.init(
                     project="LLMSeg",
                     experiment_name=args.exp_name,
@@ -885,18 +888,36 @@ def main(args):
                 if args.local_rank == 0:
                     print(f"[信息] 自动恢复：找到最新存档 {resume}")
 
+    best_score, cur_ciou = 0.0, 0.0
     if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume, load_optimizer_states=False, load_lr_scheduler_states=False)
-        # with open(os.path.join(args.resume, "latest"), "r") as f:
-        #     ckpt_dir = f.readlines()[0].strip()
-        # args.start_epoch = (
-        #     int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        # )
-        # print(
-        #     "resume training from {}, start from epoch {}".format(
-        #         args.resume, args.start_epoch
-        #     )
-        # )
+        load_path, client_state = model_engine.load_checkpoint(
+            args.resume,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=True,
+        )
+        if load_path is None:
+            raise RuntimeError(f"Failed to resume DeepSpeed checkpoint from: {args.resume}")
+        client_state = client_state or {}
+        if "epoch" in client_state:
+            args.start_epoch = int(client_state["epoch"])
+        else:
+            import re
+            match = re.search(r"epoch_(\d+)$", os.path.basename(os.path.normpath(args.resume)))
+            if match:
+                args.start_epoch = int(match.group(1))
+        best_score = float(client_state.get("best_score", 0.0))
+        cur_ciou = float(client_state.get("cur_ciou", 0.0))
+        if args.local_rank == 0:
+            try:
+                curr_lr = scheduler.get_last_lr()[0]
+            except Exception:
+                curr_lr = None
+            print(
+                f"[信息] 已完整恢复 checkpoint: {load_path} | "
+                f"next_epoch={args.start_epoch} | best_score={best_score:.6f} | "
+                f"cur_ciou={cur_ciou:.6f} | lr={curr_lr}",
+                flush=True,
+            )
 
     train_iter = iter(train_loader)
 
@@ -914,8 +935,6 @@ def main(args):
         #     print("results from threshold {}: giou={}, ciou={}".format(threshold, giou, ciou))
         exit()
 
-    best_score, cur_ciou = 0.0, 0.0
-
     # 获取 swanlab logger（仅在 local_rank == 0 时不为 None）
     swanlab_logger = swanlab if (args.local_rank == 0 and SWANLAB_AVAILABLE and swanlab is not None) else None
 
@@ -932,6 +951,8 @@ def main(args):
                 swanlab_logger,
             )
 
+            is_best = False
+            giou, ciou = None, None
             if args.no_eval == False:
                 giou, ciou = validate(val_loader, model_engine, epoch, writer, args, swanlab_logger)
                 if not args.iou_selection_only:
@@ -949,6 +970,20 @@ def main(args):
             
             # 第一步：每 5 轮保存一个定期存档，按 epoch_X 命名
             real_epoch = epoch + 1  # epoch 从 0 开始，显示时 +1
+            try:
+                curr_lr = scheduler.get_last_lr()[0]
+            except Exception:
+                curr_lr = None
+            client_state = {
+                "epoch": real_epoch,
+                "global_step": real_epoch * args.steps_per_epoch,
+                "best_score": float(best_score),
+                "cur_ciou": float(cur_ciou),
+                "last_giou": None if giou is None else float(giou),
+                "last_ciou": None if ciou is None else float(ciou),
+                "lr": curr_lr,
+                "args": vars(args),
+            }
             if real_epoch % SAVE_INTERVAL == 0:
                 epoch_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}")
                 temp_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}_temp")
@@ -961,7 +996,7 @@ def main(args):
                 if args.local_rank == 0:
                     print(f"\n[Epoch {real_epoch}] 定期存档 -> {epoch_save_dir}")
                 
-                model_engine.save_checkpoint(temp_save_dir)
+                model_engine.save_checkpoint(temp_save_dir, client_state=client_state)
                 
                 if args.local_rank == 0:
                     try:
@@ -990,7 +1025,7 @@ def main(args):
                     shutil.rmtree(best_temp_save_dir, ignore_errors=True)
                 
                 torch.distributed.barrier()
-                model_engine.save_checkpoint(best_temp_save_dir)
+                model_engine.save_checkpoint(best_temp_save_dir, client_state=client_state)
 
                 if args.local_rank == 0:
                     try:
@@ -1673,26 +1708,37 @@ def train(
                 regression_losses.all_reduce()
 
             if args.local_rank == 0:
+                global_step_total = global_step_start + global_step
+                try:
+                    curr_lr = scheduler.get_last_lr()[0]
+                except Exception:
+                    curr_lr = 0.0
                 progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step)
+                writer.add_scalar("train/loss", losses.avg, global_step_total)
+                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step_total)
                 writer.add_scalar(
-                    "train/align_loss", align_losses.avg, global_step
+                    "train/align_loss", align_losses.avg, global_step_total
                 )
                 writer.add_scalar(
-                    "metrics/total_secs_per_batch", batch_time.avg, global_step
+                    "train/regression_loss", regression_losses.avg, global_step_total
                 )
                 writer.add_scalar(
-                    "metrics/data_secs_per_batch", data_time.avg, global_step
+                    "train/lr", curr_lr, global_step_total
+                )
+                writer.add_scalar(
+                    "metrics/total_secs_per_batch", batch_time.avg, global_step_total
+                )
+                writer.add_scalar(
+                    "metrics/data_secs_per_batch", data_time.avg, global_step_total
                 )
                 # 记录到 SwanLab（使用全局步数）
                 if swanlab_logger is not None:
-                    global_step_total = global_step_start + global_step
                     log_dict = {
                         "train/loss": losses.avg,
                         "train/ce_loss": ce_losses.avg,
                         "train/align_loss": align_losses.avg,
                         "train/regression_loss": regression_losses.avg,
+                        "train/lr": curr_lr,
                         "metrics/total_secs_per_batch": batch_time.avg,
                         "metrics/data_secs_per_batch": data_time.avg,
                     }
@@ -1727,15 +1773,6 @@ def train(
             ce_losses.reset()
             align_losses.reset()
             regression_losses.reset()
-
-        if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
-                # 记录学习率到 SwanLab（使用全局步数）
-                if swanlab_logger is not None:
-                    global_step_total = global_step_start + global_step
-                    swanlab.log({"train/lr": curr_lr[0]}, step=global_step_total)
 
     return train_iter
         

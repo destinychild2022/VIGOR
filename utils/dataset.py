@@ -36,6 +36,8 @@ def collate_fn_new(
     image_path_list = []
     images_list = []
     images_clip_list = []
+    depth_list = []
+    intrinsic_list = []
     conversation_list = []
     masks_list = []
     label_list = []
@@ -59,6 +61,8 @@ def collate_fn_new(
         image_path_list.append(data.get('image_path'))
         images_list.append(data.get('images'))
         images_clip_list.append(data.get('images_clip'))
+        depth_list.append(data.get('depth', None))
+        intrinsic_list.append(data.get('intrinsic', None))
         conversation_list.extend(data.get('conversations', []))
         label_list.append(data.get('label'))
         masks_list.append(data.get('masks').float())
@@ -169,7 +173,7 @@ def collate_fn_new(
     # if len(object_name_list) > 0:
     #     print(f"[Collate Debug] Batch size: {len(object_name_list)}, Object names: {object_name_list}")
 
-    return {
+    output = {
         "image_paths": image_path_list,
         "images": torch.stack(images_list, dim=0),
         "images_clip": torch.stack(images_clip_list, dim=0),
@@ -194,6 +198,10 @@ def collate_fn_new(
         "debug_meta_list": debug_meta_list,  # 每个样本的维度追踪信息（非tensor）
         "object_name_list": object_name_list,  # ✅ GT物体名称列表
     }
+    if len(depth_list) > 0 and all(depth is not None for depth in depth_list) and all(K is not None for K in intrinsic_list):
+        output["depths"] = torch.stack(depth_list, dim=0)
+        output["intrinsics"] = torch.stack(intrinsic_list, dim=0)
+    return output
 
 
 def collate_fn(
