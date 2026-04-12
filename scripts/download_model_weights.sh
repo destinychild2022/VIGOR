@@ -54,8 +54,8 @@ try:
     from huggingface_hub import snapshot_download
 except ImportError as exc:
     raise SystemExit(
-        "huggingface_hub is not installed. Install requirements first, "
-        "for example: pip install -r requirements_fixed_new.txt"
+        "huggingface_hub is not installed. Install the project environment first, "
+        "for example: UV_PROJECT_ENVIRONMENT=.venv3124 uv sync --locked"
     ) from exc
 
 lisa_repo, lisa_dir, clip_repo, clip_dir = sys.argv[1:5]

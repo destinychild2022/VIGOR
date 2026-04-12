@@ -38,18 +38,6 @@ environment named `.venv3124` instead, run:
 UV_PROJECT_ENVIRONMENT=.venv3124 uv sync --locked
 ```
 
-The legacy requirements snapshot is still available as `requirements_fixed_new.txt`. If you need
-to use the pip-compatible interface instead of `uv sync`, run:
-
-```bash
-uv venv .venv3124 --python 3.12.4
-uv pip install --python .venv3124/bin/python \
-  -r requirements_fixed_new.txt \
-  --extra-index-url https://download.pytorch.org/whl/cu118 \
-  --index-strategy unsafe-best-match
-```
-
-
 ## Preparing the dataset
 Please first refer to the [LISA](https://github.com/dvlab-research/LISA?tab=readme-ov-file#training-data-preparation) repository to download all the datasets.
 
