@@ -29,6 +29,10 @@ except (ImportError, AttributeError, NameError) as e:
 # ✅ 全局变量：收集维度追踪信息（用于记录到SwanLab）
 _dimension_tracking_info = []
 
+DEFAULT_AUTODL_TMP_DIR = os.environ.get("AUTODL_TMP_DIR", os.path.join("..", "root", "autodl-tmp"))
+DEFAULT_MODEL_DIR = os.environ.get("MODEL_BASE_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "model"))
+DEFAULT_VIGOR_DATA_DIR = os.environ.get("VIGOR_DATA_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "VIGOR-100K_new"))
+
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -57,7 +61,7 @@ def release_model_weight_cache(args):
         args.vision_pretrained,  # SAM 权重
         args.version,  # LISA/LLaMA 模型目录
         args.vision_tower,  # CLIP 模型目录
-        "/opt/data/private/model/dinov2_vitl14",  # DINOv2 权重（如果存在）
+        os.path.join(DEFAULT_MODEL_DIR, "dinov2_vitl14"),  # DINOv2 权重（如果存在）
         os.path.expanduser("~/.cache/torch/hub"),  # torch hub 缓存
     ]
     
@@ -102,7 +106,7 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
-        "--version", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/LISA_Plus_7b"
+        "--version", default=os.path.join(DEFAULT_MODEL_DIR, "LISA_Plus_7b")
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -116,7 +120,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/clip-vit-large-patch14-2", type=str
+        "--vision-tower", default=os.path.join(DEFAULT_MODEL_DIR, "clip-vit-large-patch14"), type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -125,13 +129,13 @@ def parse_args(args):
         "--dataset", default="refer_seg||reason_seg", type=str
     )
     # VIGOR-100K数据集参数
-    parser.add_argument("--vigor_data_base_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K", type=str, help="VIGOR-100K数据集根目录")
-    parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
+    parser.add_argument("--vigor_data_base_dir", default=DEFAULT_VIGOR_DATA_DIR, type=str, help="VIGOR-100K数据集根目录")
+    parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy_new_1.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy_new_1.json）")
     parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
     parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR validation split (train/test/unseen)")
     parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
-    parser.add_argument("--vigor_train_sam_masks_dir", default=None, type=str, help="VIGOR train SAM masks directory")
-    parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
+    parser.add_argument("--vigor_train_sam_masks_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "train_masks_sam_0.8_0.8"), type=str, help="VIGOR train SAM masks directory")
+    parser.add_argument("--vigor_val_sam_masks_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_mask", "sam_masks"), type=str, help="VIGOR val SAM masks directory")
     parser.add_argument("--vigor_val_max_samples", default=2, type=int, help="Max samples for VIGOR validation set")
     parser.add_argument("--vigor_only_hard", action="store_true", default=False, help="Only load hard samples for VIGOR dataset (skip easy samples)")
     parser.add_argument("--vigor_max_instructions", default=3, type=int, help="Max instructions per sample (1, 2, or 3)")
@@ -149,17 +153,17 @@ def parse_args(args):
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
-    parser.add_argument("--dataset_dir", default="/cluster/scratch/leikel/junchi/lisa_dataset", type=str)
-    parser.add_argument("--sam_masks_dir", default="/home/leikel/junchi/processed_data", type=str)
+    parser.add_argument("--dataset_dir", default=os.path.join(".", "dataset", "lisa_dataset"), type=str)
+    parser.add_argument("--sam_masks_dir", default=os.path.join(".", "dataset", "sam_masks"), type=str)
     # 机器人手臂数据集路径参数
-    parser.add_argument("--dataset_base_dir", default="/opt/data/private/LLMSeg/dataset/raw_pic", type=str, help="原图数据集路径")
-    parser.add_argument("--gt_mask_base_dir", default="/opt/data/private/LLMSeg/dataset/GT_mask", type=str, help="GT mask数据集路径")
-    parser.add_argument("--sam_masks_base_dir", default="/opt/data/private/LLMSeg/dataset/sam_candidate", type=str, help="SAM候选mask数据集路径")
+    parser.add_argument("--dataset_base_dir", default=os.path.join(".", "dataset", "raw_pic"), type=str, help="原图数据集路径")
+    parser.add_argument("--gt_mask_base_dir", default=os.path.join(".", "dataset", "GT_mask"), type=str, help="GT mask数据集路径")
+    parser.add_argument("--sam_masks_base_dir", default=os.path.join(".", "dataset", "sam_candidate"), type=str, help="SAM候选mask数据集路径")
     # 机器人手臂数据集划分参数：每视角取前N张（默认100，共≈300），再按9:1随机划分 train/val
     parser.add_argument("--robotarm_max_per_view", default=100, type=int, help="每个视角最多使用前N张（用于构建300样本池）")
     parser.add_argument("--robotarm_val_ratio", default=0.1, type=float, help="从样本池中划分到验证集的比例（默认0.1，即9:1）")
     parser.add_argument("--robotarm_split_seed", default=0, type=int, help="划分随机种子（保证可复现）")
-    parser.add_argument("--log_base_dir", default="./runs", type=str)
+    parser.add_argument("--log_base_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "runs"), type=str)
     parser.add_argument("--exp_name", default="debug", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
@@ -188,7 +192,7 @@ def parse_args(args):
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
-    parser.add_argument("--vision_pretrained", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/LLM-Seg-deepspeed", type=str)
+    parser.add_argument("--vision_pretrained", default=os.path.join(DEFAULT_MODEL_DIR, "SAM-vit-h", "sam_vit_h_4b8939.pth"), type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--resume", default="", type=str)
@@ -755,6 +759,163 @@ def init_deepseed_config(args):
 
 
 
+def collect_learning_rates(model_engine=None, scheduler=None):
+    """Collect scheduler and optimizer LR groups for logging/checkpoint metadata."""
+    def _as_float_list(values):
+        out = []
+        if values is None:
+            return out
+        for value in values:
+            try:
+                out.append(float(value))
+            except Exception:
+                pass
+        return out
+
+    scheduler_lrs = []
+    if scheduler is not None:
+        for method_name in ("get_last_lr", "get_lr"):
+            method = getattr(scheduler, method_name, None)
+            if method is None:
+                continue
+            try:
+                scheduler_lrs = _as_float_list(method())
+                if scheduler_lrs:
+                    break
+            except Exception:
+                continue
+
+    optimizer_lrs = []
+    optimizer = getattr(model_engine, "optimizer", None) if model_engine is not None else None
+    # Some DeepSpeed optimizers wrap the real optimizer one level down.
+    optimizer_candidates = [optimizer, getattr(optimizer, "optimizer", None)]
+    for opt in optimizer_candidates:
+        param_groups = getattr(opt, "param_groups", None)
+        if not param_groups:
+            continue
+        optimizer_lrs = _as_float_list(group.get("lr") for group in param_groups)
+        if optimizer_lrs:
+            break
+
+    primary_lrs = scheduler_lrs or optimizer_lrs
+    log_dict = {}
+    if primary_lrs:
+        log_dict["train/lr"] = primary_lrs[0]
+        log_dict["train/lr_min"] = min(primary_lrs)
+        log_dict["train/lr_max"] = max(primary_lrs)
+    for idx, lr in enumerate(scheduler_lrs):
+        log_dict[f"train/lr_scheduler/group_{idx}"] = lr
+    for idx, lr in enumerate(optimizer_lrs):
+        log_dict[f"train/lr_optimizer/group_{idx}"] = lr
+
+    return {
+        "scheduler_lrs": scheduler_lrs,
+        "optimizer_lrs": optimizer_lrs,
+        "log_dict": log_dict,
+    }
+
+
+def build_checkpoint_client_state(
+    args,
+    epoch,
+    best_score,
+    cur_ciou,
+    giou=None,
+    ciou=None,
+    is_best=False,
+    save_reason="epoch",
+    model_engine=None,
+    scheduler=None,
+):
+    """State not owned by DeepSpeed but required for faithful resume."""
+    completed_epoch = int(epoch) + 1
+    state = {
+        "epoch": int(epoch),
+        "completed_epoch": completed_epoch,
+        "start_epoch": completed_epoch,
+        "next_epoch": completed_epoch,
+        "best_score": float(best_score),
+        "cur_ciou": float(cur_ciou),
+        "last_giou": None if giou is None else float(giou),
+        "last_ciou": None if ciou is None else float(ciou),
+        "is_best": bool(is_best),
+        "save_reason": str(save_reason),
+        "exp_name": args.exp_name,
+        "log_dir": args.log_dir,
+        "epochs": int(args.epochs),
+        "steps_per_epoch": int(args.steps_per_epoch),
+        "grad_accumulation_steps": int(args.grad_accumulation_steps),
+        "batch_size": int(args.batch_size),
+        "base_lr": float(args.lr),
+        "global_step_estimate": completed_epoch * int(args.steps_per_epoch),
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        lr_info = collect_learning_rates(model_engine, scheduler)
+        state["scheduler_lrs"] = lr_info["scheduler_lrs"]
+        state["optimizer_lrs"] = lr_info["optimizer_lrs"]
+    except Exception:
+        pass
+    return state
+
+
+def load_best_score_from_meta(log_dir):
+    """Fallback for old checkpoints that do not yet have client_state."""
+    best_score, cur_ciou = 0.0, 0.0
+    if not os.path.isdir(log_dir):
+        return best_score, cur_ciou
+
+    import re
+    for filename in os.listdir(log_dir):
+        if not filename.startswith("meta_log_BEST") or not filename.endswith(".pth"):
+            continue
+        path = os.path.join(log_dir, filename)
+        score = None
+        ciou = None
+        try:
+            state = torch.load(path, map_location="cpu")
+            score = state.get("giou", None) if isinstance(state, dict) else None
+            ciou = state.get("ciou", None) if isinstance(state, dict) else None
+        except Exception:
+            pass
+        if score is None:
+            match = re.search(r"giou([0-9.]+)", filename)
+            if match:
+                try:
+                    score = float(match.group(1).rstrip("."))
+                except Exception:
+                    score = None
+        if score is not None and float(score) >= best_score:
+            best_score = float(score)
+            cur_ciou = 0.0 if ciou is None else float(ciou)
+    return best_score, cur_ciou
+
+
+def restore_training_state_from_checkpoint(args, client_state, resume_path):
+    """Restore loop counters and best metrics from client_state, with old-checkpoint fallbacks."""
+    import re
+
+    best_score, cur_ciou = load_best_score_from_meta(args.log_dir)
+    restored_start_epoch = args.start_epoch
+
+    if isinstance(client_state, dict) and client_state:
+        for key in ("start_epoch", "next_epoch", "completed_epoch"):
+            if key in client_state and client_state[key] is not None:
+                restored_start_epoch = int(client_state[key])
+                break
+        if "best_score" in client_state and client_state["best_score"] is not None:
+            best_score = float(client_state["best_score"])
+        if "cur_ciou" in client_state and client_state["cur_ciou"] is not None:
+            cur_ciou = float(client_state["cur_ciou"])
+    else:
+        match = re.search(r"epoch_(\d+)$", os.path.basename(os.path.normpath(resume_path)))
+        if match:
+            restored_start_epoch = int(match.group(1))
+
+    args.start_epoch = restored_start_epoch
+    return best_score, cur_ciou
+
+
 def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
@@ -766,7 +927,7 @@ def main(args):
         if SWANLAB_AVAILABLE and swanlab is not None:
             try:
                 # 设置环境变量（参考 finetune_sam_lora_point.py）
-                os.environ['SWANLAB_API_KEY'] = "BBd5HKuM6sIhTwyWmgZ6Z"
+                os.environ['SWANLAB_API_KEY'] = "17UKzqoPx2VI4PLzCHYdH"
                 # 直接初始化（不需要先 login）
                 swanlab.init(
                     project="LLMSeg",
@@ -871,8 +1032,9 @@ def main(args):
         )
 
     # resume deepspeed checkpoint
+    restored_best_score, restored_cur_ciou = 0.0, 0.0
     if args.auto_resume and len(args.resume) == 0:
-        # 自动寻找最新的 epoch_X 存档
+        # 自动寻找最新的 epoch_X 存档；基于相同 EXP_NAME 得到的 args.log_dir。
         ckpt_base = os.path.join(args.log_dir, "ckpt_model")
         if os.path.exists(ckpt_base):
             import re
@@ -886,17 +1048,30 @@ def main(args):
                     print(f"[信息] 自动恢复：找到最新存档 {resume}")
 
     if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume, load_optimizer_states=False, load_lr_scheduler_states=False)
-        # with open(os.path.join(args.resume, "latest"), "r") as f:
-        #     ckpt_dir = f.readlines()[0].strip()
-        # args.start_epoch = (
-        #     int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        # )
-        # print(
-        #     "resume training from {}, start from epoch {}".format(
-        #         args.resume, args.start_epoch
-        #     )
-        # )
+        load_path, client_state = model_engine.load_checkpoint(
+            args.resume,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=True,
+        )
+        if load_path is None:
+            if args.local_rank == 0:
+                print(f"[警告] checkpoint 加载失败，未恢复训练状态: {args.resume}")
+        else:
+            restored_best_score, restored_cur_ciou = restore_training_state_from_checkpoint(
+                args, client_state, args.resume
+            )
+            if args.local_rank == 0:
+                print(
+                    f"[信息] 已恢复 checkpoint: {load_path} | "
+                    f"start_epoch={args.start_epoch} | "
+                    f"best_score={restored_best_score:.6f} | cur_ciou={restored_cur_ciou:.6f}"
+                )
+                lr_info = collect_learning_rates(model_engine, scheduler)
+                if lr_info["scheduler_lrs"] or lr_info["optimizer_lrs"]:
+                    print(
+                        f"[信息] 已恢复 LR | scheduler={lr_info['scheduler_lrs']} | "
+                        f"optimizer={lr_info['optimizer_lrs']}"
+                    )
 
     train_iter = iter(train_loader)
 
@@ -914,13 +1089,15 @@ def main(args):
         #     print("results from threshold {}: giou={}, ciou={}".format(threshold, giou, ciou))
         exit()
 
-    best_score, cur_ciou = 0.0, 0.0
+    best_score, cur_ciou = restored_best_score, restored_cur_ciou
 
     # 获取 swanlab logger（仅在 local_rank == 0 时不为 None）
     swanlab_logger = swanlab if (args.local_rank == 0 and SWANLAB_AVAILABLE and swanlab is not None) else None
 
     try:
         for epoch in range(args.start_epoch, args.epochs):
+            giou, ciou = None, None
+            is_best = False
             train_iter = train(
                 train_loader,
                 model_engine,
@@ -961,7 +1138,19 @@ def main(args):
                 if args.local_rank == 0:
                     print(f"\n[Epoch {real_epoch}] 定期存档 -> {epoch_save_dir}")
                 
-                model_engine.save_checkpoint(temp_save_dir)
+                epoch_client_state = build_checkpoint_client_state(
+                    args,
+                    epoch,
+                    best_score,
+                    cur_ciou,
+                    giou=giou,
+                    ciou=ciou,
+                    is_best=is_best,
+                    save_reason=f"epoch_{real_epoch}",
+                    model_engine=model_engine,
+                    scheduler=scheduler,
+                )
+                model_engine.save_checkpoint(temp_save_dir, client_state=epoch_client_state)
                 
                 if args.local_rank == 0:
                     try:
@@ -990,7 +1179,19 @@ def main(args):
                     shutil.rmtree(best_temp_save_dir, ignore_errors=True)
                 
                 torch.distributed.barrier()
-                model_engine.save_checkpoint(best_temp_save_dir)
+                best_client_state = build_checkpoint_client_state(
+                    args,
+                    epoch,
+                    best_score,
+                    cur_ciou,
+                    giou=giou,
+                    ciou=ciou,
+                    is_best=True,
+                    save_reason="best",
+                    model_engine=model_engine,
+                    scheduler=scheduler,
+                )
+                model_engine.save_checkpoint(best_temp_save_dir, client_state=best_client_state)
 
                 if args.local_rank == 0:
                     try:
@@ -1673,21 +1874,28 @@ def train(
                 regression_losses.all_reduce()
 
             if args.local_rank == 0:
+                global_step_total = global_step_start + global_step
+                lr_info = collect_learning_rates(model, scheduler)
                 progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step)
+                writer.add_scalar("train/loss", losses.avg, global_step_total)
+                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step_total)
                 writer.add_scalar(
-                    "train/align_loss", align_losses.avg, global_step
+                    "train/align_loss", align_losses.avg, global_step_total
                 )
                 writer.add_scalar(
-                    "metrics/total_secs_per_batch", batch_time.avg, global_step
+                    "train/regression_loss", regression_losses.avg, global_step_total
                 )
                 writer.add_scalar(
-                    "metrics/data_secs_per_batch", data_time.avg, global_step
+                    "metrics/total_secs_per_batch", batch_time.avg, global_step_total
                 )
+                writer.add_scalar(
+                    "metrics/data_secs_per_batch", data_time.avg, global_step_total
+                )
+                for lr_name, lr_value in lr_info["log_dict"].items():
+                    writer.add_scalar(lr_name, lr_value, global_step_total)
+
                 # 记录到 SwanLab（使用全局步数）
                 if swanlab_logger is not None:
-                    global_step_total = global_step_start + global_step
                     log_dict = {
                         "train/loss": losses.avg,
                         "train/ce_loss": ce_losses.avg,
@@ -1696,6 +1904,7 @@ def train(
                         "metrics/total_secs_per_batch": batch_time.avg,
                         "metrics/data_secs_per_batch": data_time.avg,
                     }
+                    log_dict.update(lr_info["log_dict"])
                     # ✅ 在第一个step时，将维度追踪信息记录到SwanLab
                     if epoch == 0 and global_step == 0:
                         # 检查是否有维度追踪信息
@@ -1727,15 +1936,6 @@ def train(
             ce_losses.reset()
             align_losses.reset()
             regression_losses.reset()
-
-        if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
-                # 记录学习率到 SwanLab（使用全局步数）
-                if swanlab_logger is not None:
-                    global_step_total = global_step_start + global_step
-                    swanlab.log({"train/lr": curr_lr[0]}, step=global_step_total)
 
     return train_iter
         

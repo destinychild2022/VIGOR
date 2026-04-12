@@ -438,7 +438,7 @@ class HybridDataset(torch.utils.data.Dataset):
         
 
         # # for debug
-        # sam_mask_dir = "/home/leikel/junchi/processed_data"
+        # sam_mask_dir = "./dataset/sam_masks"
         # self.coco2014_sam_mask_helper = SAM_Mask_Reader(
         #                      os.path.join(sam_mask_dir, "coco2014", "masks.json")) 
         # self.saiapr_sam_mask_helper = SAM_Mask_Reader(

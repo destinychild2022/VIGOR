@@ -21,6 +21,9 @@ from .utils import (ANSWER_LIST, DEFAULT_IMAGE_TOKEN,
 from .sam_mask_reader_png import SAM_Mask_Reader_PNG
 from .utils import compute_all_iou, compute_all_iop
 
+DEFAULT_AUTODL_TMP_DIR = os.environ.get("AUTODL_TMP_DIR", os.path.join("..", "root", "autodl-tmp"))
+DEFAULT_VIGOR_DATA_DIR = os.environ.get("VIGOR_DATA_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "VIGOR-100K_new"))
+
 
 class VIGORDataset(torch.utils.data.Dataset):
     """
@@ -40,7 +43,7 @@ class VIGORDataset(torch.utils.data.Dataset):
         vision_tower,
         precision: str = "bf16",
         image_size: int = 896,
-        data_base_dir: str = "/opt/data/private/LLMSeg/dataset/VIGOR-100K",  # VIGOR-100K根目录
+        data_base_dir: str = DEFAULT_VIGOR_DATA_DIR,  # VIGOR-100K根目录
         split: str = "train",  # train/test/unseen
         sam_mask_helper: SAM_Mask_Reader_PNG = None,  # SAM候选mask helper（可选）
         max_samples: int = None,  # 最多使用多少个样本（None表示使用全部）

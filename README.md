@@ -23,10 +23,30 @@ The table below shows the performance of LLM-Seg on ReasonSeg validation set.
 
 
 ## Prepare the environment
-We recommend using conda to create a virtual environment and install the dependencies.
+We recommend using `uv` to recreate the pinned Python environment.
+
 ```bash
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --locked
+```
+
+The project pins Python `3.12.4` in `.python-version` and uses the PyTorch CUDA 11.8 wheels
+configured in `pyproject.toml`. By default, `uv sync` creates `.venv`. To create or update an
+environment named `.venv3124` instead, run:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv3124 uv sync --locked
+```
+
+The legacy requirements snapshot is still available as `requirements_fixed_new.txt`. If you need
+to use the pip-compatible interface instead of `uv sync`, run:
+
+```bash
+uv venv .venv3124 --python 3.12.4
+uv pip install --python .venv3124/bin/python \
+  -r requirements_fixed_new.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  --index-strategy unsafe-best-match
 ```
 
 

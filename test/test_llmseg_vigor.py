@@ -37,6 +37,10 @@ from torch.utils.data import Dataset, DataLoader
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+DEFAULT_AUTODL_TMP_DIR = os.environ.get("AUTODL_TMP_DIR", os.path.join("..", "root", "autodl-tmp"))
+DEFAULT_MODEL_DIR = os.environ.get("MODEL_BASE_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "model"))
+DEFAULT_VIGOR_DATA_DIR = os.environ.get("VIGOR_DATA_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "VIGOR-100K_new"))
+
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -51,20 +55,20 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="LLMSeg VIGOR-100K 测试脚本")
     
     # 模型路径
-    parser.add_argument("--version", default="/opt/data/private/model/LISA_Plus_7b",
+    parser.add_argument("--version", default=os.path.join(DEFAULT_MODEL_DIR, "LISA_Plus_7b"),
                         type=str, help="LISA 基础模型路径")
-    parser.add_argument("--checkpoint", default="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple/ckpt_model",
+    parser.add_argument("--checkpoint", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "runs", "finetune_llmseg_vigor_simple-object", "ckpt_model"),
                         type=str, help="微调后的 checkpoint 路径")
-    parser.add_argument("--vision_tower", default="/opt/data/private/model/clip-vit-large-patch14",
+    parser.add_argument("--vision_tower", default=os.path.join(DEFAULT_MODEL_DIR, "clip-vit-large-patch14"),
                         type=str, help="CLIP 模型路径")
-    parser.add_argument("--vision_pretrained", default="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth",
+    parser.add_argument("--vision_pretrained", default=os.path.join(DEFAULT_MODEL_DIR, "SAM-vit-h", "sam_vit_h_4b8939.pth"),
                         type=str, help="SAM ViT-H 权重路径")
     
     # 数据集路径
-    parser.add_argument("--data_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test",
+    parser.add_argument("--data_dir", default=os.path.join(DEFAULT_VIGOR_DATA_DIR, "test"),
                         type=str, help="测试数据集路径")
-    parser.add_argument("--sam_masks_dir", required=True, type=str,
-                        help="SAM 候选 mask 目录 (必需)")
+    parser.add_argument("--sam_masks_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_mask", "sam_masks"), type=str,
+                        help="SAM 候选 mask 目录")
     
     # 输出路径
     parser.add_argument("--output_dir", default="./result",
@@ -109,10 +113,14 @@ def parse_args(args):
 
 def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
     """加载测试样本"""
-    json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json")
+    json_candidates = [
+        os.path.join(data_dir, f"open_vocab_grasp_{difficulty}_new_1.json"),
+        os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json"),
+    ]
+    json_file = next((path for path in json_candidates if os.path.exists(path)), None)
     
-    if not os.path.exists(json_file):
-        print(f"  [警告] 文件不存在: {json_file}")
+    if json_file is None:
+        print(f"  [警告] 文件不存在: {json_candidates[0]} 或 {json_candidates[1]}")
         return []
     
     with open(json_file, "r") as f:

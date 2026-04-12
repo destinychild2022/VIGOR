@@ -39,9 +39,9 @@ class RobotArmDataset(torch.utils.data.Dataset):
         vision_tower,
         precision: str = "bf16",
         image_size: int = 896,
-        raw_pic_base_dir: str = "/opt/data/private/LLMSeg/dataset/raw_pic",
-        gt_mask_base_dir: str = "/opt/data/private/LLMSeg/dataset/GT_mask",
-        sam_candidate_base_dir: str = "/opt/data/private/LLMSeg/dataset/sam_candidate",
+        raw_pic_base_dir: str = os.path.join(".", "dataset", "raw_pic"),
+        gt_mask_base_dir: str = os.path.join(".", "dataset", "GT_mask"),
+        sam_candidate_base_dir: str = os.path.join(".", "dataset", "sam_candidate"),
         sam_mask_helpers: Dict[str, SAM_Mask_Reader_PNG] = None,
         max_samples_per_view: int = 100,  # 每个视角最多使用100张图像
         is_train: bool = True,

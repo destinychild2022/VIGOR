@@ -8,23 +8,23 @@
 # ========================================================================
 
 # ========== 模型路径配置 ==========
-MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
-VISION_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+MODEL_PATH="../root/autodl-tmp/model/LISA_Plus_7b"
+CLIP_PATH="../root/autodl-tmp/model/clip-vit-large-patch14"
+VISION_PATH="../root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # ========== VIGOR 数据集配置 ==========
-VIGOR_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new"
+VIGOR_DATA_DIR="../root/autodl-tmp/VIGOR-100K_new"
 VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
-VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
-VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks"
+VIGOR_TRAIN_SAM_MASKS="../root/autodl-tmp/train_masks_sam_0.8_0.8"
+VIGOR_VAL_SAM_MASKS="../root/autodl-tmp/test_mask/sam_masks"
 # 是否只使用 hard 样本 (不使用 easy 样本)
 VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
-LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-new-20epochs"
+LOG_DIR="../root/autodl-tmp/runs"
+EXP_NAME="finetune_llmseg_vigor_simple-object"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
@@ -51,7 +51,7 @@ LORA_DROPOUT=0.1
 LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 # ========== GPU 配置 ==========
-GPU_IDS="0,1"
+GPU_IDS="0"
 MASTER_PORT=24375
 
 # ========== Checkpoint 配置 ==========

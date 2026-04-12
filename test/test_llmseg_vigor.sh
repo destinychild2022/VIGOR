@@ -7,16 +7,16 @@
 # ========================================================================
 
 # ========== 模型路径配置 ==========
-LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple/ckpt_model"
-CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
-SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+LISA_MODEL_PATH="../root/autodl-tmp/model/LISA_Plus_7b"
+CHECKPOINT_PATH="../root/autodl-tmp/runs/finetune_llmseg_vigor_simple-object/ckpt_model"
+CLIP_PATH="../root/autodl-tmp/model/clip-vit-large-patch14"
+SAM_VIT_PATH="../root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # ========== 数据集配置 ==========
 # 测试数据集路径
-TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test"
+TEST_DATA_DIR="../root/autodl-tmp/VIGOR-100K_new/test"
 # SAM 候选 mask 目录 (必需！)
-SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
+SAM_MASKS_DIR="../root/autodl-tmp/test_mask/sam_masks"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"

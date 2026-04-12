@@ -21,6 +21,9 @@ from .utils import (ANSWER_LIST, DEFAULT_IMAGE_TOKEN,
 from .sam_mask_reader_png import SAM_Mask_Reader_PNG
 from .utils import compute_all_iou, compute_all_iop
 
+DEFAULT_AUTODL_TMP_DIR = os.environ.get("AUTODL_TMP_DIR", os.path.join("..", "root", "autodl-tmp"))
+DEFAULT_VIGOR_DATA_DIR = os.environ.get("VIGOR_DATA_DIR", os.path.join(DEFAULT_AUTODL_TMP_DIR, "VIGOR-100K_new"))
+
 
 class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
     """
@@ -41,7 +44,7 @@ class VIGORDatasetMultiInstance(torch.utils.data.Dataset):
         vision_tower,
         precision: str = "bf16",
         image_size: int = 896,
-        data_base_dir: str = "/opt/data/private/LLMSeg/dataset/VIGOR-100K",
+        data_base_dir: str = DEFAULT_VIGOR_DATA_DIR,
         split: str = "train",
         sam_mask_helper: SAM_Mask_Reader_PNG = None,
         max_samples: int = None,
