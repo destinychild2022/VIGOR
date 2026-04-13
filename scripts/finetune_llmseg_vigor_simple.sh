@@ -57,6 +57,9 @@ MASTER_PORT=24375
 # ========== Checkpoint 配置 ==========
 RESUME_PATH=""
 
+# ========== 分布式超时配置 ==========
+export NCCL_TIMEOUT=7200000
+
 # ========================================================================
 
 cd "$(dirname "$0")/.." || exit 1
@@ -107,7 +110,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=4 \
+  --workers=16 \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \
