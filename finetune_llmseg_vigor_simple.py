@@ -1979,7 +1979,11 @@ def train(
                         "metrics/total_secs_per_batch": batch_time.avg,
                         "metrics/data_secs_per_batch": data_time.avg,
                     }
-                    log_dict.update(lr_info["log_dict"])
+                    swanlab_lr_logs = {
+                        k: v for k, v in lr_info["log_dict"].items()
+                        if not (k.startswith("train/lr_scheduler/") or k.startswith("train/lr_optimizer/"))
+                    }
+                    log_dict.update(swanlab_lr_logs)
                     log_dict.update(geo_stats)
                     # ✅ 在第一个step时，将维度追踪信息记录到SwanLab
                     if epoch == 0 and global_step == 0:
