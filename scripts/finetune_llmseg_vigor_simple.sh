@@ -36,7 +36,7 @@ VIGOR_DEPTH_MAX=1.85
 
 # ========== 输出配置 ==========
 LOG_DIR="../root/autodl-tmp/runs"
-EXP_NAME="finetune_llmseg_vigor_simple-object"
+EXP_NAME="finetune_llmseg_vigor_simple-DFormer"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
@@ -208,7 +208,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=16 \
+  --workers=8 \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \

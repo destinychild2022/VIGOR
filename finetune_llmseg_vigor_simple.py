@@ -804,8 +804,6 @@ def collect_learning_rates(model_engine=None, scheduler=None):
     log_dict = {}
     if primary_lrs:
         log_dict["train/lr"] = primary_lrs[0]
-        log_dict["train/lr_min"] = min(primary_lrs)
-        log_dict["train/lr_max"] = max(primary_lrs)
     for idx, lr in enumerate(scheduler_lrs):
         log_dict[f"train/lr_scheduler/group_{idx}"] = lr
     for idx, lr in enumerate(optimizer_lrs):
