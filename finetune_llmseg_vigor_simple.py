@@ -718,6 +718,48 @@ def init_validation_dataset(args, tokenizer):
     return val_dataset
 
 
+def build_trainable_parameter_groups(model):
+    base_params = []
+    geo_params = []
+    trainable_count = 0
+    geo_names = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        trainable_count += param.numel()
+        if "lisa_geo_prior" in name:
+            geo_params.append(param)
+            geo_names.append(name)
+        else:
+            base_params.append(param)
+
+    param_groups = []
+    if base_params:
+        param_groups.append({"params": base_params})
+    if geo_params:
+        param_groups.append({"params": geo_params})
+
+    try:
+        for module in model.modules():
+            geo = getattr(module, "lisa_geo_prior", None)
+            if geo is not None:
+                setattr(geo, "_optimizer_has_weight_cache", bool(geo_params))
+                break
+    except Exception:
+        pass
+
+    print(
+        f"[TrainableParams] total_trainable={trainable_count} "
+        f"base_tensors={len(base_params)} geo_tensors={len(geo_params)}",
+        flush=True,
+    )
+    if geo_names:
+        print(f"[TrainableParams] geometry params: {geo_names}", flush=True)
+    else:
+        print("[TrainableParams] WARNING: no trainable lisa_geo_prior parameters found", flush=True)
+    return param_groups
+
+
 def init_deepseed_config(args):
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
@@ -1063,9 +1105,10 @@ def main(args):
     except Exception as e:
         print(f"[MetaTensorCheck] Failed to scan meta parameters: {e}")
 
+    trainable_param_groups = build_trainable_parameter_groups(model)
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
-        model_parameters=model.parameters(),
+        model_parameters=trainable_param_groups,
         config=ds_config,
     )
     
