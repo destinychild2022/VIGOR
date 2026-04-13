@@ -19,8 +19,8 @@ TEST_DATA_DIR="../root/autodl-tmp/VIGOR-100K_new/test"
 SAM_MASKS_DIR="../root/autodl-tmp/test_mask/sam_masks"
 
 # ========== 输出配置 ==========
-OUTPUT_DIR="./result"
-VIS_DIR="./vis_output2_hard"  # 可视化输出目录
+OUTPUT_DIR="../root/autodl-tmp/test_results"
+VIS_DIR="../root/autodl-tmp/test_vis_output"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========

@@ -71,7 +71,7 @@ def parse_args(args):
                         help="SAM 候选 mask 目录")
     
     # 输出路径
-    parser.add_argument("--output_dir", default="./result",
+    parser.add_argument("--output_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_results"),
                         type=str, help="结果保存目录")
     
     # 模型配置
@@ -95,7 +95,7 @@ def parse_args(args):
                         type=str, help="ICR 阈值列表，逗号分隔")
     
     # 可视化配置
-    parser.add_argument("--vis_dir", default="./vis_output", type=str,
+    parser.add_argument("--vis_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_vis_output"), type=str,
                         help="可视化输出目录")
     parser.add_argument("--save_vis", action="store_true", default=True,
                         help="是否保存可视化图片")
