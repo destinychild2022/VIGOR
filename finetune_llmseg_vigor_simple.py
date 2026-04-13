@@ -1965,7 +1965,7 @@ def train(
                 writer.add_scalar(
                     "metrics/data_secs_per_batch", data_time.avg, global_step_total
                 )
-                geo_stats = collect_geometry_prior_stats(model_engine)
+                geo_stats = collect_geometry_prior_stats(model)
                 for lr_name, lr_value in lr_info["log_dict"].items():
                     writer.add_scalar(lr_name, lr_value, global_step_total)
                 for geo_name, geo_value in geo_stats.items():
