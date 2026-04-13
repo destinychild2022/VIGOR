@@ -178,6 +178,7 @@ def parse_args(args):
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=8, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
+    parser.add_argument("--geometry_lr_mult", default=10.0, type=float, help="LR multiplier for proposal geometry prior weights")
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--align_loss_weight", default=1.0, type=float)
     parser.add_argument("--regression_loss_weight", default=1.0, type=float)
@@ -718,7 +719,7 @@ def init_validation_dataset(args, tokenizer):
     return val_dataset
 
 
-def build_trainable_parameter_groups(model):
+def build_trainable_parameter_groups(model, args=None):
     base_params = []
     geo_params = []
     trainable_count = 0
@@ -737,20 +738,16 @@ def build_trainable_parameter_groups(model):
     if base_params:
         param_groups.append({"params": base_params})
     if geo_params:
-        param_groups.append({"params": geo_params})
+        geo_group = {"params": geo_params}
+        if args is not None:
+            geo_group["lr"] = float(args.lr) * float(getattr(args, "geometry_lr_mult", 1.0))
+        param_groups.append(geo_group)
 
-    try:
-        for module in model.modules():
-            geo = getattr(module, "lisa_geo_prior", None)
-            if geo is not None:
-                setattr(geo, "_optimizer_has_weight_cache", bool(geo_params))
-                break
-    except Exception:
-        pass
 
     print(
         f"[TrainableParams] total_trainable={trainable_count} "
-        f"base_tensors={len(base_params)} geo_tensors={len(geo_params)}",
+        f"base_tensors={len(base_params)} geo_tensors={len(geo_params)} "
+        f"geometry_lr={float(args.lr) * float(getattr(args, 'geometry_lr_mult', 1.0)) if args is not None else 'default'}",
         flush=True,
     )
     if geo_names:
@@ -846,10 +843,6 @@ def collect_learning_rates(model_engine=None, scheduler=None):
     log_dict = {}
     if primary_lrs:
         log_dict["train/lr"] = primary_lrs[0]
-    for idx, lr in enumerate(scheduler_lrs):
-        log_dict[f"train/lr_scheduler/group_{idx}"] = lr
-    for idx, lr in enumerate(optimizer_lrs):
-        log_dict[f"train/lr_optimizer/group_{idx}"] = lr
 
     return {
         "scheduler_lrs": scheduler_lrs,
@@ -859,7 +852,7 @@ def collect_learning_rates(model_engine=None, scheduler=None):
 
 
 
-def collect_geometry_prior_stats(model_engine=None, include_grad: bool = False, include_optimizer: bool = True):
+def collect_geometry_prior_stats(model_engine=None):
     root = getattr(model_engine, "module", model_engine)
     if root is None:
         return {}
@@ -878,58 +871,12 @@ def collect_geometry_prior_stats(model_engine=None, include_grad: bool = False, 
         with torch.no_grad():
             weight = geo.weight.detach().float().view(-1)
             decay_abs_mean = geo.decay.detach().float().abs().mean()
-            stats = {
+            return {
                 "geometry/w_pos": float(weight[0].item()),
                 "geometry/w_depth": float(weight[1].item()),
                 "geometry/pos_bias_strength": float((weight[0].abs() * decay_abs_mean).item()),
                 "geometry/depth_bias_strength": float((weight[1].abs() * decay_abs_mean).item()),
-                "geometry/active": float(bool(getattr(geo, "last_active", False))),
-                "geometry/num_proposals": float(getattr(geo, "last_num_proposals", 0)),
-                "geometry/num_valid_proposals": float(getattr(geo, "last_num_valid", 0)),
-                "geometry/bias_abs_mean": float(getattr(geo, "last_bias_abs_mean", 0.0)),
-                "geometry/weight_requires_grad": float(bool(geo.weight.requires_grad)),
             }
-            if include_optimizer:
-                cached = getattr(geo, "_optimizer_has_weight_cache", None)
-                if cached is None:
-                    cached = False
-                    target = geo.weight
-                    optimizer = getattr(model_engine, "optimizer", None) if model_engine is not None else None
-                    for opt in (optimizer, getattr(optimizer, "optimizer", None)):
-                        param_groups = getattr(opt, "param_groups", None)
-                        if not param_groups:
-                            continue
-                        for group in param_groups:
-                            for param in group.get("params", []):
-                                if param is target:
-                                    cached = True
-                                    break
-                            if cached:
-                                break
-                        if cached:
-                            break
-                    setattr(geo, "_optimizer_has_weight_cache", cached)
-                stats["geometry/optimizer_has_weight"] = float(bool(cached))
-        if include_grad:
-            grad = geo.weight.grad
-            hook_grad = getattr(geo, "last_weight_grad", None)
-            source_grad = hook_grad if hook_grad is not None else grad
-            stats["geometry/weight_grad_is_none"] = float(grad is None)
-            stats["geometry/weight_hook_grad_is_none"] = float(hook_grad is None)
-            if source_grad is None:
-                stats.update({
-                    "geometry/weight_grad_norm": 0.0,
-                    "geometry/w_pos_grad": 0.0,
-                    "geometry/w_depth_grad": 0.0,
-                })
-            else:
-                grad_flat = source_grad.detach().float().view(-1)
-                stats.update({
-                    "geometry/weight_grad_norm": float(grad_flat.norm().item()),
-                    "geometry/w_pos_grad": float(grad_flat[0].item()),
-                    "geometry/w_depth_grad": float(grad_flat[1].item()),
-                })
-        return stats
     except Exception:
         return {}
 
@@ -1105,7 +1052,13 @@ def main(args):
     except Exception as e:
         print(f"[MetaTensorCheck] Failed to scan meta parameters: {e}")
 
-    trainable_param_groups = build_trainable_parameter_groups(model)
+    trainable_param_groups = build_trainable_parameter_groups(model, args)
+    if len(trainable_param_groups) > 1 and "lr" in trainable_param_groups[-1]:
+        max_lrs = [float(args.lr)] * len(trainable_param_groups)
+        max_lrs[-1] = float(trainable_param_groups[-1]["lr"])
+        ds_config["scheduler"]["params"]["warmup_min_lr"] = [0.0] * len(trainable_param_groups)
+        ds_config["scheduler"]["params"]["warmup_max_lr"] = max_lrs
+        print(f"[TrainableParams] scheduler warmup_max_lr per group: {max_lrs}", flush=True)
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=trainable_param_groups,
@@ -1389,8 +1342,6 @@ def train(
     vis_count = 0
     sample_idx = 0  # 当前样本索引（在当前GPU中的局部索引）
     
-    last_geo_grad_stats = {}
-
     # 训练主循环
     for global_step in range(args.steps_per_epoch):
         # 梯度累积循环
@@ -1580,17 +1531,6 @@ def train(
             
             # print("backward for rank: ", args.local_rank)
             model.backward(loss)
-            geo_grad_stats = collect_geometry_prior_stats(model, include_grad=True, include_optimizer=False)
-            last_geo_grad_stats = {
-                k: v for k, v in geo_grad_stats.items()
-                if k in (
-                    "geometry/weight_grad_norm",
-                    "geometry/w_pos_grad",
-                    "geometry/w_depth_grad",
-                    "geometry/weight_grad_is_none",
-                    "geometry/weight_hook_grad_is_none",
-                )
-            }
             model.step()
             # print("backward done for rank: ", args.local_rank)
             
@@ -2065,7 +2005,6 @@ def train(
                     "metrics/data_secs_per_batch", data_time.avg, global_step_total
                 )
                 geo_stats = collect_geometry_prior_stats(model)
-                geo_stats.update(last_geo_grad_stats)
                 for lr_name, lr_value in lr_info["log_dict"].items():
                     writer.add_scalar(lr_name, lr_value, global_step_total)
                 for geo_name, geo_value in geo_stats.items():
@@ -2081,11 +2020,7 @@ def train(
                         "metrics/total_secs_per_batch": batch_time.avg,
                         "metrics/data_secs_per_batch": data_time.avg,
                     }
-                    swanlab_lr_logs = {
-                        k: v for k, v in lr_info["log_dict"].items()
-                        if not (k.startswith("train/lr_scheduler/") or k.startswith("train/lr_optimizer/"))
-                    }
-                    log_dict.update(swanlab_lr_logs)
+                    log_dict.update(lr_info["log_dict"])
                     log_dict.update(geo_stats)
                     # ✅ 在第一个step时，将维度追踪信息记录到SwanLab
                     if epoch == 0 and global_step == 0:
