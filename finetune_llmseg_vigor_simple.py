@@ -870,14 +870,18 @@ def collect_geometry_prior_stats(model_engine=None, include_grad: bool = False, 
                 stats["geometry/optimizer_has_weight"] = float(bool(cached))
         if include_grad:
             grad = geo.weight.grad
-            if grad is None:
+            hook_grad = getattr(geo, "last_weight_grad", None)
+            source_grad = hook_grad if hook_grad is not None else grad
+            stats["geometry/weight_grad_is_none"] = float(grad is None)
+            stats["geometry/weight_hook_grad_is_none"] = float(hook_grad is None)
+            if source_grad is None:
                 stats.update({
                     "geometry/weight_grad_norm": 0.0,
                     "geometry/w_pos_grad": 0.0,
                     "geometry/w_depth_grad": 0.0,
                 })
             else:
-                grad_flat = grad.detach().float().view(-1)
+                grad_flat = source_grad.detach().float().view(-1)
                 stats.update({
                     "geometry/weight_grad_norm": float(grad_flat.norm().item()),
                     "geometry/w_pos_grad": float(grad_flat[0].item()),
@@ -1536,7 +1540,13 @@ def train(
             geo_grad_stats = collect_geometry_prior_stats(model, include_grad=True, include_optimizer=False)
             last_geo_grad_stats = {
                 k: v for k, v in geo_grad_stats.items()
-                if k in ("geometry/weight_grad_norm", "geometry/w_pos_grad", "geometry/w_depth_grad")
+                if k in (
+                    "geometry/weight_grad_norm",
+                    "geometry/w_pos_grad",
+                    "geometry/w_depth_grad",
+                    "geometry/weight_grad_is_none",
+                    "geometry/weight_hook_grad_is_none",
+                )
             }
             model.step()
             # print("backward done for rank: ", args.local_rank)

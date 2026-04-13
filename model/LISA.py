@@ -37,6 +37,12 @@ class ProposalGeometryPrior(nn.Module):
         self.last_num_proposals = 0
         self.last_num_valid = 0
         self.last_bias_abs_mean = 0.0
+        self.last_weight_grad = None
+        self.weight.register_hook(self._capture_weight_grad)
+
+    def _capture_weight_grad(self, grad):
+        self.last_weight_grad = grad.detach()
+        return grad
 
     def _mark_inactive(self):
         self.last_active = False
