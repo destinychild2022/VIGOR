@@ -69,6 +69,8 @@ class VIGORDataset(torch.utils.data.Dataset):
         self.is_train = is_train
         self.debug_meta = bool(debug_meta)
         self.sam_mask_helper = sam_mask_helper
+        self.depth_min = float(os.environ.get("VIGOR_DEPTH_MIN", "0.6"))
+        self.depth_max = float(os.environ.get("VIGOR_DEPTH_MAX", "1.85"))
         
         # 加载所有样本（支持外部传入切分后的samples）
         if samples is not None:
@@ -131,6 +133,7 @@ class VIGORDataset(torch.utils.data.Dataset):
             
             # GT mask路径：{data_base_dir}/{split}/{gt_mask_path_rel}
             gt_mask_path = os.path.join(self.data_base_dir, self.split, gt_mask_path_rel)
+            depth_path = os.path.join(self.data_base_dir, self.split, "depth", f"{img_num}.npy")
             
             # 从instructions中随机选择一条指令（如果没有则使用默认格式）
             if instructions and len(instructions) > 0:
@@ -144,6 +147,7 @@ class VIGORDataset(torch.utils.data.Dataset):
             samples.append({
                 'image_path': image_path,
                 'gt_mask_path': gt_mask_path,
+                'depth_path': depth_path,
                 'question': question,
                 'instruction': instruction,  # 保存原始指令（不含<image>）
                 'object': object_name,
@@ -169,6 +173,7 @@ class VIGORDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         image_path = sample['image_path']
         gt_mask_path = sample['gt_mask_path']
+        depth_path = sample.get('depth_path', os.path.join(self.data_base_dir, self.split, "depth", os.path.splitext(sample['img_name'])[0] + ".npy"))
         img_name = sample['img_name']
         
         # 读取原图
@@ -177,6 +182,28 @@ class VIGORDataset(torch.utils.data.Dataset):
             raise ValueError(f"Failed to load image: {image_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
+
+        if os.path.exists(depth_path):
+            depth_raw = np.load(depth_path).astype(np.float32)
+            if depth_raw.shape[:2] != ori_size:
+                depth_raw = cv2.resize(depth_raw, (ori_size[1], ori_size[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            print(f"Warning: depth not found: {depth_path}, using zeros")
+            depth_raw = np.zeros(ori_size, dtype=np.float32)
+        depth_raw = np.nan_to_num(depth_raw, nan=self.depth_max, posinf=self.depth_max, neginf=self.depth_min)
+        denom = max(self.depth_max - self.depth_min, 1e-6)
+        depth_norm = np.clip((depth_raw - self.depth_min) / denom, 0.0, 1.0).astype(np.float32)
+        depth_target_hw = self.transform.get_preprocess_shape(ori_size[0], ori_size[1], self.image_size)
+        depth_resized = cv2.resize(depth_norm, (depth_target_hw[1], depth_target_hw[0]), interpolation=cv2.INTER_LINEAR)
+        padh_depth = self.image_size - depth_resized.shape[0]
+        padw_depth = self.image_size - depth_resized.shape[1]
+        depth_square = np.pad(depth_resized, ((0, padh_depth), (0, padw_depth)), mode="constant", constant_values=0)
+        depth_256 = F.interpolate(
+            torch.from_numpy(depth_square).unsqueeze(0).unsqueeze(0),
+            size=(256, 256),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0).contiguous()
         
         # 预处理图像用于CLIP
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
@@ -336,6 +363,10 @@ class VIGORDataset(torch.utils.data.Dataset):
                     "image_after_resize_longest_hw": tuple(resize),
                     "image_after_preprocess_chw": tuple(image.shape),
                     "gt_mask_path": gt_mask_path,
+                    "depth_path": depth_path,
+                    "depth_raw_shape_hw": tuple(depth_raw.shape) if hasattr(depth_raw, "shape") else None,
+                    "depth_256_shape_hw": tuple(depth_256.shape),
+                    "depth_norm_minmax": (float(depth_256.min().item()), float(depth_256.max().item())),
                     "gt_mask_shape_hw": tuple(gt_mask.shape) if hasattr(gt_mask, "shape") else None,
                     "segs_origin_shape_hwk": tuple(segs_origin.shape) if isinstance(segs_origin, np.ndarray) else None,
                     "segs_interp_256_shape_khw": tuple(segs.shape),
@@ -355,6 +386,7 @@ class VIGORDataset(torch.utils.data.Dataset):
             'questions': questions,
             'sampled_classes': sampled_sents,
             'segs': segs,
+            'depth': depth_256,
             'ious': ious,
             'iops': iops,
             'segs_origin': segs_origin,

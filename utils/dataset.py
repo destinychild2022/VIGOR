@@ -45,6 +45,7 @@ def collate_fn_new(
     offset_list = [0]
     cnt = 0
     sam_segs_list = []
+    depth_list = []
     ious_list = []
     iops_list = []
     inferences = []
@@ -68,6 +69,7 @@ def collate_fn_new(
         cnt += len(data.get('conversations', []))
         offset_list.append(cnt)
         sam_segs_list.append(data.get('segs'))
+        depth_list.append(data.get('depth', None))
         ious_list.append(data.get('ious'))
         iops_list.append(data.get('iops'))
         inferences.append(data.get('inference'))
@@ -185,6 +187,7 @@ def collate_fn_new(
         "inference": inferences[0],
         "conversation_list": conversation_list,
         "sam_segs_list": sam_segs_list,
+        "depths": depth_list,
         "sam_ious_list": ious_list,
         "sam_iops_list": iops_list,
         "origin_segs_list": origin_segs_list,

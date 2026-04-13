@@ -17,6 +17,91 @@ from .segment_anything import build_sam_vit_h
 from .loss import sigmoid_align_loss, softmax_align_loss, iou_regression_loss
 from .transformer import Attention, MLPBlock, LISA_TwoWayAttentionBlock
 
+class ProposalGeometryPrior(nn.Module):
+    def __init__(
+        self,
+        num_heads: int,
+        initial_value: float = 2.0,
+        heads_range: float = 4.0,
+        weight_init: float = 0.1,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        decay = torch.log(
+            1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads)
+        )
+        self.register_buffer("decay", decay)
+        self.weight = nn.Parameter(torch.full((2, 1, 1, 1), weight_init), requires_grad=True)
+        self.eps = eps
+
+    def proposal_valid_mask(self, masks_fg: torch.Tensor):
+        if masks_fg is None or masks_fg.dim() != 3:
+            return None
+        return masks_fg.float().flatten(1).sum(dim=1) > self.eps
+
+    def _masked_depth_median(self, masks: torch.Tensor, depth: torch.Tensor, area: torch.Tensor):
+        depth_flat = depth.flatten()
+        mask_flat = masks.flatten(1) > 0.5
+        soft_mean = (masks * depth.unsqueeze(0)).flatten(1).sum(dim=1) / area
+        medians = []
+        for idx in range(mask_flat.shape[0]):
+            selected = depth_flat[mask_flat[idx]]
+            if selected.numel() == 0:
+                selected = depth_flat[masks.flatten(1)[idx] > 0]
+            if selected.numel() == 0:
+                medians.append(soft_mean[idx])
+            else:
+                medians.append(selected.median())
+        return torch.stack(medians, dim=0)
+
+    def forward(self, masks_fg: torch.Tensor, depth_map: torch.Tensor):
+        if masks_fg is None or depth_map is None:
+            return None
+        if masks_fg.dim() != 3:
+            return None
+
+        masks = masks_fg.float().clamp(0.0, 1.0)
+        k, h, w = masks.shape
+        if k == 0:
+            return None
+
+        depth = depth_map.float()
+        if depth.dim() == 3:
+            depth = depth[0]
+        elif depth.dim() == 4:
+            depth = depth[0, 0]
+        if depth.shape[-2:] != (h, w):
+            depth = F.interpolate(depth[None, None], size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+        area_raw = masks.flatten(1).sum(dim=1)
+        valid = area_raw > self.eps
+        area = area_raw.clamp_min(self.eps)
+
+        yy, xx = torch.meshgrid(
+            torch.linspace(0.0, 1.0, h, device=masks.device, dtype=masks.dtype),
+            torch.linspace(0.0, 1.0, w, device=masks.device, dtype=masks.dtype),
+            indexing="ij",
+        )
+        cx = (masks * xx).flatten(1).sum(dim=1) / area
+        cy = (masks * yy).flatten(1).sum(dim=1) / area
+        centers = torch.stack([cx, cy], dim=-1)
+        pos_dist = (centers[:, None, :] - centers[None, :, :]).abs().sum(dim=-1)
+
+        proposal_depth = self._masked_depth_median(masks, depth, area)
+        depth_dist = (proposal_depth[:, None] - proposal_depth[None, :]).abs()
+
+        decay = self.decay.to(device=masks.device, dtype=masks.dtype)[None, :, None, None]
+        geo_bias = decay * (
+            self.weight[0].to(dtype=masks.dtype) * pos_dist[None, None]
+            + self.weight[1].to(dtype=masks.dtype) * depth_dist[None, None]
+        )
+
+        if not bool(valid.all()):
+            invalid_key = (~valid)[None, None, None, :]
+            geo_bias = geo_bias.masked_fill(invalid_key, -1e4)
+        return geo_bias
+
 class LisaMetaModel:
     def __init__(
         self,
@@ -51,8 +136,18 @@ class LisaMetaModel:
                 param.requires_grad = True
 
         # DINO-V2
-        # 优先从本地路径加载权重文件
-        dinov2_local_path = "/opt/data/private/model/dinov2_vitl14"
+        # 优先从数据盘/本地路径加载权重文件，torch.hub 代码缓存也放到 TORCH_HOME。
+        dinov2_local_path = os.environ.get(
+            "DINOV2_LOCAL_PATH",
+            os.path.join(
+                os.environ.get("MODEL_BASE_DIR", os.path.join(os.environ.get("AUTODL_TMP_DIR", "/root/autodl-tmp"), "model")),
+                "dinov2_vitl14",
+            ),
+        )
+        torch_home = os.environ.get("TORCH_HOME", os.path.join(os.environ.get("AUTODL_TMP_DIR", "/root/autodl-tmp"), "torch_cache"))
+        os.environ.setdefault("TORCH_HOME", torch_home)
+        torch.hub.set_dir(os.path.join(torch_home, "hub"))
+        os.makedirs(torch.hub.get_dir(), exist_ok=True)
         dinov2_weight_path = None
         
         # 检查本地路径是否有权重文件
@@ -72,7 +167,15 @@ class LisaMetaModel:
         use_pretrained = dinov2_weight_path is None
         
         dinov2_vitl14 = None
-        cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+        cache_dir = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+        print(f"DINOv2 local path: {dinov2_local_path}")
+        print(f"DINOv2 torch.hub cache: {cache_dir}")
+
+        def load_dinov2_from_hub(pretrained):
+            local_hubconf = os.path.join(cache_dir, "hubconf.py")
+            if os.path.exists(local_hubconf):
+                return torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=pretrained, source='local')
+            return torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=pretrained)
         
         # 如果是多 GPU 训练，使用文件锁机制
         import torch.distributed as dist
@@ -82,11 +185,11 @@ class LisaMetaModel:
                 try:
                     # 先清理可能损坏的缓存
                     import shutil
-                    broken_cache = os.path.expanduser("~/.cache/torch/hub/facebookresearch-dinov2-b194f00")
+                    broken_cache = os.path.join(torch.hub.get_dir(), "facebookresearch-dinov2-b194f00")
                     if os.path.exists(broken_cache):
                         shutil.rmtree(broken_cache, ignore_errors=True)
                     
-                    dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
+                    dinov2_vitl14 = load_dinov2_from_hub(use_pretrained)
                     print(f"[Rank 0] Loaded DINOv2 model structure from torch.hub")
                 except Exception as e:
                     print(f"[Rank 0] Warning: Failed to load DINOv2 from torch.hub ({e})")
@@ -114,21 +217,7 @@ class LisaMetaModel:
         else:
             # 单 GPU 训练，直接加载
             try:
-                # 先清理可能损坏的缓存（与多 GPU 逻辑一致）
-                import shutil
-                for broken_cache_pattern in [
-                    "~/.cache/torch/hub/facebookresearch-dinov2*",
-                    "~/.cache/torch/hub/facebookresearch_dinov2_main",
-                ]:
-                    import glob
-                    for broken_cache in glob.glob(os.path.expanduser(broken_cache_pattern)):
-                        try:
-                            shutil.rmtree(broken_cache, ignore_errors=True)
-                            print(f"Cleaned up broken cache: {broken_cache}")
-                        except Exception:
-                            pass
-                
-                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
+                dinov2_vitl14 = load_dinov2_from_hub(use_pretrained)
                 if use_pretrained:
                     print("Loaded DINOv2 from torch.hub (with pretrained weights)")
                 else:
@@ -154,7 +243,7 @@ class LisaMetaModel:
                 print(f"Successfully loaded DINOv2 weights from local path")
             except Exception as e:
                 print(f"Warning: Failed to load weights from local path ({e}), using pretrained weights")
-                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+                dinov2_vitl14 = load_dinov2_from_hub(True)
         
         self.visual_model_dinov2 = dinov2_vitl14
         for param in self.visual_model_dinov2.parameters():
@@ -200,6 +289,7 @@ class LisaMetaModel:
 
         # 1x1 conv to reduce the dimension of the image feature to 256
         self.lisa_dino_conv = nn.Conv2d(1024, 256, kernel_size=1, stride=1, padding=0)
+        self.lisa_geo_prior = ProposalGeometryPrior(num_heads=8)
 
         self.lisa_attention_layers = nn.ModuleList()
         depth = 2
@@ -416,6 +506,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         sam_segs_list: List[torch.FloatTensor],
         sam_ious_list: List[torch.FloatTensor],
         sam_iops_list: List[torch.FloatTensor],
+        depths: List[torch.FloatTensor] = None,
         inference: bool = False,
         **kwargs,
     ):
@@ -759,6 +850,31 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                                     print(f"[debug] ✅ 信息-mask_pooling后特征区分度较好 | mean={stats_pool['mean']:.3f}<0.5", flush=True)
                 except Exception:
                     pass
+            if not hasattr(self, "_segs_fg_semantic_check_printed"):
+                try:
+                    area_ratio = segs_fg.float().flatten(1).mean(dim=1)
+                    print(
+                        "[MaskSemanticCheck] assuming SAM candidates use 0=foreground, 1=background; "
+                        f"after inversion segs_fg foreground-area ratio: "
+                        f"min={float(area_ratio.min().item()):.6f} "
+                        f"mean={float(area_ratio.mean().item()):.6f} "
+                        f"max={float(area_ratio.max().item()):.6f}",
+                        flush=True,
+                    )
+                    if float(area_ratio.mean().item()) > 0.8:
+                        print("[MaskSemanticCheck] WARNING: segs_fg mean area is very large; re-check mask polarity.", flush=True)
+                    if float(area_ratio.max().item()) <= 1e-6:
+                        print("[MaskSemanticCheck] WARNING: all candidate foreground masks are empty after inversion.", flush=True)
+                except Exception:
+                    pass
+                self._segs_fg_semantic_check_printed = True
+
+            depth_map = None
+            if depths is not None and batch_idx < len(depths):
+                depth_map = depths[batch_idx]
+            proposal_valid = self.model.lisa_geo_prior.proposal_valid_mask(segs_fg)
+            geo_attn_bias = self.model.lisa_geo_prior(segs_fg, depth_map)
+
             # use attention to update the mask feature, keep text embedding unchanged
             text_feature = pred_embeddings[batch_idx] # (C, D)
             # # add one dimension to text_feature （C, 1, D）
@@ -767,9 +883,15 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             number_conversations = text_feature.shape[0]
 
             segs_feature = segs_feature.unsqueeze(0) # (1, K, D)
+            proposal_valid_expanded = None
             if number_conversations > 0:
                 # expand segs_feature to (C, K, D)
                 segs_feature = segs_feature.expand(number_conversations, -1, -1)
+                if proposal_valid is not None:
+                    proposal_valid_expanded = proposal_valid.unsqueeze(0).expand(number_conversations, -1)
+                    segs_feature = segs_feature * proposal_valid_expanded.unsqueeze(-1).to(segs_feature.dtype)
+                if geo_attn_bias is not None:
+                    geo_attn_bias = geo_attn_bias.expand(number_conversations, -1, -1, -1)
 
             # import pdb; pdb.set_trace()    
 
@@ -777,11 +899,15 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 segs_feature, text_feature = layer(
                     queries=segs_feature,
                     keys=text_feature,
+                    self_attn_bias=geo_attn_bias,
+                    query_valid_mask=proposal_valid_expanded,
                 )
 
             attn_out = self.model.lisa_final_attn(q=segs_feature, k=text_feature, v=text_feature)
             segs_feature = segs_feature + attn_out
             segs_feature = self.model.lisa_norm_final_attn(segs_feature)
+            if proposal_valid_expanded is not None:
+                segs_feature = segs_feature * proposal_valid_expanded.unsqueeze(-1).to(segs_feature.dtype)
 
             if debug_train_shapes and (not inference):
                 try:
@@ -815,9 +941,13 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
             # use MLP to reduce the seg_features to 1 dimension
             sam_iou = self.model.lisa_iou_head(segs_feature) # (C, K, 1)
+            if proposal_valid_expanded is not None:
+                sam_iou = sam_iou.masked_fill(~proposal_valid_expanded.unsqueeze(-1), 0.0)
             sam_pred_ious_list.append(sam_iou) # (C, K, 1)
 
             segs_feature = self.model.lisa_embedding_head(segs_feature) # (C, K, D)
+            if proposal_valid_expanded is not None:
+                segs_feature = segs_feature * proposal_valid_expanded.unsqueeze(-1).to(segs_feature.dtype)
             sam_segs_feature_list.append(segs_feature)
 
             if debug_train_shapes and (not inference):

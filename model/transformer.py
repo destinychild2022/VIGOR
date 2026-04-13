@@ -253,30 +253,51 @@ class LISA_TwoWayAttentionBlock(nn.Module):
         )
 
     def forward(
-        self, queries: Tensor, keys: Tensor
+        self, queries: Tensor, keys: Tensor, self_attn_bias: Tensor = None, query_valid_mask: Tensor = None
     ) -> Tuple[Tensor, Tensor]:
+        valid_scale = None
+        if query_valid_mask is not None:
+            valid_scale = query_valid_mask.to(dtype=queries.dtype, device=queries.device).unsqueeze(-1)
+            queries = queries * valid_scale
+
         # Self attention block
         q = queries
-        attn_out = self.self_attn(q=q, k=q, v=queries)
+        attn_out = self.self_attn(q=q, k=q, v=queries, attn_bias=self_attn_bias)
         queries = queries + attn_out
+        if valid_scale is not None:
+            queries = queries * valid_scale
         queries = self.norm1(queries)
+        if valid_scale is not None:
+            queries = queries * valid_scale
 
         # Cross attention block, tokens attending to image embedding
         q = queries
         k = keys
         attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
+        if valid_scale is not None:
+            queries = queries * valid_scale
         queries = self.norm2(queries)
+        if valid_scale is not None:
+            queries = queries * valid_scale
 
         # MLP block
         mlp_out = self.mlp(queries)
         queries = queries + mlp_out
+        if valid_scale is not None:
+            queries = queries * valid_scale
         queries = self.norm3(queries)
+        if valid_scale is not None:
+            queries = queries * valid_scale
 
         # Cross attention block, image embedding attending to tokens
         q = queries
         k = keys
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
+        image_to_token_bias = None
+        if query_valid_mask is not None:
+            invalid_keys = ~query_valid_mask.to(device=queries.device, dtype=torch.bool)
+            image_to_token_bias = invalid_keys[:, None, None, :].to(dtype=queries.dtype) * -1e4
+        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries, attn_bias=image_to_token_bias)
         keys = keys + attn_out
         keys = self.norm4(keys)
 
@@ -316,7 +337,7 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_bias: Tensor = None) -> Tensor:
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -331,6 +352,8 @@ class Attention(nn.Module):
         _, _, _, c_per_head = q.shape
         attn = q @ k.permute(0, 1, 3, 2)  # B x N_heads x N_tokens x N_tokens
         attn = attn / math.sqrt(c_per_head)
+        if attn_bias is not None:
+            attn = attn + attn_bias.to(dtype=attn.dtype, device=attn.device)
         attn = torch.softmax(attn, dim=-1)
 
         # Get output

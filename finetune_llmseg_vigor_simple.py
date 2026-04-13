@@ -62,7 +62,7 @@ def release_model_weight_cache(args):
         args.version,  # LISA/LLaMA 模型目录
         args.vision_tower,  # CLIP 模型目录
         os.path.join(DEFAULT_MODEL_DIR, "dinov2_vitl14"),  # DINOv2 权重（如果存在）
-        os.path.expanduser("~/.cache/torch/hub"),  # torch hub 缓存
+        torch.hub.get_dir(),  # torch hub 缓存
     ]
     
     def release_path_cache(path):
@@ -197,6 +197,8 @@ def parse_args(args):
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
+    parser.add_argument("--profile_perf", action="store_true", default=False)
+    parser.add_argument("--disable_swanlab", action="store_true", default=False)
     parser.add_argument("--start_epoch", default=0, type=int)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--train_mask_decoder", action="store_true", default=False)
@@ -463,7 +465,8 @@ def init_LISA_model(args, tokenizer):
                 x in n
                 for x in ["lm_head", "embed_tokens", "text_hidden_fcs",
                           "lisa_attention_layers", "lisa_final_attn", "lisa_norm_final_attn",
-                          "lisa_iou_head", "lisa_embedding_head", "lisa_dino_conv"]
+                          "lisa_iou_head", "lisa_embedding_head", "lisa_dino_conv",
+                          "lisa_geo_prior"]
             ]
         ):
             # print("n: ", n, "p.shape: ", p.shape)  # 注释掉：打印每个参数的名称和形状
@@ -815,6 +818,37 @@ def collect_learning_rates(model_engine=None, scheduler=None):
     }
 
 
+
+def collect_geometry_prior_stats(model_engine=None):
+    root = getattr(model_engine, "module", model_engine)
+    if root is None:
+        return {}
+    geo = None
+    try:
+        for module in root.modules():
+            candidate = getattr(module, "lisa_geo_prior", None)
+            if candidate is not None:
+                geo = candidate
+                break
+    except Exception:
+        geo = None
+    if geo is None or not hasattr(geo, "weight") or not hasattr(geo, "decay"):
+        return {}
+    try:
+        with torch.no_grad():
+            weight = geo.weight.detach().float().view(-1)
+            decay_abs_mean = geo.decay.detach().float().abs().mean()
+            stats = {
+                "geometry/w_pos": float(weight[0].item()),
+                "geometry/w_depth": float(weight[1].item()),
+                "geometry/pos_bias_strength": float((weight[0].abs() * decay_abs_mean).item()),
+                "geometry/depth_bias_strength": float((weight[1].abs() * decay_abs_mean).item()),
+            }
+            return stats
+    except Exception:
+        return {}
+
+
 def build_checkpoint_client_state(
     args,
     epoch,
@@ -924,7 +958,7 @@ def main(args):
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
         # 初始化 SwanLab
-        if SWANLAB_AVAILABLE and swanlab is not None:
+        if (not args.disable_swanlab) and SWANLAB_AVAILABLE and swanlab is not None:
             try:
                 # 设置环境变量（参考 finetune_sam_lora_point.py）
                 os.environ['SWANLAB_API_KEY'] = "17UKzqoPx2VI4PLzCHYdH"
@@ -945,6 +979,8 @@ def main(args):
             except Exception as e:
                 print(f"Warning: swanlab init failed: {e}, continuing without SwanLab")
                 # 不使用 swanlab = None，避免局部变量问题
+        elif args.disable_swanlab:
+            print("Warning: swanlab disabled by --disable_swanlab")
         elif not SWANLAB_AVAILABLE:
             print("Warning: swanlab not installed, skipping SwanLab logging")
     else:
@@ -1076,7 +1112,7 @@ def main(args):
     train_iter = iter(train_loader)
 
     # 获取 swanlab logger（仅在 local_rank == 0 时不为 None）
-    swanlab_logger = swanlab if (args.local_rank == 0 and SWANLAB_AVAILABLE and swanlab is not None) else None
+    swanlab_logger = swanlab if (args.local_rank == 0 and (not args.disable_swanlab) and SWANLAB_AVAILABLE and swanlab is not None) else None
 
     if args.eval_only:
         # giou, ciou = validate_threshold_from_topIoU(val_loader, model_engine, 0, writer, args, threshold=0.5, swanlab_logger=swanlab_logger)
@@ -1092,7 +1128,7 @@ def main(args):
     best_score, cur_ciou = restored_best_score, restored_cur_ciou
 
     # 获取 swanlab logger（仅在 local_rank == 0 时不为 None）
-    swanlab_logger = swanlab if (args.local_rank == 0 and SWANLAB_AVAILABLE and swanlab is not None) else None
+    swanlab_logger = swanlab if (args.local_rank == 0 and (not args.disable_swanlab) and SWANLAB_AVAILABLE and swanlab is not None) else None
 
     try:
         for epoch in range(args.start_epoch, args.epochs):
@@ -1859,6 +1895,10 @@ def train(
             # 更新 sample_idx（保留，可能用于其他调试/统计）
             sample_idx += batch_size
 
+        if getattr(args, "profile_perf", False) and torch.cuda.is_available():
+            profile_device = torch.device(f"cuda:{args.local_rank}")
+            torch.cuda.synchronize(profile_device)
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -1877,6 +1917,40 @@ def train(
                 global_step_total = global_step_start + global_step
                 lr_info = collect_learning_rates(model, scheduler)
                 progress.display(global_step + 1)
+                if getattr(args, "profile_perf", False):
+                    try:
+                        world_size = (
+                            torch.distributed.get_world_size()
+                            if args.distributed and torch.distributed.is_initialized()
+                            else 1
+                        )
+                    except Exception:
+                        world_size = 1
+                    effective_batch = args.batch_size * args.grad_accumulation_steps * world_size
+                    total_secs_per_batch = batch_time.avg
+                    data_secs_per_batch = data_time.sum / max(float(batch_time.count), 1.0)
+                    samples_per_sec = effective_batch / max(total_secs_per_batch, 1e-12)
+                    print(
+                        f"[Perf] effective_batch={effective_batch} "
+                        f"total_secs_per_batch={total_secs_per_batch:.6f} "
+                        f"samples_per_sec={samples_per_sec:.6f} "
+                        f"data_secs_per_batch={data_secs_per_batch:.6f}",
+                        flush=True,
+                    )
+                    if torch.cuda.is_available():
+                        profile_device = torch.device(f"cuda:{args.local_rank}")
+                        gb = 1024 ** 3
+                        allocated_gb = torch.cuda.memory_allocated(profile_device) / gb
+                        reserved_gb = torch.cuda.memory_reserved(profile_device) / gb
+                        max_allocated_gb = torch.cuda.max_memory_allocated(profile_device) / gb
+                        max_reserved_gb = torch.cuda.max_memory_reserved(profile_device) / gb
+                        print(
+                            f"[CudaMem] allocated_gb={allocated_gb:.3f} "
+                            f"reserved_gb={reserved_gb:.3f} "
+                            f"max_allocated_gb={max_allocated_gb:.3f} "
+                            f"max_reserved_gb={max_reserved_gb:.3f}",
+                            flush=True,
+                        )
                 writer.add_scalar("train/loss", losses.avg, global_step_total)
                 writer.add_scalar("train/ce_loss", ce_losses.avg, global_step_total)
                 writer.add_scalar(
@@ -1891,8 +1965,11 @@ def train(
                 writer.add_scalar(
                     "metrics/data_secs_per_batch", data_time.avg, global_step_total
                 )
+                geo_stats = collect_geometry_prior_stats(model_engine)
                 for lr_name, lr_value in lr_info["log_dict"].items():
                     writer.add_scalar(lr_name, lr_value, global_step_total)
+                for geo_name, geo_value in geo_stats.items():
+                    writer.add_scalar(geo_name, geo_value, global_step_total)
 
                 # 记录到 SwanLab（使用全局步数）
                 if swanlab_logger is not None:
@@ -1905,6 +1982,7 @@ def train(
                         "metrics/data_secs_per_batch": data_time.avg,
                     }
                     log_dict.update(lr_info["log_dict"])
+                    log_dict.update(geo_stats)
                     # ✅ 在第一个step时，将维度追踪信息记录到SwanLab
                     if epoch == 0 and global_step == 0:
                         # 检查是否有维度追踪信息
