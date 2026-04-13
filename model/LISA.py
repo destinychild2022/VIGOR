@@ -33,6 +33,16 @@ class ProposalGeometryPrior(nn.Module):
         self.register_buffer("decay", decay)
         self.weight = nn.Parameter(torch.full((2, 1, 1, 1), weight_init), requires_grad=True)
         self.eps = eps
+        self.last_active = False
+        self.last_num_proposals = 0
+        self.last_num_valid = 0
+        self.last_bias_abs_mean = 0.0
+
+    def _mark_inactive(self):
+        self.last_active = False
+        self.last_num_proposals = 0
+        self.last_num_valid = 0
+        self.last_bias_abs_mean = 0.0
 
     def proposal_valid_mask(self, masks_fg: torch.Tensor):
         if masks_fg is None or masks_fg.dim() != 3:
@@ -56,13 +66,16 @@ class ProposalGeometryPrior(nn.Module):
 
     def forward(self, masks_fg: torch.Tensor, depth_map: torch.Tensor):
         if masks_fg is None or depth_map is None:
+            self._mark_inactive()
             return None
         if masks_fg.dim() != 3:
+            self._mark_inactive()
             return None
 
         masks = masks_fg.float().clamp(0.0, 1.0)
         k, h, w = masks.shape
         if k == 0:
+            self._mark_inactive()
             return None
 
         depth = depth_map.float()
@@ -100,6 +113,14 @@ class ProposalGeometryPrior(nn.Module):
         if not bool(valid.all()):
             invalid_key = (~valid)[None, None, None, :]
             geo_bias = geo_bias.masked_fill(invalid_key, -1e4)
+
+        with torch.no_grad():
+            valid_pair = valid[None, None, :, None] & valid[None, None, None, :]
+            valid_bias = geo_bias.detach().masked_select(valid_pair)
+            self.last_active = True
+            self.last_num_proposals = int(k)
+            self.last_num_valid = int(valid.sum().item())
+            self.last_bias_abs_mean = float(valid_bias.abs().mean().item()) if valid_bias.numel() > 0 else 0.0
         return geo_bias
 
 class LisaMetaModel:

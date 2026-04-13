@@ -817,7 +817,7 @@ def collect_learning_rates(model_engine=None, scheduler=None):
 
 
 
-def collect_geometry_prior_stats(model_engine=None):
+def collect_geometry_prior_stats(model_engine=None, include_grad: bool = False, include_optimizer: bool = True):
     root = getattr(model_engine, "module", model_engine)
     if root is None:
         return {}
@@ -841,8 +841,49 @@ def collect_geometry_prior_stats(model_engine=None):
                 "geometry/w_depth": float(weight[1].item()),
                 "geometry/pos_bias_strength": float((weight[0].abs() * decay_abs_mean).item()),
                 "geometry/depth_bias_strength": float((weight[1].abs() * decay_abs_mean).item()),
+                "geometry/active": float(bool(getattr(geo, "last_active", False))),
+                "geometry/num_proposals": float(getattr(geo, "last_num_proposals", 0)),
+                "geometry/num_valid_proposals": float(getattr(geo, "last_num_valid", 0)),
+                "geometry/bias_abs_mean": float(getattr(geo, "last_bias_abs_mean", 0.0)),
+                "geometry/weight_requires_grad": float(bool(geo.weight.requires_grad)),
             }
-            return stats
+            if include_optimizer:
+                cached = getattr(geo, "_optimizer_has_weight_cache", None)
+                if cached is None:
+                    cached = False
+                    target = geo.weight
+                    optimizer = getattr(model_engine, "optimizer", None) if model_engine is not None else None
+                    for opt in (optimizer, getattr(optimizer, "optimizer", None)):
+                        param_groups = getattr(opt, "param_groups", None)
+                        if not param_groups:
+                            continue
+                        for group in param_groups:
+                            for param in group.get("params", []):
+                                if param is target:
+                                    cached = True
+                                    break
+                            if cached:
+                                break
+                        if cached:
+                            break
+                    setattr(geo, "_optimizer_has_weight_cache", cached)
+                stats["geometry/optimizer_has_weight"] = float(bool(cached))
+        if include_grad:
+            grad = geo.weight.grad
+            if grad is None:
+                stats.update({
+                    "geometry/weight_grad_norm": 0.0,
+                    "geometry/w_pos_grad": 0.0,
+                    "geometry/w_depth_grad": 0.0,
+                })
+            else:
+                grad_flat = grad.detach().float().view(-1)
+                stats.update({
+                    "geometry/weight_grad_norm": float(grad_flat.norm().item()),
+                    "geometry/w_pos_grad": float(grad_flat[0].item()),
+                    "geometry/w_depth_grad": float(grad_flat[1].item()),
+                })
+        return stats
     except Exception:
         return {}
 
@@ -1301,6 +1342,8 @@ def train(
     vis_count = 0
     sample_idx = 0  # 当前样本索引（在当前GPU中的局部索引）
     
+    last_geo_grad_stats = {}
+
     # 训练主循环
     for global_step in range(args.steps_per_epoch):
         # 梯度累积循环
@@ -1490,6 +1533,11 @@ def train(
             
             # print("backward for rank: ", args.local_rank)
             model.backward(loss)
+            geo_grad_stats = collect_geometry_prior_stats(model, include_grad=True, include_optimizer=False)
+            last_geo_grad_stats = {
+                k: v for k, v in geo_grad_stats.items()
+                if k in ("geometry/weight_grad_norm", "geometry/w_pos_grad", "geometry/w_depth_grad")
+            }
             model.step()
             # print("backward done for rank: ", args.local_rank)
             
@@ -1964,6 +2012,7 @@ def train(
                     "metrics/data_secs_per_batch", data_time.avg, global_step_total
                 )
                 geo_stats = collect_geometry_prior_stats(model)
+                geo_stats.update(last_geo_grad_stats)
                 for lr_name, lr_value in lr_info["log_dict"].items():
                     writer.add_scalar(lr_name, lr_value, global_step_total)
                 for geo_name, geo_value in geo_stats.items():
