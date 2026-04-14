@@ -108,13 +108,17 @@ def parse_args(args):
 
 
 def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
-    """加载测试样本"""
-    json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json")
+    """加载测试样本 (适配多目标解析)"""
+    # 优先尝试加载 _new_1.json 高质量过滤版本，如果不存在则加载原版
+    json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}_new_1.json")
+    if not os.path.exists(json_file):
+        json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json")
     
     if not os.path.exists(json_file):
         print(f"  [警告] 文件不存在: {json_file}")
         return []
     
+    print(f"  [信息] 加载数据文件: {json_file}")
     with open(json_file, "r") as f:
         data = json.load(f)
     
@@ -127,21 +131,28 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
     
     samples = []
     for sample in raw_samples:
-        # 从 gt_mask_path 提取图片编号
-        gt_mask_path_rel = sample.get('gt_mask_path', '')
-        if not gt_mask_path_rel:
+        # 支持解析逗号分隔的多路径
+        gt_mask_path_raw = sample.get('gt_mask_path', '')
+        if not gt_mask_path_raw:
             continue
         
-        mask_filename = os.path.basename(gt_mask_path_rel)
-        match = re.match(r'^(\d+)_', mask_filename)
+        # 兼容多目标逻辑
+        gt_mask_paths_rel = [p.strip() for p in gt_mask_path_raw.split(',') if p.strip()]
+        if not gt_mask_paths_rel:
+            continue
+        
+        # 获取图片编号（取第一个掩码文件名即可）
+        first_mask_filename = os.path.basename(gt_mask_paths_rel[0])
+        match = re.match(r'^(\d+)_', first_mask_filename)
         if not match:
             continue
         
         img_num = match.group(1)
         img_name = f"{img_num}.png"
-        
         image_path = os.path.join(data_dir, img_name)
-        gt_mask_path = os.path.join(data_dir, gt_mask_path_rel)
+        
+        # 转化为绝对路径列表
+        gt_mask_paths = [os.path.join(data_dir, p) for p in gt_mask_paths_rel]
         
         gt_object = sample.get('gt_object', sample.get('object', ''))
         instructions = sample.get('instructions', [])
@@ -151,7 +162,7 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
         
         samples.append({
             'image_path': image_path,
-            'gt_mask_path': gt_mask_path,
+            'gt_mask_paths': gt_mask_paths, # 返回列表
             'gt_object': gt_object,
             'instructions': instructions,
             'difficulty': difficulty,
@@ -163,12 +174,12 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
 
 def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     """计算两个二值 mask 的 IoU"""
-    if pred_mask is None:
+    if pred_mask is None or gt_mask is None:
         return 0.0
     
     # VIGOR mask 语义: 0 = 前景, 1 = 背景
-    pred_fg = (pred_mask == 0).astype(np.uint8)
-    gt_fg = (gt_mask == 0).astype(np.uint8)
+    pred_fg = (pred_mask == 0)
+    gt_fg = (gt_mask == 0)
     
     intersection = np.logical_and(pred_fg, gt_fg).sum()
     union = np.logical_or(pred_fg, gt_fg).sum()
@@ -177,6 +188,23 @@ def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
         return 0.0
     
     return float(intersection) / float(union)
+
+
+def compute_iou_max(pred_mask: np.ndarray, gt_masks: List[np.ndarray]) -> Tuple[float, np.ndarray]:
+    """多目标择优：计算预测掩码与多个 GT 掩码中的最大 IoU"""
+    if not gt_masks:
+        return 0.0, None
+    
+    max_iou = -1.0
+    best_gt = gt_masks[0]
+    
+    for gt in gt_masks:
+        iou = compute_iou(pred_mask, gt)
+        if iou > max_iou:
+            max_iou = iou
+            best_gt = gt
+            
+    return max_iou, best_gt
 
 
 def compute_icr_score(iou_pairs: List[float], threshold: float) -> int:
@@ -685,9 +713,9 @@ def evaluate_sample(
     model, tokenizer, clip_image_processor, transform,
     sample: Dict, sam_mask_helper, args, obj_count: int = 1
 ) -> Dict:
-    """评估单个样本"""
+    """评估单个样本 (支持多目标 Max-IoU)"""
     image_path = sample['image_path']
-    gt_mask_path = sample['gt_mask_path']
+    gt_mask_paths = sample['gt_mask_paths'] # 这是一个列表
     instructions = sample['instructions']
     img_name = sample['img_name']
     
@@ -700,12 +728,15 @@ def evaluate_sample(
         return None
     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
     
-    # 读取 GT mask
-    gt_mask = cv2.imread(gt_mask_path, cv2.IMREAD_GRAYSCALE)
-    if gt_mask is None:
-        return None
+    # 读取所有 GT masks
+    gt_masks = []
+    for gp in gt_mask_paths:
+        m = cv2.imread(gp, cv2.IMREAD_GRAYSCALE)
+        if m is not None:
+            gt_masks.append(m)
     
-    # GT mask 已经是 0=前景, 非0=背景 的格式
+    if not gt_masks:
+        return None
     
     original_size = image_np.shape[:2]
     original_h, original_w = original_size
@@ -721,16 +752,18 @@ def evaluate_sample(
         )
         
         # 调整大小
-        if pred_mask.shape != gt_mask.shape:
+        if pred_mask.shape != (original_h, original_w):
             pred_mask = cv2.resize(pred_mask.astype(np.float32), 
                                    (original_w, original_h),
                                    interpolation=cv2.INTER_NEAREST)
         
         pred_masks.append(pred_mask)
-        iou = compute_iou(pred_mask, gt_mask)
+        
+        # 多目标择优逻辑 (Max-IoU)
+        iou, best_gt = compute_iou_max(pred_mask, gt_masks)
         ic_ious.append(iou)
         
-        # 保存可视化结果
+        # 保存可视化结果 (展示最匹配的那个 GT)
         if args.save_vis:
             sample_info = {
                 'gt_object': sample['gt_object'],
@@ -741,7 +774,7 @@ def evaluate_sample(
             save_visualization(
                 image_np=image_np,
                 pred_mask=pred_mask,
-                gt_mask=gt_mask,
+                gt_mask=best_gt,
                 vis_dir=args.vis_dir,
                 sample_info=sample_info,
                 instruction_idx=instr_idx,
@@ -763,7 +796,7 @@ def evaluate_sample(
     
     return {
         'image_path': image_path,
-        'gt_mask_path': gt_mask_path,
+        'gt_mask_path': gt_mask_paths[0], # 返回第一个作为代表
         'gt_object': sample['gt_object'],
         'difficulty': sample['difficulty'],
         'ic_ious': ic_ious,

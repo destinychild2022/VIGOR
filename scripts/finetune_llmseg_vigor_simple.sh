@@ -110,7 +110,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=16 \
+  --workers=12 \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \

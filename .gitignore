@@ -13,6 +13,7 @@ build/
 venv/
 ENV/
 env/
+core
 
 # IDE
 .vscode/
