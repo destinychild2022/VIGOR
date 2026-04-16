@@ -71,7 +71,7 @@ class SAM_Mask_Reader_PNG:
         预处理mask：padding到正方形
         masks: (H, W, K)
         """
-        masks = masks.astype(np.float64)
+        masks = masks.astype(np.float32, copy=False)
         h, w, _ = masks.shape
         padh = max(h, w) - h
         padw = max(h, w) - w

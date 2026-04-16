@@ -177,6 +177,7 @@ def parse_args(args):
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=8, type=int)
+    parser.add_argument("--val_workers", default=None, type=int, help="num_workers for validation DataLoader; defaults to min(workers, 2)")
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--geometry_lr_mult", default=10.0, type=float, help="LR multiplier for proposal geometry prior weights")
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
@@ -1090,11 +1091,14 @@ def main(args):
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             val_dataset, shuffle=False, drop_last=False
         )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
+        val_num_workers = args.val_workers if args.val_workers is not None else min(args.workers, 2)
+        if args.local_rank == 0:
+            print(f"[DataLoader] train_workers={args.workers} val_workers={val_num_workers}", flush=True)
+        val_loader_kwargs = dict(
+            dataset=val_dataset,
             batch_size=args.val_batch_size,
             shuffle=False,
-            num_workers=args.workers,
+            num_workers=val_num_workers,
             pin_memory=False,
             sampler=val_sampler,
             collate_fn=partial(
@@ -1105,6 +1109,10 @@ def main(args):
                 local_rank=args.local_rank,
             ),
         )
+        if val_num_workers > 0:
+            val_loader_kwargs["prefetch_factor"] = 1
+            val_loader_kwargs["persistent_workers"] = False
+        val_loader = torch.utils.data.DataLoader(**val_loader_kwargs)
 
     # resume deepspeed checkpoint
     restored_best_score, restored_cur_ciou = 0.0, 0.0

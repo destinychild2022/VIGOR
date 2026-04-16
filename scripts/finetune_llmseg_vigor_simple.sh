@@ -22,7 +22,7 @@ VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
 VIGOR_TRAIN_SAM_MASKS="../root/autodl-tmp/train_masks_sam_0.8_0.8"
-VIGOR_VAL_SAM_MASKS="../root/autodl-tmp/test_mask/sam_masks"
+VIGOR_VAL_SAM_MASKS="../root/autodl-tmp/test_mask/sam_masks3"
 # 是否只使用 hard 样本 (不使用 easy 样本)
 VIGOR_ONLY_HARD=false
 # 训练启动前自动扫描 train/depth，用训练集分位数确定 depth range。
@@ -50,6 +50,7 @@ LR=2e-5
 PRECISION="bf16"
 ALIGN_TEMP=0.05
 VIGOR_MAX_INSTRUCTIONS=3
+VAL_WORKERS=4
 
 # ========== 性能测试开关 ==========
 # 手动测试不同 batch size 时，只改上面的 BATCH_SIZE 和 EXP_NAME 即可。
@@ -208,7 +209,8 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=8 \
+  --workers=16 \
+  --val_workers=${VAL_WORKERS} \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \

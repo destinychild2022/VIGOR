@@ -69,6 +69,10 @@ def parse_args(args):
                         type=str, help="测试数据集路径")
     parser.add_argument("--sam_masks_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_mask", "sam_masks"), type=str,
                         help="SAM 候选 mask 目录")
+    parser.add_argument("--depth_min", default=float(os.environ.get("VIGOR_DEPTH_MIN", "0.6")), type=float,
+                        help="Depth normalization lower bound, same meaning as VIGOR_DEPTH_MIN in training")
+    parser.add_argument("--depth_max", default=float(os.environ.get("VIGOR_DEPTH_MAX", "1.85")), type=float,
+                        help="Depth normalization upper bound, same meaning as VIGOR_DEPTH_MAX in training")
     
     # 输出路径
     parser.add_argument("--output_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_results"),
@@ -97,13 +101,19 @@ def parse_args(args):
     # 可视化配置
     parser.add_argument("--vis_dir", default=os.path.join(DEFAULT_AUTODL_TMP_DIR, "test_vis_output"), type=str,
                         help="可视化输出目录")
-    parser.add_argument("--save_vis", action="store_true", default=True,
+    parser.add_argument("--save_vis", action="store_true", default=False,
                         help="是否保存可视化图片")
     
     # 调试
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--max_samples", default=None, type=int,
                         help="最大测试样本数（用于调试）")
+    parser.add_argument("--workers", default=4, type=int,
+                        help="测试 DataLoader worker 数量")
+    parser.add_argument("--iou_selection_only", action="store_true", default=False,
+                        help="Use validate() style pred_similarity argmax mask selection; if false, use validate_threshold() style pred_iou threshold selection")
+    parser.add_argument("--iou_threshold", default=0.5, type=float,
+                        help="pred_iou threshold used when --iou_selection_only is not set")
     parser.add_argument("--split", default="both", type=str,
                         choices=["easy", "hard", "both"], help="测试的数据子集")
     
@@ -149,7 +159,9 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
         img_name = f"{img_num}.png"
         
         image_path = os.path.join(data_dir, img_name)
-        gt_mask_path = os.path.join(data_dir, gt_mask_path_rel)
+        gt_mask_paths = [p.strip() for p in gt_mask_path_rel.split(',')]
+        gt_mask_path = ",".join(os.path.join(data_dir, p) for p in gt_mask_paths)
+        depth_path = os.path.join(data_dir, "depth", f"{img_num}.npy")
         
         gt_object = sample.get('gt_object', sample.get('object', ''))
         instructions = sample.get('instructions', [])
@@ -160,6 +172,7 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
         samples.append({
             'image_path': image_path,
             'gt_mask_path': gt_mask_path,
+            'depth_path': depth_path,
             'gt_object': gt_object,
             'instructions': instructions,
             'difficulty': difficulty,
@@ -607,160 +620,233 @@ def prepare_sam_masks(sam_mask_helper, img_name, image_size, transform, precisio
     return segs, segs_origin
 
 
-def predict_mask_llmseg(
-    model, tokenizer, clip_image_processor, transform,
-    image_np, instruction, sam_mask_helper, args
-):
-    """LLMSeg 预测掩码 - 从 SAM 候选中选择"""
-    ori_size = image_np.shape[:2]
-    img_name = f"{args._current_img_name}"  # 从 args 中获取
-    
-    # 准备 SAM 候选 mask
-    segs, segs_origin = prepare_sam_masks(
-        sam_mask_helper, img_name, args.image_size, transform, args.precision
-    )
-    
-    if segs is None:
-        return np.ones(ori_size, dtype=np.float32)  # 返回全背景
-    
-    # CLIP 图像处理
-    image_clip = clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
-    
-    # SAM 图像处理
-    image_tensor, resize = preprocess_image(image_np, transform, args.image_size)
-    
-    # 构建对话
+def prepare_depth_map(depth_path: str, ori_size, image_size: int, transform, depth_min: float, depth_max: float):
+    if depth_path and os.path.exists(depth_path):
+        depth_raw = np.load(depth_path).astype(np.float32)
+        if depth_raw.shape[:2] != ori_size:
+            depth_raw = cv2.resize(depth_raw, (ori_size[1], ori_size[0]), interpolation=cv2.INTER_LINEAR)
+    else:
+        print(f"Warning: depth not found: {depth_path}, using zeros")
+        depth_raw = np.zeros(ori_size, dtype=np.float32)
+
+    depth_raw = np.nan_to_num(depth_raw, nan=depth_max, posinf=depth_max, neginf=depth_min)
+    denom = max(depth_max - depth_min, 1e-6)
+    depth_norm = np.clip((depth_raw - depth_min) / denom, 0.0, 1.0).astype(np.float32)
+    depth_target_hw = transform.get_preprocess_shape(ori_size[0], ori_size[1], image_size)
+    depth_resized = cv2.resize(depth_norm, (depth_target_hw[1], depth_target_hw[0]), interpolation=cv2.INTER_LINEAR)
+    padh_depth = image_size - depth_resized.shape[0]
+    padw_depth = image_size - depth_resized.shape[1]
+    depth_square = np.pad(depth_resized, ((0, padh_depth), (0, padw_depth)), mode="constant", constant_values=0)
+    depth_256 = F.interpolate(
+        torch.from_numpy(depth_square).unsqueeze(0).unsqueeze(0),
+        size=(256, 256),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).squeeze(0).contiguous()
+    return depth_256
+
+
+class VIGORTestDataset(Dataset):
+    def __init__(
+        self,
+        samples: List[Dict],
+        sam_mask_helper,
+        clip_image_processor,
+        transform,
+        image_size: int,
+        precision: str,
+        depth_min: float,
+        depth_max: float,
+    ):
+        self.samples = samples
+        self.sam_mask_helper = sam_mask_helper
+        self.clip_image_processor = clip_image_processor
+        self.transform = transform
+        self.image_size = image_size
+        self.precision = precision
+        self.depth_min = depth_min
+        self.depth_max = depth_max
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        try:
+            image_path = sample['image_path']
+            gt_mask_path = sample['gt_mask_path']
+            img_name = sample['img_name']
+            depth_path = sample.get('depth_path')
+
+            image_np = cv2.imread(image_path)
+            if image_np is None:
+                return {"error": f"Failed to load image: {image_path}", "sample": sample}
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+            ori_size = image_np.shape[:2]
+
+            gt_masks = []
+            for p in [x.strip() for x in gt_mask_path.split(',') if x.strip()]:
+                mask = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    gt_masks.append(mask)
+            if not gt_masks:
+                return {"error": f"Failed to load GT mask: {gt_mask_path}", "sample": sample}
+
+            segs, segs_origin = prepare_sam_masks(
+                self.sam_mask_helper, img_name, self.image_size, self.transform, self.precision
+            )
+            image_clip = self.clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
+            image_tensor, resize = preprocess_image(image_np, self.transform, self.image_size)
+            depth_256 = prepare_depth_map(
+                depth_path, ori_size, self.image_size, self.transform, self.depth_min, self.depth_max
+            )
+
+            return {
+                "sample": sample,
+                "image_np": image_np,
+                "gt_masks": gt_masks,
+                "image_tensor": image_tensor,
+                "image_clip": image_clip,
+                "resize": resize,
+                "segs": segs,
+                "segs_origin": segs_origin,
+                "depth_256": depth_256,
+                "ori_size": ori_size,
+            }
+        except Exception as e:
+            return {"error": repr(e), "sample": sample}
+
+
+def collate_single_item(batch):
+    return batch[0]
+
+
+def predict_mask_llmseg_prepared(model, tokenizer, prepared: Dict, instruction: str, args):
+    segs = prepared.get("segs")
+    segs_origin = prepared.get("segs_origin")
+    ori_size = prepared["ori_size"]
+    if segs is None or segs_origin is None:
+        return np.ones(ori_size, dtype=np.float32)
+
     question = f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"
     conv = conversation_lib.conv_templates[args.conv_type].copy()
     conv.append_message(conv.roles[0], question)
     conv.append_message(conv.roles[1], "[SEG]")
     prompt = conv.get_prompt()
-    
-    # Tokenize
+
     from model.llava.mm_utils import tokenizer_image_token
     input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt").unsqueeze(0)
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
-    
-    # 占空 IoU
-    K = segs.shape[0]
-    dummy_ious = np.zeros((1, K))
-    dummy_iops = np.zeros((1, K))
-    
+
+    k = segs.shape[0]
+    dummy_ious = np.zeros((1, k))
+    dummy_iops = np.zeros((1, k))
+
     input_dict = {
-        "images": image_tensor.unsqueeze(0),
-        "images_clip": image_clip.unsqueeze(0),
+        "images": prepared["image_tensor"].unsqueeze(0),
+        "images_clip": prepared["image_clip"].unsqueeze(0),
         "input_ids": input_ids,
         "labels": labels,
         "attention_masks": attention_mask,
         "offset": torch.tensor([0, 1]),
         "masks_list": [torch.zeros(1, ori_size[0], ori_size[1])],
         "label_list": [torch.ones(ori_size[0], ori_size[1]) * 255],
-        "resize_list": [resize],
+        "resize_list": [prepared["resize"]],
         "sam_segs_list": [segs],
         "sam_ious_list": [dummy_ious],
         "sam_iops_list": [dummy_iops],
         "origin_segs_list": [segs_origin],
+        "depths": [prepared["depth_256"]],
         "inference": True,
     }
-    
-    # 确定精度
+
     torch_dtype = torch.float32
     if args.precision == "bf16":
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    
-    # 移动到 GPU
+
     device = next(model.parameters()).device
     input_dict = dict_to_cuda(input_dict, torch_dtype=torch_dtype, device=device)
-    
-    # 推理
+
     with torch.no_grad():
         output_dict = model(**input_dict)
-    
-    # 获取预测结果
-    pred_similarity = output_dict["pred_similarity"][0]  # (1, K)
-    max_idx = torch.argmax(pred_similarity).item()
-    
-    # 获取预测 mask
-    pred_mask = segs_origin[:, :, max_idx]  # (H, W)
-    
-    return pred_mask
+
+    if args.iou_selection_only:
+        pred_similarity = output_dict["pred_similarity"][0]
+        max_idx = torch.argmax(pred_similarity).item()
+        return segs_origin[:, :, max_idx]
+
+    pred_iou = output_dict["pred_iou"][0]
+    max_ids = []
+    for i in range(pred_iou.shape[1]):
+        if pred_iou[0][i] > args.iou_threshold:
+            max_ids.append(i)
+
+    pred_mask = np.ones_like(segs_origin[:, :, 0])
+    for i in max_ids:
+        pred_mask = np.minimum(pred_mask, segs_origin[:, :, i])
+    return pred_mask.astype(np.uint8)
 
 
-def evaluate_sample(
-    model, tokenizer, clip_image_processor, transform,
-    sample: Dict, sam_mask_helper, args, obj_count: int = 1
-) -> Dict:
-    """评估单个样本"""
-    image_path = sample['image_path']
-    gt_mask_path = sample['gt_mask_path']
+def evaluate_prepared_sample(model, tokenizer, prepared: Dict, args, obj_count: int = 1) -> Dict:
+    if prepared.get("error"):
+        if args.debug:
+            sample = prepared.get("sample", {})
+            print(f"  [Error] {sample.get('image_path', 'N/A')}: {prepared['error']}")
+        return None
+
+    sample = prepared["sample"]
     instructions = sample['instructions']
-    img_name = sample['img_name']
-    
-    # 设置当前图片名
-    args._current_img_name = img_name
-    
-    # 读取图像
-    image_np = cv2.imread(image_path)
-    if image_np is None:
-        return None
-    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-    
-    # 读取 GT mask
-    gt_mask = cv2.imread(gt_mask_path, cv2.IMREAD_GRAYSCALE)
-    if gt_mask is None:
-        return None
-    
-    # GT mask 已经是 0=前景, 非0=背景 的格式
-    
-    original_size = image_np.shape[:2]
-    original_h, original_w = original_size
-    
-    # 对每条指令进行推理
+    gt_masks = prepared["gt_masks"]
+    image_np = prepared["image_np"]
+    original_h, original_w = image_np.shape[:2]
+
     pred_masks = []
     ic_ious = []
-    
     for instr_idx, instruction in enumerate(instructions[:3]):
-        pred_mask = predict_mask_llmseg(
-            model, tokenizer, clip_image_processor, transform,
-            image_np, instruction, sam_mask_helper, args
-        )
-        
-        # 调整大小
-        if pred_mask.shape != gt_mask.shape:
-            pred_mask = cv2.resize(pred_mask.astype(np.float32), 
-                                   (original_w, original_h),
-                                   interpolation=cv2.INTER_NEAREST)
-        
+        pred_mask = predict_mask_llmseg_prepared(model, tokenizer, prepared, instruction, args)
+        resized_pred_masks = []
+        iou_candidates = []
+        for gt_mask in gt_masks:
+            pred_for_gt = pred_mask
+            if pred_for_gt.shape != gt_mask.shape:
+                pred_for_gt = cv2.resize(
+                    pred_for_gt.astype(np.float32),
+                    (gt_mask.shape[1], gt_mask.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            resized_pred_masks.append(pred_for_gt)
+            iou_candidates.append(compute_iou(pred_for_gt, gt_mask))
+
+        best_gt_idx = int(np.argmax(iou_candidates)) if iou_candidates else 0
+        pred_mask = resized_pred_masks[best_gt_idx] if resized_pred_masks else pred_mask
+        gt_mask_for_vis = gt_masks[best_gt_idx] if gt_masks else np.zeros((original_h, original_w), dtype=np.uint8)
+
         pred_masks.append(pred_mask)
-        iou = compute_iou(pred_mask, gt_mask)
+        iou = iou_candidates[best_gt_idx] if iou_candidates else 0.0
         ic_ious.append(iou)
-        
-        # 保存可视化结果
+
         if args.save_vis:
             sample_info = {
                 'gt_object': sample['gt_object'],
                 'difficulty': sample['difficulty'],
                 'instructions': instructions,
-                'img_name': img_name,
+                'img_name': sample['img_name'],
             }
             save_visualization(
                 image_np=image_np,
                 pred_mask=pred_mask,
-                gt_mask=gt_mask,
+                gt_mask=gt_mask_for_vis,
                 vis_dir=args.vis_dir,
                 sample_info=sample_info,
                 instruction_idx=instr_idx,
                 iou=iou,
-                obj_count=obj_count
+                obj_count=obj_count,
             )
-    
-    # 计算平均 IC-IoU
+
     avg_ic_iou = np.mean(ic_ious) if ic_ious else 0.0
-    
-    # 计算 ICR (pred 之间的 IoU)
     iou_pairs = []
     if len(pred_masks) >= 3:
         iou_pairs.append(compute_iou(pred_masks[0], pred_masks[1]))
@@ -768,10 +854,10 @@ def evaluate_sample(
         iou_pairs.append(compute_iou(pred_masks[1], pred_masks[2]))
     elif len(pred_masks) == 2:
         iou_pairs.append(compute_iou(pred_masks[0], pred_masks[1]))
-    
+
     return {
-        'image_path': image_path,
-        'gt_mask_path': gt_mask_path,
+        'image_path': sample['image_path'],
+        'gt_mask_path': sample['gt_mask_path'],
         'gt_object': sample['gt_object'],
         'difficulty': sample['difficulty'],
         'ic_ious': ic_ious,
@@ -780,6 +866,43 @@ def evaluate_sample(
         'num_instructions': len(instructions[:3]),
     }
 
+
+def run_split_with_loader(split_name: str, samples: List[Dict], model, tokenizer, sam_mask_helper, clip_image_processor, transform, args):
+    dataset = VIGORTestDataset(
+        samples=samples,
+        sam_mask_helper=sam_mask_helper,
+        clip_image_processor=clip_image_processor,
+        transform=transform,
+        image_size=args.image_size,
+        precision=args.precision,
+        depth_min=args.depth_min,
+        depth_max=args.depth_max,
+    )
+    loader_kwargs = dict(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=False,
+        collate_fn=collate_single_item,
+    )
+    if args.workers > 0:
+        loader_kwargs["prefetch_factor"] = 1
+        loader_kwargs["persistent_workers"] = False
+    loader = DataLoader(**loader_kwargs)
+
+    result_list = []
+    seen_counts = defaultdict(int)
+    for prepared in tqdm(loader, desc=split_name.capitalize()):
+        sample = prepared.get("sample", {})
+        img_name = sample.get('img_name', '')
+        obj_name = sample.get('gt_object', '')
+        seen_counts[(img_name, obj_name)] += 1
+        curr_count = seen_counts[(img_name, obj_name)]
+        result = evaluate_prepared_sample(model, tokenizer, prepared, args, obj_count=curr_count)
+        if result:
+            result_list.append(result)
+    return result_list
 
 
 def main(args):
@@ -829,6 +952,9 @@ def main(args):
     print(f"  Easy 样本数: {len(easy_samples)}")
     print(f"  Hard 样本数: {len(hard_samples)}")
     print(f"  SAM 候选 mask 目录: {args.sam_masks_dir}")
+    selection_mode = "pred_similarity_argmax" if args.iou_selection_only else f"pred_iou_threshold_{args.iou_threshold}"
+    print(f"  Depth归一化: [{args.depth_min}, {args.depth_max}]")
+    print(f"  Mask选择方式: {selection_mode}")
     
     # 存储结果
     results = {
@@ -836,50 +962,24 @@ def main(args):
         'hard': [],
     }
     
+    print(f"  DataLoader workers: {args.workers}")
+
     # 测试 Easy 样本
     print("\n" + "=" * 60)
     print("  测试 Easy 样本")
     print("=" * 60)
-    easy_seen_counts = defaultdict(int)
-    for sample in tqdm(easy_samples, desc="Easy"):
-        try:
-            img_name = sample['img_name']
-            obj_name = sample['gt_object']
-            easy_seen_counts[(img_name, obj_name)] += 1
-            curr_count = easy_seen_counts[(img_name, obj_name)]
-            
-            result = evaluate_sample(
-                model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args, obj_count=curr_count
-            )
-            if result:
-                results['easy'].append(result)
-        except Exception as e:
-            if args.debug:
-                print(f"  [Error] {sample['image_path']}: {e}")
-    
+    results['easy'] = run_split_with_loader(
+        "easy", easy_samples, model, tokenizer, sam_mask_helper, clip_image_processor, transform, args
+    )
+
     # 测试 Hard 样本
     print("\n" + "=" * 60)
     print("  测试 Hard 样本")
     print("=" * 60)
-    hard_seen_counts = defaultdict(int)
-    for sample in tqdm(hard_samples, desc="Hard"):
-        try:
-            img_name = sample['img_name']
-            obj_name = sample['gt_object']
-            hard_seen_counts[(img_name, obj_name)] += 1
-            curr_count = hard_seen_counts[(img_name, obj_name)]
-            
-            result = evaluate_sample(
-                model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args, obj_count=curr_count
-            )
-            if result:
-                results['hard'].append(result)
-        except Exception as e:
-            if args.debug:
-                print(f"  [Error] {sample['image_path']}: {e}")
-    
+    results['hard'] = run_split_with_loader(
+        "hard", hard_samples, model, tokenizer, sam_mask_helper, clip_image_processor, transform, args
+    )
+
     # 计算统计指标
     print("\n" + "=" * 60)
     print("  计算统计指标")
@@ -950,6 +1050,9 @@ def main(args):
         f.write(f"微调权重: {args.checkpoint}\n")
         f.write(f"数据目录: {args.data_dir}\n")
         f.write(f"SAM masks: {args.sam_masks_dir}\n")
+        f.write(f"Depth range: [{args.depth_min}, {args.depth_max}]\n")
+        f.write(f"DataLoader workers: {args.workers}\n")
+        f.write(f"Mask selection: {selection_mode}\n")
         f.write(f"测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
         # 汇总表格
