@@ -102,8 +102,8 @@ class LisaMetaModel:
                 dinov2_weight_path = pth_files[0]
                 print(f"Found local DINOv2 weight: {dinov2_weight_path}")
         
-        # ✅ 防止多进程同时下载 DINOv2 代码仓库导致冲突
-        # 获取当前进程的 rank，只有 rank 0 才下载，其他进程等待
+        # ✅ 优先使用本地 torch.hub 缓存，避免测试/训练时触发 GitHub 下载导致 403 rate limit。
+        # 获取当前进程的 rank，只有 rank 0 在缺少缓存时才尝试在线加载，其他进程等待。
         local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
         
         # 加载模型结构（从 torch.hub，这会下载代码但可能失败）
@@ -112,32 +112,26 @@ class LisaMetaModel:
         
         dinov2_vitl14 = None
         cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+
+        def load_dinov2_from_cache():
+            if not os.path.exists(cache_dir):
+                raise FileNotFoundError(
+                    "DINOv2 本地 torch.hub 代码缓存不存在，已禁止在线下载以避免 HTTP 403/rate limit。"
+                    f"请先把 facebookresearch/dinov2 代码放到: {cache_dir}"
+                )
+            return torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=False, source='local')
         
         # 如果是多 GPU 训练，使用文件锁机制
         import torch.distributed as dist
         if dist.is_initialized():
             if local_rank == 0:
-                # Rank 0 负责下载/加载
+                # Rank 0 负责加载；优先本地缓存，只有缓存缺失时才尝试在线拉取。
                 try:
-                    # 先清理可能损坏的缓存
-                    import shutil
-                    broken_cache = os.path.expanduser("~/.cache/torch/hub/facebookresearch-dinov2-b194f00")
-                    if os.path.exists(broken_cache):
-                        shutil.rmtree(broken_cache, ignore_errors=True)
-                    
-                    dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
-                    print(f"[Rank 0] Loaded DINOv2 model structure from torch.hub")
+                    dinov2_vitl14 = load_dinov2_from_cache()
+                    print("[Rank 0] Loaded DINOv2 model structure from local cache")
                 except Exception as e:
-                    print(f"[Rank 0] Warning: Failed to load DINOv2 from torch.hub ({e})")
-                    if os.path.exists(cache_dir):
-                        try:
-                            dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
-                            print("[Rank 0] Loaded DINOv2 model structure from local cache")
-                        except Exception as e2:
-                            print(f"[Rank 0] Error: Cannot load DINOv2 from cache: {e2}")
-                            raise e2
-                    else:
-                        raise e
+                    print(f"[Rank 0] Error: Failed to load DINOv2 from local cache ({e})")
+                    raise e
             
             # 等待 Rank 0 完成下载
             dist.barrier()
@@ -145,44 +139,19 @@ class LisaMetaModel:
             if local_rank != 0:
                 # 其他 Rank 从缓存加载
                 try:
-                    dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
+                    dinov2_vitl14 = load_dinov2_from_cache()
                     print(f"[Rank {local_rank}] Loaded DINOv2 model structure from local cache")
                 except Exception as e:
                     print(f"[Rank {local_rank}] Error: Cannot load DINOv2 from cache: {e}")
                     raise e
         else:
-            # 单 GPU 训练，直接加载
+            # 单 GPU / 测试，优先本地缓存，避免在线下载被限流。
             try:
-                # 先清理可能损坏的缓存（与多 GPU 逻辑一致）
-                import shutil
-                for broken_cache_pattern in [
-                    "~/.cache/torch/hub/facebookresearch-dinov2*",
-                    "~/.cache/torch/hub/facebookresearch_dinov2_main",
-                ]:
-                    import glob
-                    for broken_cache in glob.glob(os.path.expanduser(broken_cache_pattern)):
-                        try:
-                            shutil.rmtree(broken_cache, ignore_errors=True)
-                            print(f"Cleaned up broken cache: {broken_cache}")
-                        except Exception:
-                            pass
-                
-                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=use_pretrained)
-                if use_pretrained:
-                    print("Loaded DINOv2 from torch.hub (with pretrained weights)")
-                else:
-                    print("Loaded DINOv2 model structure from torch.hub")
+                dinov2_vitl14 = load_dinov2_from_cache()
+                print("Loaded DINOv2 model structure from local cache")
             except Exception as e:
-                print(f"Warning: Failed to load DINOv2 from torch.hub ({e})")
-                if os.path.exists(cache_dir):
-                    try:
-                        dinov2_vitl14 = torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=use_pretrained, source='local')
-                        print("Loaded DINOv2 model structure from local cache")
-                    except Exception as e2:
-                        print(f"Error: Cannot load DINOv2 model structure from cache.")
-                        raise e2
-                else:
-                    raise e
+                print(f"Error: Failed to load DINOv2 from local cache ({e})")
+                raise e
         
         # 如果本地有权重文件，加载本地权重
         if dinov2_weight_path and os.path.exists(dinov2_weight_path):
@@ -193,7 +162,7 @@ class LisaMetaModel:
                 print(f"Successfully loaded DINOv2 weights from local path")
             except Exception as e:
                 print(f"Warning: Failed to load weights from local path ({e}), using pretrained weights")
-                dinov2_vitl14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+                dinov2_vitl14 = load_dinov2_from_cache()
         
         self.visual_model_dinov2 = dinov2_vitl14
         for param in self.visual_model_dinov2.parameters():
@@ -1020,20 +989,22 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
 
         if inference:
-            # during inference , C = 1
+            # during inference, C is the number of conversations/instructions
+            # for each image. Validation usually has C=1, while batched VIGOR
+            # testing can send the three instructions for one sample together.
             pred_similarity = []
             for batch_idx in range(len(pred_embeddings)):
-                pred_embedding = pred_embeddings[batch_idx] # (1, D)
+                pred_embedding = pred_embeddings[batch_idx] # (C, D)
                 pred_embedding_normlized = pred_embedding / pred_embedding.norm(dim=-1, keepdim=True)
-                sam_features = sam_segs_feature_list[batch_idx][0, :, :] # (K, D)
+                sam_features = sam_segs_feature_list[batch_idx] # (C, K, D)
                 sam_features_normlized = sam_features / sam_features.norm(dim=-1, keepdim=True)
-                similarity = pred_embedding_normlized @ sam_features_normlized.T # (1, K)
+                similarity = torch.einsum("cd,ckd->ck", pred_embedding_normlized, sam_features_normlized) # (C, K)
                 pred_similarity.append(similarity)
 
             pred_ious = []
             for batch_idx in range(len(sam_pred_ious_list)):
-                sam_pred_ious = sam_pred_ious_list[batch_idx][0, :, :] # (K, 1)
-                pred_ious.append(sam_pred_ious.T) # (1, K)
+                sam_pred_ious = sam_pred_ious_list[batch_idx].squeeze(-1) # (C, K)
+                pred_ious.append(sam_pred_ious)
 
             return {
                 "pred_similarity": pred_similarity,

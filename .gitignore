@@ -58,6 +58,10 @@ outputs/
 checkpoints/
 ckpt_model/
 
+# Core dumps
+core
+core.*
+
 # Project specific directories (not uploaded)
 SAM_finetune/sam_output/
 swanlog/

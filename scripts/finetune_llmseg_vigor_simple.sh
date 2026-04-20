@@ -18,7 +18,7 @@ VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
 VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
-VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks"
+VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 # 是否只使用 hard 样本 (不使用 easy 样本)
 VIGOR_ONLY_HARD=false
 
@@ -66,7 +66,7 @@ export NCCL_TIMEOUT=7200
 cd "$(dirname "$0")/.." || exit 1
 
 # Prefer the project's venv
-DEEPSPEED_BIN="./.venv/bin/deepspeed"
+DEEPSPEED_BIN="./.venv3124/bin/deepspeed"
 if [ ! -x "$DEEPSPEED_BIN" ]; then
   DEEPSPEED_BIN="deepspeed"
 fi
@@ -111,7 +111,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=4 \
+  --workers=12 \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \

@@ -35,7 +35,7 @@ MAX_INSTRUCTIONS=3
 # 候选 mask 选择方式:
 #   similarity: 选 pred_similarity 最大的单个候选 mask
 #   iou:        合并 pred_iou > IOU_THRESHOLD 的候选 mask（与 validate_threshold 一致）
-MASK_SELECTION_MODE="similarity"
+MASK_SELECTION_MODE="iou"
 IOU_THRESHOLD=0.5
 
 # 一次性测试的 checkpoint 子目录。需要改哪些权重就直接改这里。
@@ -44,7 +44,7 @@ CKPT_NAMES="epoch_5 epoch_10 epoch_15 epoch_20"
 # ========== 调试配置 ==========
 DEBUG=0
 MAX_SAMPLES=""
-GPU_ID=0
+GPU_ID=1
 SPLIT="both"  # 可选: both, easy, hard
 
 # ========================================================================
