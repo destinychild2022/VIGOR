@@ -8,19 +8,19 @@
 
 # ========== 模型路径配置 ==========
 LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple/ckpt_model"
+CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-new-20epochs/ckpt_model/best"
 CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
 SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # ========== 数据集配置 ==========
 # 测试数据集路径
-TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test"
+TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test"
 # SAM 候选 mask 目录 (必需！)
 SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"
-VIS_DIR="./vis_output2_hard"  # 可视化输出目录
+VIS_DIR="./vis_output_new-best"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
@@ -31,7 +31,7 @@ ICR_THRESHOLDS="0.3,0.4,0.5,0.6,0.7,0.8,0.9"
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 GPU_ID="${GPU_ID:-0}"
-SPLIT="${SPLIT:-hard}"  # 可选: both, easy, hard
+SPLIT="${SPLIT:-both}"  # 可选: both, easy, hard
 
 # ========================================================================
 

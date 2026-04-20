@@ -6,7 +6,7 @@
 # 1. 配置
 PORT="5557"
 CHECKPOINT="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 DEVICE="cuda:0" # 物理卡 2 现在映射为逻辑 0
 
 # 2. 激活环境
