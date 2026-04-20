@@ -198,7 +198,7 @@ def parse_args(args):
         "--save_only_target_epoch",
         action="store_true",
         default=False,
-        help="Only save --target_save_epoch, remove other training checkpoints, and stop after that checkpoint is written",
+        help="Save every epoch, keep only the latest checkpoint, and stop once --target_save_epoch is written",
     )
     parser.add_argument(
         "--target_save_epoch",
@@ -1203,14 +1203,14 @@ def main(args):
                 best_score = max(giou, best_score)
                 cur_ciou = ciou if is_best else cur_ciou
 
-            # ========== 保存权重逻辑 (best + 定期/指定轮次存档) ==========
+            # ========== 保存权重逻辑 (best + 定期/最新轮次存档) ==========
             stop_after_target_save = False
             best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
             
-            # 第一步：默认每 N 轮保存一个定期存档；指定轮次模式只保存 target epoch
+            # 第一步：默认每 N 轮保存；目标模式每轮保存并只保留最新 checkpoint
             real_epoch = epoch + 1  # epoch 从 0 开始，显示时 +1
             should_save_epoch = (
-                real_epoch == args.target_save_epoch
+                True
                 if args.save_only_target_epoch
                 else real_epoch % args.checkpoint_save_interval == 0
             )
@@ -1224,7 +1224,10 @@ def main(args):
                 torch.distributed.barrier()
                 
                 if args.local_rank == 0:
-                    save_label = "目标轮次存档" if args.save_only_target_epoch else "定期存档"
+                    if args.save_only_target_epoch:
+                        save_label = "目标轮次存档" if real_epoch >= args.target_save_epoch else "最新轮次存档"
+                    else:
+                        save_label = "定期存档"
                     print(f"\n[Epoch {real_epoch}] {save_label} -> {epoch_save_dir}")
                 
                 epoch_client_state = build_checkpoint_client_state(
@@ -1236,7 +1239,11 @@ def main(args):
                     ciou=ciou,
                     is_best=is_best,
                     save_reason=(
-                        f"target_epoch_{real_epoch}"
+                        (
+                            f"target_epoch_{real_epoch}"
+                            if real_epoch >= args.target_save_epoch
+                            else f"latest_epoch_{real_epoch}"
+                        )
                         if args.save_only_target_epoch
                         else f"epoch_{real_epoch}"
                     ),
@@ -1257,7 +1264,7 @@ def main(args):
                     except Exception as e:
                         print(f"  [警告] 存档重命名失败: {e}，权重暂留在 {temp_save_dir}")
                 if args.save_only_target_epoch:
-                    stop_after_target_save = True
+                    stop_after_target_save = real_epoch >= args.target_save_epoch
 
             # 第二步：如果当前是历史最高分，则同步更新 "best"
             if not args.save_only_target_epoch and not args.no_eval and is_best:

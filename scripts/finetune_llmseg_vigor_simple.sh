@@ -82,7 +82,7 @@ echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
 if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
-  echo "权重保存: 仅保留 ckpt_model/epoch_${TARGET_SAVE_EPOCH}，保存后自动停止"
+  echo "权重保存: 每轮保存最新 checkpoint，仅保留一个；到 epoch_${TARGET_SAVE_EPOCH} 后自动停止"
 else
   echo "权重保存: ckpt_model/best (最优) + 每 ${CHECKPOINT_SAVE_INTERVAL} 轮定期存档"
 fi
