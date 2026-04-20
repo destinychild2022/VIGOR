@@ -18,19 +18,19 @@ VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
 VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
-VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks"
+VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 # 是否只使用 hard 样本 (不使用 easy 样本)
-VIGOR_ONLY_HARD=false
+VIGOR_ONLY_HARD=true
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-new-20epochs"
+EXP_NAME="finetune_llmseg_vigor_simple-new-onlyhard3"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
 
 # ========== 训练超参数 ==========
-EPOCHS=20  #70*14*3/2
+EPOCHS=20
 STEPS_PER_EPOCH=1000
 BATCH_SIZE=8
 GRAD_ACCUMULATION_STEPS=1
@@ -40,6 +40,7 @@ ALIGN_TEMP=0.05
 VIGOR_MAX_INSTRUCTIONS=3
 
 # 验证集配置 (test 分片中 scene ID <= 1000 的所有 Easy+Hard 样本)
+RUN_VALIDATION=false
 VAL_MAX_SCENE_ID=1000
 # 每个 epoch 可视化样本数
 MAX_VIS_SAMPLES=4
@@ -56,6 +57,9 @@ MASTER_PORT=24375
 
 # ========== Checkpoint 配置 ==========
 RESUME_PATH=""
+CHECKPOINT_SAVE_INTERVAL=5
+SAVE_ONLY_TARGET_EPOCH=true
+TARGET_SAVE_EPOCH=20
 
 # ========== 分布式超时配置 ==========
 export NCCL_TIMEOUT=7200000
@@ -77,15 +81,29 @@ echo "模型路径: ${MODEL_PATH}"
 echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
-echo "权重保存: ckpt_model/best (最优) + epoch_5/10/15/20 (每5轮定期存档)"
+if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
+  echo "权重保存: 仅保留 ckpt_model/epoch_${TARGET_SAVE_EPOCH}，保存后自动停止"
+else
+  echo "权重保存: ckpt_model/best (最优) + 每 ${CHECKPOINT_SAVE_INTERVAL} 轮定期存档"
+fi
 echo "最大验证场景 ID: ${VAL_MAX_SCENE_ID}"
-echo "验证数据: Easy + Hard 混合验证"
+if [ "${RUN_VALIDATION}" = true ]; then
+  echo "验证数据: Easy + Hard 混合验证"
+else
+  echo "验证数据: 已关闭每轮验证"
+fi
 echo "========================================================================"
 
 # 额外的可选参数
 EXTRA_ARGS=""
 if [ "${VIGOR_ONLY_HARD}" = true ]; then
   EXTRA_ARGS="${EXTRA_ARGS} --vigor_only_hard"
+fi
+if [ "${RUN_VALIDATION}" != true ]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --no_eval"
+fi
+if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --save_only_target_epoch --target_save_epoch=${TARGET_SAVE_EPOCH}"
 fi
 
 # 执行训练
@@ -108,6 +126,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --steps_per_epoch=${STEPS_PER_EPOCH} \
   --lr=${LR} \
   --epochs=${EPOCHS} \
+  --checkpoint_save_interval=${CHECKPOINT_SAVE_INTERVAL} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
   --workers=12 \

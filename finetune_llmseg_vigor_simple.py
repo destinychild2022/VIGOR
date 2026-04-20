@@ -188,6 +188,24 @@ def parse_args(args):
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
+    parser.add_argument(
+        "--checkpoint_save_interval",
+        default=5,
+        type=int,
+        help="Save regular DeepSpeed checkpoints every N epochs; ignored when --save_only_target_epoch is set",
+    )
+    parser.add_argument(
+        "--save_only_target_epoch",
+        action="store_true",
+        default=False,
+        help="Only save --target_save_epoch, remove other training checkpoints, and stop after that checkpoint is written",
+    )
+    parser.add_argument(
+        "--target_save_epoch",
+        default=-1,
+        type=int,
+        help="1-based epoch number to save when --save_only_target_epoch is enabled",
+    )
     parser.add_argument("--vision_pretrained", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/LLM-Seg-deepspeed", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--weight", default="", type=str)
@@ -217,6 +235,49 @@ def parse_args(args):
         help="每个epoch在第一个batch打印一次原图/GT/候选mask的关键维度与语义统计（不刷屏）",
     )
     return parser.parse_args(args)
+
+
+def cleanup_checkpoints_except_epoch(args, target_epoch):
+    """Remove training checkpoint dirs other than the requested epoch checkpoint."""
+    ckpt_base = os.path.join(args.log_dir, "ckpt_model")
+    keep_name = f"epoch_{target_epoch}"
+    removed = []
+
+    if os.path.isdir(ckpt_base):
+        for name in os.listdir(ckpt_base):
+            if name == keep_name:
+                continue
+            path = os.path.join(ckpt_base, name)
+            should_remove = (
+                name == "best"
+                or name == "best_temp"
+                or name.endswith("_temp")
+                or name.startswith("epoch_")
+            )
+            if not should_remove:
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed.append(path)
+            except Exception as e:
+                print(f"  [警告] 清理旧 checkpoint 失败: {path} ({e})")
+
+    if os.path.isdir(args.log_dir):
+        for name in os.listdir(args.log_dir):
+            if not (name.startswith("meta_log_BEST") and name.endswith(".pth")):
+                continue
+            path = os.path.join(args.log_dir, name)
+            try:
+                os.remove(path)
+                removed.append(path)
+            except Exception as e:
+                print(f"  [警告] 清理 best meta 文件失败: {path} ({e})")
+
+    if removed:
+        print(f"  [清理] 仅保留 {keep_name}，已移除 {len(removed)} 个旧 checkpoint/meta 项")
 
 
 def _build_robotarm_samples(
@@ -505,10 +566,10 @@ def init_training_dataset(args, tokenizer):
                 return []
 
         if args.vigor_only_hard:
-            print(f"Mode: Hard-only training - Multi-instance (3 instructions/image)")
+            print(f"Mode: Hard-only training - Multi-instance ({args.vigor_max_instructions} instructions/image)")
             easy_samples = []
         else:
-            print(f"Mode: Mixed training (Easy + Hard) - Multi-instance (3 instructions/image)")
+            print(f"Mode: Mixed training (Easy + Hard) - Multi-instance ({args.vigor_max_instructions} instructions/image)")
             print(f"Loading Easy samples from: {easy_json_path}")
             easy_samples = load_vigor_samples(easy_json_path)
 
@@ -657,7 +718,10 @@ def init_validation_dataset(args, tokenizer):
             is_train=False,
             debug_meta=getattr(args, "debug_epoch_shapes", False),
         )
-        print(f"VIGOR combined validation dataset loaded: {len(val_dataset)} total instances ({len(combined_raw_samples)} images * 3)")
+        print(
+            f"VIGOR combined validation dataset loaded: {len(val_dataset)} total instances "
+            f"({len(combined_raw_samples)} images * {args.vigor_max_instructions})"
+        )
         
     else:
         # RobotArm validation dataset (original logic)
@@ -916,6 +980,16 @@ def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
 
+    if args.checkpoint_save_interval <= 0:
+        raise ValueError("--checkpoint_save_interval must be a positive integer")
+    if args.save_only_target_epoch:
+        if args.target_save_epoch <= 0:
+            raise ValueError("--target_save_epoch must be a positive 1-based epoch when --save_only_target_epoch is set")
+        if args.target_save_epoch > args.epochs:
+            raise ValueError(
+                f"--target_save_epoch ({args.target_save_epoch}) cannot be greater than --epochs ({args.epochs})"
+            )
+
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -1069,6 +1143,20 @@ def main(args):
                         f"optimizer={lr_info['optimizer_lrs']}"
                     )
 
+    if args.save_only_target_epoch and args.start_epoch >= args.target_save_epoch:
+        target_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{args.target_save_epoch}")
+        if not os.path.isdir(target_dir):
+            raise ValueError(
+                f"当前 start_epoch={args.start_epoch} 已经不小于目标 epoch {args.target_save_epoch}，"
+                f"但目标 checkpoint 不存在: {target_dir}"
+            )
+        if args.local_rank == 0:
+            cleanup_checkpoints_except_epoch(args, args.target_save_epoch)
+            print(f"[信息] 目标 checkpoint 已存在: {target_dir}，无需继续训练。")
+        if args.distributed:
+            torch.distributed.barrier()
+        return
+
     train_iter = iter(train_loader)
 
     # 获取 swanlab logger（仅在 local_rank == 0 时不为 None）
@@ -1115,14 +1203,18 @@ def main(args):
                 best_score = max(giou, best_score)
                 cur_ciou = ciou if is_best else cur_ciou
 
-            
-            # ========== 保存权重逻辑 (best + 每5轮定期存档) ==========
-            SAVE_INTERVAL = 5  # 每 5 个 epoch 保存一次定期存档
+            # ========== 保存权重逻辑 (best + 定期/指定轮次存档) ==========
+            stop_after_target_save = False
             best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
             
-            # 第一步：每 5 轮保存一个定期存档，按 epoch_X 命名
+            # 第一步：默认每 N 轮保存一个定期存档；指定轮次模式只保存 target epoch
             real_epoch = epoch + 1  # epoch 从 0 开始，显示时 +1
-            if real_epoch % SAVE_INTERVAL == 0:
+            should_save_epoch = (
+                real_epoch == args.target_save_epoch
+                if args.save_only_target_epoch
+                else real_epoch % args.checkpoint_save_interval == 0
+            )
+            if should_save_epoch:
                 epoch_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}")
                 temp_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}_temp")
                 
@@ -1132,7 +1224,8 @@ def main(args):
                 torch.distributed.barrier()
                 
                 if args.local_rank == 0:
-                    print(f"\n[Epoch {real_epoch}] 定期存档 -> {epoch_save_dir}")
+                    save_label = "目标轮次存档" if args.save_only_target_epoch else "定期存档"
+                    print(f"\n[Epoch {real_epoch}] {save_label} -> {epoch_save_dir}")
                 
                 epoch_client_state = build_checkpoint_client_state(
                     args,
@@ -1142,7 +1235,11 @@ def main(args):
                     giou=giou,
                     ciou=ciou,
                     is_best=is_best,
-                    save_reason=f"epoch_{real_epoch}",
+                    save_reason=(
+                        f"target_epoch_{real_epoch}"
+                        if args.save_only_target_epoch
+                        else f"epoch_{real_epoch}"
+                    ),
                     model_engine=model_engine,
                     scheduler=scheduler,
                 )
@@ -1154,12 +1251,16 @@ def main(args):
                         if os.path.exists(epoch_save_dir):
                             shutil.rmtree(epoch_save_dir, ignore_errors=True)
                         os.rename(temp_save_dir, epoch_save_dir)
-                        print(f"  [成功] 定期存档已保存: {epoch_save_dir}")
+                        print(f"  [成功] {save_label}已保存: {epoch_save_dir}")
+                        if args.save_only_target_epoch:
+                            cleanup_checkpoints_except_epoch(args, real_epoch)
                     except Exception as e:
                         print(f"  [警告] 存档重命名失败: {e}，权重暂留在 {temp_save_dir}")
+                if args.save_only_target_epoch:
+                    stop_after_target_save = True
 
             # 第二步：如果当前是历史最高分，则同步更新 "best"
-            if not args.no_eval and is_best:
+            if not args.save_only_target_epoch and not args.no_eval and is_best:
                 if args.local_rank == 0:
                     print(f"  [🎉 创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
                     torch.save(
@@ -1199,6 +1300,10 @@ def main(args):
                         print(f"  [警告] best 重命名失败: {e}")
 
             torch.distributed.barrier()
+            if stop_after_target_save:
+                if args.local_rank == 0:
+                    print(f"[信息] 已得到 epoch_{real_epoch} 权重，按 --save_only_target_epoch 设置自动停止训练。")
+                break
             # ================================================
     except KeyboardInterrupt:
         if args.local_rank == 0:
