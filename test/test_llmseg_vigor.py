@@ -82,8 +82,8 @@ def parse_args(args):
     # LoRA 配置（需要与训练时一致）
     parser.add_argument("--lora_r", default=8, type=int, help="LoRA rank")
     parser.add_argument("--lora_alpha", default=16, type=int, help="LoRA alpha")
-    parser.add_argument("--lora_dropout", default=0.05, type=float, help="LoRA dropout")
-    parser.add_argument("--lora_target_modules", default="q_proj,v_proj", type=str,
+    parser.add_argument("--lora_dropout", default=0.1, type=float, help="LoRA dropout")
+    parser.add_argument("--lora_target_modules", default="q_proj,k_proj,v_proj,out_proj", type=str,
                         help="LoRA target modules")
     
     # ICR 阈值配置
@@ -93,7 +93,7 @@ def parse_args(args):
     # 可视化配置
     parser.add_argument("--vis_dir", default="./vis_output", type=str,
                         help="可视化输出目录")
-    parser.add_argument("--save_vis", action="store_true", default=True,
+    parser.add_argument("--save_vis", action="store_true", default=False,
                         help="是否保存可视化图片")
     
     # 调试
@@ -102,6 +102,8 @@ def parse_args(args):
                         help="最大测试样本数（用于调试）")
     parser.add_argument("--split", default="both", type=str,
                         choices=["easy", "hard", "both"], help="测试的数据子集")
+    parser.add_argument("--workers", default=12, type=int,
+                        help="测试 DataLoader worker 数量")
     
     return parser.parse_args(args)
 
@@ -170,6 +172,34 @@ def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
         })
     
     return samples
+
+
+def numpy_to_torch(array: np.ndarray, torch_dtype=None) -> torch.Tensor:
+    """Convert numpy arrays to torch tensors without torch's NumPy C-API bridge."""
+    dtype_pairs = {
+        np.dtype("uint8"): (torch.uint8, np.uint8),
+        np.dtype("int32"): (torch.int32, np.int32),
+        np.dtype("int64"): (torch.int64, np.int64),
+        np.dtype("float16"): (torch.float16, np.float16),
+        np.dtype("float32"): (torch.float32, np.float32),
+        np.dtype("float64"): (torch.float64, np.float64),
+        np.dtype("bool"): (torch.bool, np.bool_),
+    }
+    reverse_dtype = {v[0]: v[1] for v in dtype_pairs.values()}
+
+    if torch_dtype is not None:
+        np_dtype = reverse_dtype.get(torch_dtype)
+        if np_dtype is None:
+            raise TypeError(f"Unsupported target torch dtype: {torch_dtype}")
+        array = array.astype(np_dtype, copy=False)
+
+    array = np.ascontiguousarray(array)
+    mapped = dtype_pairs.get(array.dtype)
+    if mapped is None:
+        raise TypeError(f"Unsupported numpy dtype: {array.dtype}")
+
+    dtype = torch_dtype if torch_dtype is not None else mapped[0]
+    return torch.frombuffer(array, dtype=dtype).reshape(array.shape)
 
 
 def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
@@ -565,7 +595,7 @@ def preprocess_image(image_np, transform, image_size):
     image_resized = transform.apply_image(image_np)
     resize = image_resized.shape[:2]
     
-    image_tensor = torch.from_numpy(image_resized).permute(2, 0, 1).contiguous().float()
+    image_tensor = numpy_to_torch(image_resized, torch.uint8).permute(2, 0, 1).contiguous().float()
     image_tensor = (image_tensor - pixel_mean) / pixel_std
     
     h, w = image_tensor.shape[-2:]
@@ -610,7 +640,7 @@ def prepare_sam_masks(sam_mask_helper, img_name, image_size, transform, precisio
     )
     
     # 转换为 tensor 并插值到 256x256
-    segs_tensor = torch.from_numpy(segs_square).permute(2, 0, 1).contiguous()
+    segs_tensor = numpy_to_torch(segs_square, torch.float32).permute(2, 0, 1).contiguous()
     segs = F.interpolate(
         segs_tensor.unsqueeze(0),
         size=(256, 256),
@@ -627,27 +657,117 @@ def prepare_sam_masks(sam_mask_helper, img_name, image_size, transform, precisio
     return segs, segs_origin
 
 
+class VIGORTestDataset(Dataset):
+    """测试阶段预加载单个 sample 的静态视觉输入。"""
+
+    def __init__(
+        self,
+        samples: List[Dict],
+        clip_image_processor,
+        transform,
+        sam_mask_helper,
+        image_size: int,
+        precision: str,
+    ):
+        self.samples = samples
+        self.clip_image_processor = clip_image_processor
+        self.transform = transform
+        self.sam_mask_helper = sam_mask_helper
+        self.image_size = image_size
+        self.precision = precision
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        try:
+            image_path = sample['image_path']
+            image_np = cv2.imread(image_path)
+            if image_np is None:
+                raise ValueError(f"Failed to load image: {image_path}")
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+            gt_masks = []
+            for gp in sample['gt_mask_paths']:
+                m = cv2.imread(gp, cv2.IMREAD_GRAYSCALE)
+                if m is not None:
+                    gt_masks.append(m)
+            if not gt_masks:
+                raise ValueError(f"No valid GT masks for: {image_path}")
+
+            segs, segs_origin = prepare_sam_masks(
+                self.sam_mask_helper,
+                sample['img_name'],
+                self.image_size,
+                self.transform,
+                self.precision,
+            )
+            image_clip_np = self.clip_image_processor.preprocess(
+                image_np, return_tensors="np"
+            )["pixel_values"][0]
+            image_clip = numpy_to_torch(image_clip_np, torch.float32)
+            image_tensor, resize = preprocess_image(
+                image_np, self.transform, self.image_size
+            )
+
+            return {
+                "sample": sample,
+                "image_np": image_np,
+                "gt_masks": gt_masks,
+                "segs": segs,
+                "segs_origin": segs_origin,
+                "image_clip": image_clip,
+                "image_tensor": image_tensor,
+                "resize": resize,
+                "ori_size": image_np.shape[:2],
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "sample": sample,
+                "error": repr(e),
+            }
+
+
+def collate_single_sample(batch):
+    return batch[0]
+
+
+def build_test_loader(samples, clip_image_processor, transform, sam_mask_helper, args):
+    dataset = VIGORTestDataset(
+        samples=samples,
+        clip_image_processor=clip_image_processor,
+        transform=transform,
+        sam_mask_helper=sam_mask_helper,
+        image_size=args.image_size,
+        precision=args.precision,
+    )
+    loader_kwargs = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": args.workers,
+        "collate_fn": collate_single_sample,
+    }
+    if args.workers > 0:
+        loader_kwargs["prefetch_factor"] = 1
+    return DataLoader(dataset, **loader_kwargs)
+
+
 def predict_mask_llmseg(
-    model, tokenizer, clip_image_processor, transform,
-    image_np, instruction, sam_mask_helper, args
+    model, tokenizer, prepared_sample: Dict, instruction, args
 ):
     """LLMSeg 预测掩码 - 从 SAM 候选中选择"""
-    ori_size = image_np.shape[:2]
-    img_name = f"{args._current_img_name}"  # 从 args 中获取
-    
-    # 准备 SAM 候选 mask
-    segs, segs_origin = prepare_sam_masks(
-        sam_mask_helper, img_name, args.image_size, transform, args.precision
-    )
+    ori_size = prepared_sample["ori_size"]
+    segs = prepared_sample["segs"]
+    segs_origin = prepared_sample["segs_origin"]
     
     if segs is None:
         return np.ones(ori_size, dtype=np.float32)  # 返回全背景
     
-    # CLIP 图像处理
-    image_clip = clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
-    
-    # SAM 图像处理
-    image_tensor, resize = preprocess_image(image_np, transform, args.image_size)
+    image_clip = prepared_sample["image_clip"]
+    image_tensor = prepared_sample["image_tensor"]
+    resize = prepared_sample["resize"]
     
     # 构建对话
     question = f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"
@@ -710,10 +830,10 @@ def predict_mask_llmseg(
 
 
 def evaluate_sample(
-    model, tokenizer, clip_image_processor, transform,
-    sample: Dict, sam_mask_helper, args, obj_count: int = 1
+    model, tokenizer, prepared_sample: Dict, args, obj_count: int = 1
 ) -> Dict:
     """评估单个样本 (支持多目标 Max-IoU)"""
+    sample = prepared_sample["sample"]
     image_path = sample['image_path']
     gt_mask_paths = sample['gt_mask_paths'] # 这是一个列表
     instructions = sample['instructions']
@@ -721,20 +841,9 @@ def evaluate_sample(
     
     # 设置当前图片名
     args._current_img_name = img_name
-    
-    # 读取图像
-    image_np = cv2.imread(image_path)
-    if image_np is None:
-        return None
-    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-    
-    # 读取所有 GT masks
-    gt_masks = []
-    for gp in gt_mask_paths:
-        m = cv2.imread(gp, cv2.IMREAD_GRAYSCALE)
-        if m is not None:
-            gt_masks.append(m)
-    
+
+    image_np = prepared_sample["image_np"]
+    gt_masks = prepared_sample["gt_masks"]
     if not gt_masks:
         return None
     
@@ -747,8 +856,7 @@ def evaluate_sample(
     
     for instr_idx, instruction in enumerate(instructions[:3]):
         pred_mask = predict_mask_llmseg(
-            model, tokenizer, clip_image_processor, transform,
-            image_np, instruction, sam_mask_helper, args
+            model, tokenizer, prepared_sample, instruction, args
         )
         
         # 调整大小
@@ -809,6 +917,9 @@ def evaluate_sample(
 
 def main(args):
     args = parse_args(args)
+
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.set_device(torch.device(args.device))
     
     # 解析 ICR 阈值
     icr_thresholds = [float(t) for t in args.icr_thresholds.split(",")]
@@ -854,9 +965,14 @@ def main(args):
     print(f"  Easy 样本数: {len(easy_samples)}")
     print(f"  Hard 样本数: {len(hard_samples)}")
     print(f"  SAM 候选 mask 目录: {args.sam_masks_dir}")
+    print(f"  DataLoader workers: {args.workers}")
     
     # 存储结果
     results = {
+        'easy': [],
+        'hard': [],
+    }
+    skipped_errors = {
         'easy': [],
         'hard': [],
     }
@@ -866,20 +982,28 @@ def main(args):
     print("  测试 Easy 样本")
     print("=" * 60)
     easy_seen_counts = defaultdict(int)
-    for sample in tqdm(easy_samples, desc="Easy"):
+    easy_loader = build_test_loader(
+        easy_samples, clip_image_processor, transform, sam_mask_helper, args
+    )
+    for prepared_sample in tqdm(easy_loader, desc="Easy"):
+        sample = prepared_sample.get("sample", {})
         try:
+            if prepared_sample.get("error"):
+                raise RuntimeError(prepared_sample["error"])
             img_name = sample['img_name']
             obj_name = sample['gt_object']
             easy_seen_counts[(img_name, obj_name)] += 1
             curr_count = easy_seen_counts[(img_name, obj_name)]
             
             result = evaluate_sample(
-                model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args, obj_count=curr_count
+                model, tokenizer, prepared_sample, args, obj_count=curr_count
             )
             if result:
                 results['easy'].append(result)
         except Exception as e:
+            skipped_errors['easy'].append((sample.get('image_path', 'unknown'), repr(e)))
+            if len(skipped_errors['easy']) <= 5:
+                print(f"  [Easy Error] {sample.get('image_path', 'unknown')}: {e}")
             if args.debug:
                 print(f"  [Error] {sample['image_path']}: {e}")
     
@@ -888,20 +1012,28 @@ def main(args):
     print("  测试 Hard 样本")
     print("=" * 60)
     hard_seen_counts = defaultdict(int)
-    for sample in tqdm(hard_samples, desc="Hard"):
+    hard_loader = build_test_loader(
+        hard_samples, clip_image_processor, transform, sam_mask_helper, args
+    )
+    for prepared_sample in tqdm(hard_loader, desc="Hard"):
+        sample = prepared_sample.get("sample", {})
         try:
+            if prepared_sample.get("error"):
+                raise RuntimeError(prepared_sample["error"])
             img_name = sample['img_name']
             obj_name = sample['gt_object']
             hard_seen_counts[(img_name, obj_name)] += 1
             curr_count = hard_seen_counts[(img_name, obj_name)]
             
             result = evaluate_sample(
-                model, tokenizer, clip_image_processor, transform,
-                sample, sam_mask_helper, args, obj_count=curr_count
+                model, tokenizer, prepared_sample, args, obj_count=curr_count
             )
             if result:
                 results['hard'].append(result)
         except Exception as e:
+            skipped_errors['hard'].append((sample.get('image_path', 'unknown'), repr(e)))
+            if len(skipped_errors['hard']) <= 5:
+                print(f"  [Hard Error] {sample.get('image_path', 'unknown')}: {e}")
             if args.debug:
                 print(f"  [Error] {sample['image_path']}: {e}")
     
@@ -999,7 +1131,14 @@ def main(args):
         
         f.write(f"总样本数: {total_count}\n")
         f.write(f"  Easy: {easy_metrics['count']}\n")
-        f.write(f"  Hard: {hard_metrics['count']}\n\n")
+        f.write(f"  Hard: {hard_metrics['count']}\n")
+        f.write(f"跳过样本数: Easy={len(skipped_errors['easy'])}, Hard={len(skipped_errors['hard'])}\n")
+        if skipped_errors['easy'] or skipped_errors['hard']:
+            f.write("跳过样本错误示例:\n")
+            for split_name in ['easy', 'hard']:
+                for path, err in skipped_errors[split_name][:5]:
+                    f.write(f"  [{split_name}] {path}: {err}\n")
+        f.write("\n")
         
         f.write("IC-IoU:\n")
         f.write(f"  Easy:    {easy_metrics['ic_iou']:.4f}\n")

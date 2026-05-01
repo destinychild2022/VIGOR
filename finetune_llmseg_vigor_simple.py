@@ -1,4 +1,5 @@
 import argparse
+from datetime import timedelta
 import json
 import os 
 import shutil
@@ -28,6 +29,15 @@ except (ImportError, AttributeError, NameError) as e:
 
 # ✅ 全局变量：收集维度追踪信息（用于记录到SwanLab）
 _dimension_tracking_info = []
+
+
+class NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
 
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
@@ -161,6 +171,12 @@ def parse_args(args):
     parser.add_argument("--robotarm_split_seed", default=0, type=int, help="划分随机种子（保证可复现）")
     parser.add_argument("--log_base_dir", default="./runs", type=str)
     parser.add_argument("--exp_name", default="debug", type=str)
+    parser.add_argument(
+        "--disable_tensorboard",
+        action="store_true",
+        default=False,
+        help="Disable TensorBoard event file writing; useful on flaky network filesystems",
+    )
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
     parser.add_argument(
@@ -174,6 +190,12 @@ def parse_args(args):
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=8, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
+    parser.add_argument(
+        "--distributed_timeout_sec",
+        default=7200,
+        type=int,
+        help="Torch/DeepSpeed distributed collective timeout in seconds.",
+    )
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--align_loss_weight", default=1.0, type=float)
     parser.add_argument("--regression_loss_weight", default=1.0, type=float)
@@ -875,6 +897,48 @@ def collect_learning_rates(model_engine=None, scheduler=None):
     }
 
 
+def init_distributed_with_explicit_timeout(args):
+    """
+    Initialize the process group explicitly so the collective timeout is
+    controlled by this script instead of falling back to a launcher default.
+    """
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    args.world_size = env_world_size if env_world_size > 0 else torch.cuda.device_count()
+    args.distributed = args.world_size > 1
+
+    if args.distributed_timeout_sec <= 0:
+        raise ValueError("--distributed_timeout_sec must be a positive integer")
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
+
+    timeout = timedelta(seconds=int(args.distributed_timeout_sec))
+    args.distributed_timeout = timeout
+
+    if not args.distributed:
+        return False
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if args.local_rank == 0:
+            print(
+                "[信息] torch.distributed 已提前初始化；"
+                "当前脚本无法再覆盖 timeout，继续使用现有进程组。"
+            )
+        return False
+
+    if args.local_rank == 0:
+        print(
+            "[信息] 显式初始化 DeepSpeed distributed，"
+            f"timeout={int(args.distributed_timeout_sec)} 秒"
+        )
+    deepspeed.init_distributed(
+        dist_backend="nccl",
+        timeout=timeout,
+        init_method="env://",
+    )
+    return True
+
+
 def build_checkpoint_client_state(
     args,
     epoch,
@@ -992,12 +1056,20 @@ def main(args):
 
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
-        writer = SummaryWriter(args.log_dir)
+        if args.disable_tensorboard:
+            writer = NullSummaryWriter()
+            print("[信息] TensorBoard event 写入已禁用 (--disable_tensorboard)")
+        else:
+            try:
+                writer = SummaryWriter(args.log_dir)
+            except OSError as e:
+                writer = NullSummaryWriter()
+                print(f"[警告] TensorBoard writer 初始化失败，已自动禁用: {repr(e)}")
         # 初始化 SwanLab
         if SWANLAB_AVAILABLE and swanlab is not None:
             try:
                 # 设置环境变量（参考 finetune_sam_lora_point.py）
-                os.environ['SWANLAB_API_KEY'] = "BBd5HKuM6sIhTwyWmgZ6Z"
+                os.environ['SWANLAB_API_KEY'] = "17UKzqoPx2VI4PLzCHYdH"
                 # 直接初始化（不需要先 login）
                 swanlab.init(
                     project="LLMSeg",
@@ -1025,8 +1097,7 @@ def main(args):
     random.seed(0+args.local_rank)
     np.random.seed(0+args.local_rank)
 
-    world_size = torch.cuda.device_count()
-    args.distributed = world_size > 1
+    dist_initialized_here = init_distributed_with_explicit_timeout(args)
 
     tokenizer = init_tokenizer(args)
     model = init_LISA_model(args, tokenizer)
@@ -1058,6 +1129,7 @@ def main(args):
         model=model,
         model_parameters=model.parameters(),
         config=ds_config,
+        dist_init_required=False if dist_initialized_here else None,
     )
     
     # ✅ 模型已加载到 GPU，释放权重文件的 page cache

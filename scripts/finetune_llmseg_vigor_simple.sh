@@ -20,14 +20,15 @@ VIGOR_VAL_SPLIT="test"
 VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
 VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 # 是否只使用 hard 样本 (不使用 easy 样本)
-VIGOR_ONLY_HARD=true
+VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-new-onlyhard3"
+EXP_NAME="finetune_llmseg_vigor_simple-new"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
+DISABLE_TENSORBOARD=true
 
 # ========== 训练超参数 ==========
 EPOCHS=20
@@ -62,7 +63,8 @@ SAVE_ONLY_TARGET_EPOCH=true
 TARGET_SAVE_EPOCH=20
 
 # ========== 分布式超时配置 ==========
-export NCCL_TIMEOUT=7200000
+DISTRIBUTED_TIMEOUT_SEC=7200
+export NCCL_TIMEOUT=$((DISTRIBUTED_TIMEOUT_SEC * 1000))
 
 # ========================================================================
 
@@ -81,6 +83,7 @@ echo "模型路径: ${MODEL_PATH}"
 echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
+echo "分布式超时: ${DISTRIBUTED_TIMEOUT_SEC}s"
 if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
   echo "权重保存: 每轮保存最新 checkpoint，仅保留一个；到 epoch_${TARGET_SAVE_EPOCH} 后自动停止"
 else
@@ -105,6 +108,9 @@ fi
 if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
   EXTRA_ARGS="${EXTRA_ARGS} --save_only_target_epoch --target_save_epoch=${TARGET_SAVE_EPOCH}"
 fi
+if [ "${DISABLE_TENSORBOARD}" = true ]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --disable_tensorboard"
+fi
 
 # 执行训练
 $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
@@ -125,6 +131,7 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --log_base_dir="${LOG_DIR}" \
   --steps_per_epoch=${STEPS_PER_EPOCH} \
   --lr=${LR} \
+  --distributed_timeout_sec=${DISTRIBUTED_TIMEOUT_SEC} \
   --epochs=${EPOCHS} \
   --checkpoint_save_interval=${CHECKPOINT_SAVE_INTERVAL} \
   --batch_size=${BATCH_SIZE} \

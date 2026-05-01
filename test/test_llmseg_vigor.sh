@@ -8,7 +8,7 @@
 
 # ========== 模型路径配置 ==========
 LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-new-20epochs/ckpt_model/best"
+CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-new/ckpt_model/epoch_20"
 CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
 SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
@@ -20,18 +20,23 @@ SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"
-VIS_DIR="./vis_output_new-best"  # 可视化输出目录
+VIS_DIR="./vis_output_new-20epoch"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
 PRECISION="bf16"
 ICR_THRESHOLDS="0.3,0.4,0.5,0.6,0.7,0.8,0.9"
+LORA_R=8
+LORA_ALPHA=16
+LORA_DROPOUT=0.1
+LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 # ========== 调试配置 ==========
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 GPU_ID="${GPU_ID:-0}"
 SPLIT="${SPLIT:-both}"  # 可选: both, easy, hard
+WORKERS="${WORKERS:-12}"
 
 # ========================================================================
 
@@ -46,6 +51,7 @@ echo "测试数据: ${TEST_DATA_DIR}"
 echo "SAM候选mask: ${SAM_MASKS_DIR}"
 echo "输出目录: ${OUTPUT_DIR}"
 echo "可视化目录: ${VIS_DIR}"
+echo "DataLoader workers: ${WORKERS}"
 echo "========================================================================"
 
 # 构建参数
@@ -60,8 +66,13 @@ ARGS="
     --vis_dir=${VIS_DIR}
     --precision=${PRECISION}
     --icr_thresholds=${ICR_THRESHOLDS}
+    --lora_r=${LORA_R}
+    --lora_alpha=${LORA_ALPHA}
+    --lora_dropout=${LORA_DROPOUT}
+    --lora_target_modules=${LORA_TARGET_MODULES}
     --device="cuda:${GPU_ID}"
     --split=${SPLIT}
+    --workers=${WORKERS}
     --use_mm_start_end
 "
 

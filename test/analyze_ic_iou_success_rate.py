@@ -10,8 +10,6 @@
 import argparse
 import re
 import os
-from collections import defaultdict
-
 
 def parse_ic_iou_values(line: str):
     """
@@ -27,24 +25,49 @@ def parse_ic_iou_values(line: str):
     return []
 
 
+def make_empty_stats(thresholds):
+    return {
+        'values': [],
+        'sample_count': 0,
+        'total_instructions': 0,
+        'passed': {t: 0 for t in thresholds},
+    }
+
+
+def add_values(stats, category, values, thresholds):
+    if not values:
+        return
+
+    bucket = stats[category]
+    bucket['sample_count'] += 1
+    bucket['total_instructions'] += len(values)
+    bucket['values'].extend(values)
+
+    for threshold in thresholds:
+        bucket['passed'][threshold] += sum(1 for v in values if v >= threshold)
+
+
+def mean_value(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def sr_percent(bucket, threshold):
+    total = bucket['total_instructions']
+    return bucket['passed'][threshold] / total * 100 if total else 0.0
+
+
 def analyze_results(input_file: str, output_file: str):
     """分析结果文件并输出统计"""
     
     # 定义阈值
     thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     
-    # 统计数据
+    # 统计数据。hard_first2 / hard_third 都只从 Hard 样本中切分得到。
     stats = {
-        'easy': {
-            'total_instructions': 0,
-            'passed': {t: 0 for t in thresholds},
-            'sample_count': 0,
-        },
-        'hard': {
-            'total_instructions': 0,
-            'passed': {t: 0 for t in thresholds},
-            'sample_count': 0,
-        }
+        'easy': make_empty_stats(thresholds),
+        'hard': make_empty_stats(thresholds),
+        'hard_first2': make_empty_stats(thresholds),
+        'hard_third': make_empty_stats(thresholds),
     }
     
     # 当前解析状态
@@ -69,19 +92,18 @@ def analyze_results(input_file: str, output_file: str):
                 iou_values = parse_ic_iou_values(line)
                 
                 if iou_values:
-                    stats[current_section]['sample_count'] += 1
-                    stats[current_section]['total_instructions'] += len(iou_values)
-                    
-                    # 统计每个阈值下超过的数量
-                    for threshold in thresholds:
-                        passed = sum(1 for v in iou_values if v >= threshold)
-                        stats[current_section]['passed'][threshold] += passed
+                    add_values(stats, current_section, iou_values, thresholds)
+                    if current_section == 'hard':
+                        add_values(stats, 'hard_first2', iou_values[:2], thresholds)
+                        add_values(stats, 'hard_third', iou_values[2:3], thresholds)
     
     # 打印读取统计
     print(f"\n[调试] 文件总行数: {line_count}")
     print(f"[调试] 匹配到的 IC-IoU 行数: {matched_lines}")
     print(f"[调试] Easy 样本数: {stats['easy']['sample_count']}, 指令数: {stats['easy']['total_instructions']}")
     print(f"[调试] Hard 样本数: {stats['hard']['sample_count']}, 指令数: {stats['hard']['total_instructions']}")
+    print(f"[调试] Hard 前2条指令样本数: {stats['hard_first2']['sample_count']}, 指令数: {stats['hard_first2']['total_instructions']}")
+    print(f"[调试] Hard 第3条指令样本数: {stats['hard_third']['sample_count']}, 指令数: {stats['hard_third']['total_instructions']}")
     print("")
     
     # 生成输出报告
@@ -100,56 +122,50 @@ def analyze_results(input_file: str, output_file: str):
     output_lines.append("")
     
     # 表头
-    header = "| Category | #Samples | #Instructions |"
+    header = "| Category | #Samples | #Instructions | IC-IoU |"
     for t in thresholds:
         header += f" SR@{t:.1f} |"
     output_lines.append(header)
     
-    separator = "|----------|----------|---------------|"
+    separator = "|----------|----------|---------------|--------|"
     for _ in thresholds:
         separator += "--------|"
     output_lines.append(separator)
-    
-    # Easy 行
+
     easy = stats['easy']
-    easy_sr = {}
-    row = f"| Easy     | {easy['sample_count']:>8} | {easy['total_instructions']:>13} |"
-    for t in thresholds:
-        if easy['total_instructions'] > 0:
-            sr = easy['passed'][t] / easy['total_instructions'] * 100
-        else:
-            sr = 0.0
-        easy_sr[t] = sr
-        row += f" {sr:>5.2f}% |"
-    output_lines.append(row)
-    
-    # Hard 行
     hard = stats['hard']
-    hard_sr = {}
-    row = f"| Hard     | {hard['sample_count']:>8} | {hard['total_instructions']:>13} |"
-    for t in thresholds:
-        if hard['total_instructions'] > 0:
-            sr = hard['passed'][t] / hard['total_instructions'] * 100
-        else:
-            sr = 0.0
-        hard_sr[t] = sr
-        row += f" {sr:>5.2f}% |"
-    output_lines.append(row)
-    
-    # Average 行（按样本数加权平均）
+    hard_first2 = stats['hard_first2']
+    hard_third = stats['hard_third']
+
     total_samples = easy['sample_count'] + hard['sample_count']
     total_instr = easy['total_instructions'] + hard['total_instructions']
-    avg_sr = {}
-    row = f"| Average  | {total_samples:>8} | {total_instr:>13} |"
+    average = make_empty_stats(thresholds)
+    average['sample_count'] = total_samples
+    average['total_instructions'] = total_instr
+    average['values'] = easy['values'] + hard['values']
     for t in thresholds:
-        if total_samples > 0:
-            # 加权平均：(easy_sr * easy_samples + hard_sr * hard_samples) / total_samples
-            sr = (easy_sr[t] * easy['sample_count'] + hard_sr[t] * hard['sample_count']) / total_samples
-        else:
-            sr = 0.0
-        avg_sr[t] = sr
-        row += f" {sr:>5.2f}% |"
-    output_lines.append(row)
+        average['passed'][t] = easy['passed'][t] + hard['passed'][t]
+
+    rows = [
+        ("Easy", easy),
+        ("Hard", hard),
+        ("Hard-First2", hard_first2),
+        ("Hard-Third", hard_third),
+        ("Average", average),
+    ]
+
+    avg_sr = {}
+    for name, bucket in rows:
+        row = (
+            f"| {name:<12} | {bucket['sample_count']:>8} | "
+            f"{bucket['total_instructions']:>13} | {mean_value(bucket['values']):>6.4f} |"
+        )
+        for t in thresholds:
+            sr = sr_percent(bucket, t)
+            if name == "Average":
+                avg_sr[t] = sr
+            row += f" {sr:>5.2f}% |"
+        output_lines.append(row)
     
     output_lines.append("")
     
@@ -159,20 +175,24 @@ def analyze_results(input_file: str, output_file: str):
     output_lines.append("=" * 80)
     output_lines.append("")
     
-    for category in ['easy', 'hard']:
+    for category in ['easy', 'hard', 'hard_first2', 'hard_third']:
         cat_stats = stats[category]
-        output_lines.append(f"{category.upper()} 样本:")
+        display_name = {
+            'easy': 'EASY',
+            'hard': 'HARD',
+            'hard_first2': 'HARD 前2条 instruction',
+            'hard_third': 'HARD 第3条 instruction',
+        }[category]
+        output_lines.append(f"{display_name}:")
         output_lines.append(f"  样本数: {cat_stats['sample_count']}")
-        output_lines.append(f"  总指令数 (每个样本3条): {cat_stats['total_instructions']}")
+        output_lines.append(f"  总指令数: {cat_stats['total_instructions']}")
+        output_lines.append(f"  平均 IC-IoU: {mean_value(cat_stats['values']):.4f}")
         output_lines.append("")
         
         for t in thresholds:
             passed = cat_stats['passed'][t]
             total = cat_stats['total_instructions']
-            if total > 0:
-                sr = passed / total * 100
-            else:
-                sr = 0.0
+            sr = sr_percent(cat_stats, t)
             output_lines.append(f"  SR@{t:.1f}: {passed}/{total} = {sr:.2f}%")
         output_lines.append("")
     
@@ -180,6 +200,7 @@ def analyze_results(input_file: str, output_file: str):
     output_lines.append("AVERAGE (加权平均):")
     output_lines.append(f"  总样本数: {total_samples}")
     output_lines.append(f"  总指令数: {total_instr}")
+    output_lines.append(f"  平均 IC-IoU: {mean_value(average['values']):.4f}")
     output_lines.append("")
     for t in thresholds:
         output_lines.append(f"  SR@{t:.1f}: {avg_sr[t]:.2f}%")
