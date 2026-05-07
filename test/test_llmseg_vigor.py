@@ -63,6 +63,10 @@ def parse_args(args):
     # 数据集路径
     parser.add_argument("--data_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test",
                         type=str, help="测试数据集路径")
+    parser.add_argument("--easy_json_file", default="open_vocab_grasp_easy_new_1.json",
+                        type=str, help="easy 测试 JSON 文件名")
+    parser.add_argument("--hard_json_file", default="open_vocab_grasp_hard_new_1.json",
+                        type=str, help="hard 测试 JSON 文件名")
     parser.add_argument("--sam_masks_dir", required=True, type=str,
                         help="SAM 候选 mask 目录 (必需)")
     
@@ -109,12 +113,9 @@ def parse_args(args):
 
 
 
-def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
+def load_samples(data_dir: str, json_file_name: str, difficulty: str) -> List[Dict]:
     """加载测试样本 (适配多目标解析)"""
-    # 优先尝试加载 _new_1.json 高质量过滤版本，如果不存在则加载原版
-    json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}_new_1.json")
-    if not os.path.exists(json_file):
-        json_file = os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json")
+    json_file = os.path.join(data_dir, json_file_name)
     
     if not os.path.exists(json_file):
         print(f"  [警告] 文件不存在: {json_file}")
@@ -949,14 +950,14 @@ def main(args):
     print("=" * 60)
     
     print(f"  测试模式 (Split): {args.split}")
-    
+
     easy_samples = []
     hard_samples = []
-    
+
     if args.split in ["easy", "both"]:
-        easy_samples = load_samples(args.data_dir, "easy")
+        easy_samples = load_samples(args.data_dir, args.easy_json_file, "easy")
     if args.split in ["hard", "both"]:
-        hard_samples = load_samples(args.data_dir, "hard")
+        hard_samples = load_samples(args.data_dir, args.hard_json_file, "hard")
     
     if args.max_samples:
         easy_samples = easy_samples[:args.max_samples]

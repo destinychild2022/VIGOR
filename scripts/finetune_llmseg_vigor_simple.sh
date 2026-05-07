@@ -16,6 +16,8 @@ VISION_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 VIGOR_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new"
 VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
+VIGOR_EASY_JSON="open_vocab_grasp_easy_object_2.json"
+VIGOR_HARD_JSON="open_vocab_grasp_hard_object_2.json"
 # SAM候选masks路径
 VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
 VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
@@ -24,7 +26,7 @@ VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
 LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-new"
+EXP_NAME="finetune_llmseg_vigor_simple-newdata"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
@@ -84,6 +86,8 @@ echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
 echo "分布式超时: ${DISTRIBUTED_TIMEOUT_SEC}s"
+echo "Easy JSON: ${VIGOR_EASY_JSON}"
+echo "Hard JSON: ${VIGOR_HARD_JSON}"
 if [ "${SAVE_ONLY_TARGET_EPOCH}" = true ]; then
   echo "权重保存: 每轮保存最新 checkpoint，仅保留一个；到 epoch_${TARGET_SAVE_EPOCH} 后自动停止"
 else
@@ -123,6 +127,8 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --vigor_data_base_dir="${VIGOR_DATA_DIR}" \
   --vigor_split="${VIGOR_TRAIN_SPLIT}" \
   --vigor_val_split="${VIGOR_VAL_SPLIT}" \
+  --vigor_easy_json_file="${VIGOR_EASY_JSON}" \
+  --vigor_hard_json_file="${VIGOR_HARD_JSON}" \
   --vigor_train_sam_masks_dir="${VIGOR_TRAIN_SAM_MASKS}" \
   --vigor_val_sam_masks_dir="${VIGOR_VAL_SAM_MASKS}" \
   --vigor_val_max_samples=${VAL_MAX_SCENE_ID} \

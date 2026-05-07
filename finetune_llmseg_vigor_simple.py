@@ -136,7 +136,8 @@ def parse_args(args):
     )
     # VIGOR-100K数据集参数
     parser.add_argument("--vigor_data_base_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K", type=str, help="VIGOR-100K数据集根目录")
-    parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
+    parser.add_argument("--vigor_easy_json_file", default="open_vocab_grasp_easy_new_1.json", type=str, help="VIGOR easy JSON文件名")
+    parser.add_argument("--vigor_hard_json_file", default="open_vocab_grasp_hard_new_1.json", type=str, help="VIGOR hard JSON文件名")
     parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
     parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR validation split (train/test/unseen)")
     parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
@@ -557,8 +558,6 @@ def init_training_dataset(args, tokenizer):
     # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
         # VIGOR dataset
-        vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_json_file)
-        
         # Create SAM mask helper
         sam_mask_helper = None
         
@@ -571,8 +570,8 @@ def init_training_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_train_sam_masks_dir not specified")
         
-        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy_new_1.json")
-        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard_new_1.json")
+        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_easy_json_file)
+        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_hard_json_file)
 
         def load_vigor_samples(json_file):
             if not os.path.exists(json_file):
@@ -693,7 +692,7 @@ def init_validation_dataset(args, tokenizer):
 
         combined_raw_samples = []
         val_json_dir = os.path.join(args.vigor_data_base_dir, args.vigor_val_split)
-        for json_name in ["open_vocab_grasp_easy_new_1.json", "open_vocab_grasp_hard_new_1.json"]:
+        for json_name in [args.vigor_easy_json_file, args.vigor_hard_json_file]:
             path = os.path.join(val_json_dir, json_name)
             if not os.path.exists(path):
                 print(f"[警告] 找不到验证文件: {path}")
@@ -726,7 +725,7 @@ def init_validation_dataset(args, tokenizer):
         # 使用 VIGORDatasetMultiInstance 并传入我们过滤好的 samples
         # 并禁用 max_samples 限制（即使用全部满足条件的样本）
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=os.path.join(val_json_dir, "open_vocab_grasp_hard_new_1.json"), # 仅路径占位
+            json_path=os.path.join(val_json_dir, args.vigor_hard_json_file), # 仅路径占位
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,

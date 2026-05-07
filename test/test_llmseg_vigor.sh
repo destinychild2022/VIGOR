@@ -8,19 +8,21 @@
 
 # ========== 模型路径配置 ==========
 LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-new/ckpt_model/epoch_20"
+CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-newdata/ckpt_model/epoch_20"
 CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
 SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # ========== 数据集配置 ==========
 # 测试数据集路径
 TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test"
+TEST_EASY_JSON="open_vocab_grasp_easy_object_2.json"
+TEST_HARD_JSON="open_vocab_grasp_hard_object_2.json"
 # SAM 候选 mask 目录 (必需！)
 SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"
-VIS_DIR="./vis_output_new-20epoch"  # 可视化输出目录
+VIS_DIR="./vis_output_newdata"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
@@ -48,6 +50,8 @@ echo "========================================================================"
 echo "基础模型: ${LISA_MODEL_PATH}"
 echo "微调权重: ${CHECKPOINT_PATH}"
 echo "测试数据: ${TEST_DATA_DIR}"
+echo "Easy JSON: ${TEST_EASY_JSON}"
+echo "Hard JSON: ${TEST_HARD_JSON}"
 echo "SAM候选mask: ${SAM_MASKS_DIR}"
 echo "输出目录: ${OUTPUT_DIR}"
 echo "可视化目录: ${VIS_DIR}"
@@ -61,6 +65,8 @@ ARGS="
     --vision_tower=${CLIP_PATH}
     --vision_pretrained=${SAM_VIT_PATH}
     --data_dir=${TEST_DATA_DIR}
+    --easy_json_file=${TEST_EASY_JSON}
+    --hard_json_file=${TEST_HARD_JSON}
     --sam_masks_dir=${SAM_MASKS_DIR}
     --output_dir=${OUTPUT_DIR}
     --vis_dir=${VIS_DIR}
