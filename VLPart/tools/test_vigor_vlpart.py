@@ -167,6 +167,27 @@ def resolve_repo_path(path: str) -> str:
     return str(VLPART_ROOT / expanded)
 
 
+def resolve_optional_repo_path(path: str) -> str:
+    if not path:
+        return path
+    return resolve_repo_path(path)
+
+
+def resolve_cfg_repo_paths(cfg) -> None:
+    box_head = cfg.MODEL.ROI_BOX_HEAD
+    box_head.ZEROSHOT_WEIGHT_PATH = resolve_optional_repo_path(box_head.ZEROSHOT_WEIGHT_PATH)
+    box_head.ZEROSHOT_WEIGHT_INFERENCE_PATH = resolve_optional_repo_path(
+        box_head.ZEROSHOT_WEIGHT_INFERENCE_PATH
+    )
+    box_head.ZEROSHOT_WEIGHT_PATH_GROUP = [
+        resolve_optional_repo_path(path) for path in box_head.ZEROSHOT_WEIGHT_PATH_GROUP
+    ]
+    box_head.CAT_FREQ_PATH = resolve_optional_repo_path(box_head.CAT_FREQ_PATH)
+    box_head.CAT_FREQ_PATH_GROUP = [
+        resolve_optional_repo_path(path) for path in box_head.CAT_FREQ_PATH_GROUP
+    ]
+
+
 def resolve_data_path(data_dir: str, path: str) -> str:
     expanded = Path(path).expanduser()
     if expanded.is_absolute():
@@ -186,6 +207,7 @@ def setup_cfg(args: argparse.Namespace):
         cfg.merge_from_list(args.opts)
 
     cfg.defrost()
+    resolve_cfg_repo_paths(cfg)
     cfg.MODEL.WEIGHTS = resolve_repo_path(args.weights)
     cfg.MODEL.DEVICE = args.device
     cfg.MODEL.RETINANET.SCORE_THRESH_TEST = args.confidence_threshold
