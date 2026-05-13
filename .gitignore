@@ -48,6 +48,17 @@ swanlog/
 vis_output/
 runs/
 sam2
+detectron2/
+
+# VLPart generated artifacts
+VLPart/output*/
+VLPart/instant_test_output/
+VLPart/inference_test_output/
+VLPart/vlpart_vigor_outputs/
+VLPart/vlpart_vigor_outputs_zeroshot/
+VLPart/swanlog/
+VLPart/core
+VLPart/.git/
 
 # Logs and outputs
 *.log

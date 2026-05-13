@@ -1,0 +1,64 @@
+_BASE_: "../joint_in/swinbase_cascade_lvis_paco_pascalpart_partimagenet_inparsed.yaml"
+
+MODEL:
+  # Stage 1 starts from the existing strongest VLPart SwinBase + IN parsed checkpoint.
+  WEIGHTS: "models/swinbase_cascade_lvis_paco_pascalpart_partimagenet_inparsed.pth"
+  ROI_HEADS:
+    NUM_CLASSES: 4
+  ROI_BOX_HEAD:
+    USE_ZEROSHOT_CLS: True
+    USE_ZEROSHOT_CLS_GROUP: True
+    ZEROSHOT_WEIGHT_DIM: 1024
+    ZEROSHOT_WEIGHT_PATH: "datasets/metadata/vigor_easy_clip_RN50_a+cname.npy"
+    ZEROSHOT_WEIGHT_PATH_GROUP: [
+      "datasets/metadata/vigor_easy_clip_RN50_a+cname.npy",
+    ]
+    ZEROSHOT_WEIGHT_INFERENCE_PATH: "datasets/metadata/vigor_easy_clip_RN50_a+cname.npy"
+    IGNORE_ZERO_CATS_GROUP: [False]
+    USE_FED_LOSS_GROUP: [False]
+    CAT_FREQ_PATH_GROUP: [""]
+    MULT_OBJECT_SCORE: True
+    USE_SIGMOID_CE: True
+
+DATASETS:
+  TRAIN: ("vigor_easy_train",)
+  TEST: ()
+
+SOLVER:
+  IMS_PER_BATCH: 16
+  USE_CUSTOM_SOLVER: True
+  OPTIMIZER: "ADAMW"
+  BASE_LR: 0.00004
+  STEPS: (60000, 80000)
+  MAX_ITER: 90000
+  CHECKPOINT_PERIOD: 5000
+
+TEST:
+  EVAL_PERIOD: 0
+
+INPUT:
+  CUSTOM_AUG: ResizeShortestEdge
+  MIN_SIZE_TRAIN_SAMPLING: range
+  MIN_SIZE_TRAIN: (640, 800)
+  MAX_SIZE_TRAIN: 1333
+  MASK_FORMAT: "bitmask"
+  FORMAT: "RGB"
+
+DATALOADER:
+  SAMPLER_TRAIN: "MultiDatasetSampler"
+  DATASET_RATIO: [1]
+  USE_DIFF_BS_SIZE: True
+  DATASET_BS: [8]
+  USE_RFS: [False]
+  DATASET_MIN_SIZES: [[640, 800]]
+  DATASET_MAX_SIZES: [1333]
+  FILTER_EMPTY_ANNOTATIONS: False
+  MULTI_DATASET_GROUPING: True
+  DATASET_ANN: ["part"]
+  STRONG_AUG_ON_PARSED: False
+  NUM_WORKERS: 8
+
+WITH_IMAGE_LABELS: True
+FP16: True
+FIND_UNUSED_PARAM: True
+OUTPUT_DIR: "output/VLPart/vigor_swinbase_easy_stage1_bs16_lr4e-5"
