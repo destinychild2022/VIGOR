@@ -14,13 +14,13 @@ SAM_MODEL_PATH="/opt/data/private/model/SAM-vit-h"
 FINETUNED_CHECKPOINT="/opt/data/private/LLMSeg/SAM_finetune/sam_output/sam_finetuned_vigor_point2/best_model.pth"
 
 # 设置数据集路径
-DATASET_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/unseen"
+DATASET_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test/region_rgb"
 
 # 设置输出目录
-OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/unseen_masks_sam_0.8_0.8"
+OUTPUT_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test/region_rgb_sam_masks"
 
 # 设置GPU
-GPU_IDS="0"
+GPU_IDS="1"
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 # 选择使用的模型（sam2 或 sam）
