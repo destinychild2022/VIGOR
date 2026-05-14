@@ -47,8 +47,8 @@ SAM_finetune/sam_output/
 swanlog/
 vis_output/
 runs/
+graspnet-baseline/
 sam2
-detectron2/
 
 # VLPart generated artifacts
 VLPart/output*/
