@@ -1,0 +1,25 @@
+_BASE_: "swinbase_vigor_easy_stage1.yaml"
+
+MODEL:
+  # GT Object Prior upper-bound experiment starts from the already fine-tuned
+  # VIGOR Stage-1 VLPart checkpoint, then trains on easy+hard VIGOR train JSONs.
+  WEIGHTS: "/opt/data/private/LLMSeg/VLPart/output/VLPart/vigor_swinbase_easy_stage1_bs16_lr4e-5/model_final.pth"
+  META_ARCHITECTURE: VLMRCNNObjectPrior
+  ROI_HEADS:
+    NAME: "CascadeVLMROIHeadsObjectPrior"
+  OBJECT_PRIOR:
+    ENABLED: True
+    MODE: "gt"
+    FPN: True
+    RPN_ROI: True
+    MASK_HEAD: True
+    FPN_ALPHA_INIT: 0.0
+    RPN_ROI_BETA_INIT: 0.1
+    MASK_ALPHA_INIT: 0.0
+    RPN_RERANK: True
+
+DATASETS:
+  TRAIN: ("vigor_easy_hard_train_gt_object_prior",)
+  TEST: ()
+
+OUTPUT_DIR: "output/VLPart/vigor_swinbase_stage1_gt_object_prior_bs16_lr4e-5"
