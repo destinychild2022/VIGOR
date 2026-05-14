@@ -160,7 +160,8 @@ class VLMRCNNObjectPrior(VLMRCNN):
                 device=proposals_per_image.proposal_boxes.tensor.device,
                 dtype=proposals_per_image.proposal_boxes.tensor.dtype,
             )
-            proposals_per_image.object_prior_scores = scores_per_image
+            if not self.training:
+                proposals_per_image.object_prior_scores = scores_per_image
             if proposals_per_image.has("objectness_logits"):
                 proposals_per_image.objectness_logits = (
                     proposals_per_image.objectness_logits

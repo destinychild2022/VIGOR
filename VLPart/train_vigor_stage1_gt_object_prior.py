@@ -28,6 +28,16 @@ _OBJECT_PRIOR_LOG_MODEL = None
 _ORIGINAL_SWANLAB_LOG = train_net._log_swanlab
 
 
+class FineTuneDetectionCheckpointer(DetectionCheckpointer):
+    def resume_or_load(self, path, resume=True):
+        resume_from_output = bool(resume and self.has_checkpoint())
+        checkpoint = super().resume_or_load(path, resume=resume)
+        if not resume_from_output:
+            checkpoint = dict(checkpoint)
+            checkpoint.pop("iteration", None)
+        return checkpoint
+
+
 def _unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -105,6 +115,7 @@ def main(args):
     # Reuse train_net.do_train unchanged, but swap its mapper symbol inside this
     # experiment entrypoint so object_prior is produced by the dataloader.
     train_net.DatasetMapperWithImage = DatasetMapperWithImageObjectPrior
+    train_net.DetectionCheckpointer = FineTuneDetectionCheckpointer
 
     cfg = setup(args)
     model = build_model(cfg)
