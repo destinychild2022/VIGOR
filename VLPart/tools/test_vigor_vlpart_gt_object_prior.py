@@ -294,6 +294,69 @@ def output_stem(sample: Dict, ordinal: int) -> str:
     return f"{ordinal:06d}_{safe_name(base)}_{obj}_ins{instruction_index:02d}"
 
 
+def raw_sample_key(sample: Dict) -> Tuple[str, int, str]:
+    return (
+        str(sample.get("difficulty", "")),
+        int(sample.get("sample_index", -1)),
+        str(sample.get("scene", "")),
+    )
+
+
+def compute_foreground_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    fg_a = mask_a.astype(bool)
+    fg_b = mask_b.astype(bool)
+    if fg_a.shape != fg_b.shape:
+        h, w = fg_b.shape
+        fg_a = cv2.resize(
+            fg_a.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+    intersection = np.logical_and(fg_a, fg_b).sum()
+    union = np.logical_or(fg_a, fg_b).sum()
+    if union == 0:
+        return 0.0
+    return float(intersection) / float(union)
+
+
+def compute_icr_score(iou_pairs: List[float], threshold: float) -> int:
+    return sum(1 for iou in iou_pairs if iou >= threshold)
+
+
+def compute_icr_metrics(icr_records: List[Dict], threshold: float) -> Dict:
+    scores = [
+        compute_icr_score(record.get("iou_pairs", []), threshold)
+        for record in icr_records
+        if len(record.get("iou_pairs", [])) >= 3
+    ]
+    if not scores:
+        return {"icr": 0.0, "count": 0, "threshold": threshold}
+    return {
+        "icr": float(np.mean(scores)),
+        "count": len(scores),
+        "threshold": threshold,
+    }
+
+
+def filter_instruction_group(results: List[Dict], group: str) -> List[Dict]:
+    if group == "first2":
+        return [r for r in results if int(r.get("instruction_index", -1)) in (0, 1)]
+    if group == "third":
+        return [r for r in results if int(r.get("instruction_index", -1)) == 2]
+    raise ValueError(f"Unknown instruction group: {group}")
+
+
+def compute_split_summary(easy_results: List[Dict], hard_results: List[Dict], threshold: float) -> Dict:
+    easy_metrics = compute_metrics(easy_results, threshold)
+    hard_metrics = compute_metrics(hard_results, threshold)
+    return {
+        "easy": easy_metrics,
+        "hard": hard_metrics,
+        "avg_ic_iou": weighted_average(easy_metrics, hard_metrics, "ic_iou"),
+        "avg_ssr": weighted_average(easy_metrics, hard_metrics, "ssr"),
+        "total_count": easy_metrics["count"] + hard_metrics["count"],
+        "total_success": easy_metrics["success_count"] + hard_metrics["success_count"],
+    }
+
+
 def evaluate_split(
     split_name: str,
     samples: List[Dict],
@@ -303,8 +366,40 @@ def evaluate_split(
 ):
     results = []
     skipped = []
+    icr_records = []
+    current_key = None
+    current_predictions = []
+
+    def flush_icr_record():
+        nonlocal current_key, current_predictions
+        if current_key is None:
+            return
+        first_three = {}
+        for instruction_index, pred_mask in current_predictions:
+            if instruction_index in (0, 1, 2) and instruction_index not in first_three:
+                first_three[instruction_index] = pred_mask
+        if len(first_three) >= 3:
+            iou_pairs = [
+                compute_foreground_iou(first_three[0], first_three[1]),
+                compute_foreground_iou(first_three[0], first_three[2]),
+                compute_foreground_iou(first_three[1], first_three[2]),
+            ]
+            icr_records.append(
+                {
+                    "sample_key": current_key,
+                    "iou_pairs": iou_pairs,
+                }
+            )
+        current_predictions = []
 
     for ordinal, sample in enumerate(tqdm(samples, desc=split_name.capitalize()), start=1):
+        sample_key = raw_sample_key(sample)
+        if current_key is None:
+            current_key = sample_key
+        elif sample_key != current_key:
+            flush_icr_record()
+            current_key = sample_key
+
         try:
             best = evaluate_sample_candidates(sample, demo, args, pred_cache)
             iou = best["iou"]
@@ -312,6 +407,7 @@ def evaluate_split(
             image_bgr = best["image_bgr"]
             pred_fg = best["pred_fg"]
             pred_info = best["pred_info"]
+            instruction_index = int(sample.get("instruction_index", 0))
 
             selected_sample = dict(sample)
             selected_sample["image_path"] = best["image_path"]
@@ -339,8 +435,10 @@ def evaluate_split(
                     "gt_mask_path": best["gt_mask_path"],
                     "object_prior_mask_path": best["object_prior_mask_path"],
                     "gt_object": sample["gt_object"],
+                    "sample_index": sample.get("sample_index", -1),
+                    "scene": sample.get("scene", ""),
                     "instruction": sample.get("instruction", ""),
-                    "instruction_index": sample.get("instruction_index", 0),
+                    "instruction_index": instruction_index,
                     "difficulty": sample["difficulty"],
                     "iou": iou,
                     "ic_ious": [iou],
@@ -356,12 +454,15 @@ def evaluate_split(
                     "candidate_gt_count": len(sample["gt_mask_paths"]),
                 }
             )
+            if instruction_index in (0, 1, 2):
+                current_predictions.append((instruction_index, pred_fg.copy()))
         except Exception as exc:
             skipped.append((sample.get("image_path", "unknown"), repr(exc)))
             if len(skipped) <= 5 or args.debug:
                 print(f"  [{split_name} Error] {sample.get('image_path', 'unknown')}: {exc}")
 
-    return results, skipped
+    flush_icr_record()
+    return results, skipped, icr_records
 
 
 def write_sample_result(f, split_title: str, index: int, result: Dict) -> None:
@@ -383,13 +484,42 @@ def write_sample_result(f, split_title: str, index: int, result: Dict) -> None:
     f.write("\n")
 
 
-def write_results(args, easy_results, hard_results, skipped_errors):
-    easy_metrics = compute_metrics(easy_results, args.ssr_threshold)
-    hard_metrics = compute_metrics(hard_results, args.ssr_threshold)
-    total_count = easy_metrics["count"] + hard_metrics["count"]
-    avg_ic_iou = weighted_average(easy_metrics, hard_metrics, "ic_iou")
-    avg_ssr = weighted_average(easy_metrics, hard_metrics, "ssr")
-    total_success = easy_metrics["success_count"] + hard_metrics["success_count"]
+def write_instruction_group_row(f, title: str, summary: Dict) -> None:
+    easy_metrics = summary["easy"]
+    hard_metrics = summary["hard"]
+    f.write(
+        f"| {title} | {easy_metrics['ic_iou']:.4f} | "
+        f"{hard_metrics['ic_iou']:.4f} | {summary['avg_ic_iou']:.4f} | "
+        f"{easy_metrics['ssr']:.4f} | {hard_metrics['ssr']:.4f} | "
+        f"{summary['avg_ssr']:.4f} |\n"
+    )
+
+
+def write_results(
+    args,
+    easy_results,
+    hard_results,
+    skipped_errors,
+    easy_icr_records,
+    hard_icr_records,
+):
+    all_summary = compute_split_summary(easy_results, hard_results, args.ssr_threshold)
+    first2_summary = compute_split_summary(
+        filter_instruction_group(easy_results, "first2"),
+        filter_instruction_group(hard_results, "first2"),
+        args.ssr_threshold,
+    )
+    third_summary = compute_split_summary(
+        filter_instruction_group(easy_results, "third"),
+        filter_instruction_group(hard_results, "third"),
+        args.ssr_threshold,
+    )
+    easy_metrics = all_summary["easy"]
+    hard_metrics = all_summary["hard"]
+    easy_icr_metrics = compute_icr_metrics(easy_icr_records, args.icr_threshold)
+    hard_icr_metrics = compute_icr_metrics(hard_icr_records, args.icr_threshold)
+    avg_icr = weighted_average(easy_icr_metrics, hard_icr_metrics, "icr")
+    total_icr_count = easy_icr_metrics["count"] + hard_icr_metrics["count"]
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -406,23 +536,52 @@ def write_results(args, easy_results, hard_results, skipped_errors):
         f.write("Instruction text: not fed into VLPart; each instruction counted once\n")
         f.write(f"Vocabulary: {args.custom_vocabulary if args.vocabulary == 'custom' else args.vocabulary}\n")
         f.write(f"Mask selection: {args.mask_selection}\n")
-        f.write(f"Confidence threshold: {args.confidence_threshold}\n\n")
+        f.write(f"Confidence threshold: {args.confidence_threshold}\n")
+        f.write(f"SSR threshold: {args.ssr_threshold}\n")
+        f.write(f"ICR threshold: {args.icr_threshold}\n\n")
 
         f.write(
             "| Method | IC-IoU Easy | IC-IoU Hard | IC-IoU Avg | "
-            "SSR Easy | SSR Hard | SSR Avg |\n"
+            f"SSR Easy | SSR Hard | SSR Avg | ICR@{args.icr_threshold:.1f} Easy | "
+            f"ICR@{args.icr_threshold:.1f} Hard | ICR@{args.icr_threshold:.1f} Avg |\n"
         )
         f.write(
             f"| VLPart+GTObjectPrior | {easy_metrics['ic_iou']:.4f} | "
-            f"{hard_metrics['ic_iou']:.4f} | {avg_ic_iou:.4f} | "
-            f"{easy_metrics['ssr']:.4f} | {hard_metrics['ssr']:.4f} | {avg_ssr:.4f} |\n\n"
+            f"{hard_metrics['ic_iou']:.4f} | {all_summary['avg_ic_iou']:.4f} | "
+            f"{easy_metrics['ssr']:.4f} | {hard_metrics['ssr']:.4f} | "
+            f"{all_summary['avg_ssr']:.4f} | {easy_icr_metrics['icr']:.4f} | "
+            f"{hard_icr_metrics['icr']:.4f} | {avg_icr:.4f} |\n\n"
         )
 
-        f.write(f"总 instruction 样本数: {total_count}\n")
+        f.write(f"总 instruction 样本数: {all_summary['total_count']}\n")
         f.write(f"  Easy: {easy_metrics['count']}\n")
         f.write(f"  Hard: {hard_metrics['count']}\n")
-        f.write(f"成功数: {total_success} / {total_count}\n")
+        f.write(f"成功数: {all_summary['total_success']} / {all_summary['total_count']}\n")
         f.write(f"跳过样本数: Easy={len(skipped_errors['easy'])}, Hard={len(skipped_errors['hard'])}\n\n")
+
+        f.write("=" * 80 + "\n")
+        f.write("  Instruction group IC-IoU 和 SSR\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(
+            "| Instruction Group | IC-IoU Easy | IC-IoU Hard | IC-IoU Avg | "
+            f"SSR@{args.ssr_threshold:.1f} Easy | SSR@{args.ssr_threshold:.1f} Hard | "
+            f"SSR@{args.ssr_threshold:.1f} Avg |\n"
+        )
+        write_instruction_group_row(f, "All instructions", all_summary)
+        write_instruction_group_row(f, "First 2 instructions", first2_summary)
+        write_instruction_group_row(f, "Third instruction", third_summary)
+        f.write("\n")
+
+        f.write(f"ICR@{args.icr_threshold:.1f} (3 pairwise predictions per raw sample):\n")
+        f.write(
+            f"  Easy:    {easy_icr_metrics['icr']:.4f} "
+            f"({easy_icr_metrics['count']} samples)\n"
+        )
+        f.write(
+            f"  Hard:    {hard_icr_metrics['icr']:.4f} "
+            f"({hard_icr_metrics['count']} samples)\n"
+        )
+        f.write(f"  Average: {avg_icr:.4f} ({total_icr_count} samples)\n\n")
 
         for split_name in ["easy", "hard"]:
             if skipped_errors[split_name]:
@@ -497,16 +656,18 @@ def main() -> None:
     print("  Instruction text input: disabled")
     print(f"  Mask selection: {args.mask_selection}")
     print(f"  SSR threshold: {args.ssr_threshold}")
+    print(f"  ICR threshold: {args.icr_threshold}")
 
     pred_cache = PredictionCache(args.prediction_cache_size)
     results = {"easy": [], "hard": []}
     skipped_errors = {"easy": [], "hard": []}
+    icr_records = {"easy": [], "hard": []}
 
     if easy_samples:
         print("\n" + "=" * 60)
         print("  Testing Easy instruction samples")
         print("=" * 60)
-        results["easy"], skipped_errors["easy"] = evaluate_split(
+        results["easy"], skipped_errors["easy"], icr_records["easy"] = evaluate_split(
             "easy", easy_samples, demo, args, pred_cache
         )
 
@@ -514,7 +675,7 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("  Testing Hard instruction samples")
         print("=" * 60)
-        results["hard"], skipped_errors["hard"] = evaluate_split(
+        results["hard"], skipped_errors["hard"], icr_records["hard"] = evaluate_split(
             "hard", hard_samples, demo, args, pred_cache
         )
 
@@ -523,12 +684,26 @@ def main() -> None:
         easy_results=results["easy"],
         hard_results=results["hard"],
         skipped_errors=skipped_errors,
+        easy_icr_records=icr_records["easy"],
+        hard_icr_records=icr_records["hard"],
     )
 
-    easy_metrics = compute_metrics(results["easy"], args.ssr_threshold)
-    hard_metrics = compute_metrics(results["hard"], args.ssr_threshold)
-    avg_iou = weighted_average(easy_metrics, hard_metrics, "ic_iou")
-    avg_ssr = weighted_average(easy_metrics, hard_metrics, "ssr")
+    all_summary = compute_split_summary(results["easy"], results["hard"], args.ssr_threshold)
+    first2_summary = compute_split_summary(
+        filter_instruction_group(results["easy"], "first2"),
+        filter_instruction_group(results["hard"], "first2"),
+        args.ssr_threshold,
+    )
+    third_summary = compute_split_summary(
+        filter_instruction_group(results["easy"], "third"),
+        filter_instruction_group(results["hard"], "third"),
+        args.ssr_threshold,
+    )
+    easy_metrics = all_summary["easy"]
+    hard_metrics = all_summary["hard"]
+    easy_icr_metrics = compute_icr_metrics(icr_records["easy"], args.icr_threshold)
+    hard_icr_metrics = compute_icr_metrics(icr_records["hard"], args.icr_threshold)
+    avg_icr = weighted_average(easy_icr_metrics, hard_icr_metrics, "icr")
 
     print("\n" + "=" * 60)
     print("  VLPart GT Object Prior evaluation finished")
@@ -536,11 +711,27 @@ def main() -> None:
     print(f"Result file: {result_file}")
     print(
         f"IC-IoU: Easy={easy_metrics['ic_iou']:.4f}, "
-        f"Hard={hard_metrics['ic_iou']:.4f}, Avg={avg_iou:.4f}"
+        f"Hard={hard_metrics['ic_iou']:.4f}, Avg={all_summary['avg_ic_iou']:.4f}"
     )
     print(
         f"SSR@{args.ssr_threshold:.1f}: Easy={easy_metrics['ssr']:.4f}, "
-        f"Hard={hard_metrics['ssr']:.4f}, Avg={avg_ssr:.4f}"
+        f"Hard={hard_metrics['ssr']:.4f}, Avg={all_summary['avg_ssr']:.4f}"
+    )
+    print(
+        f"First2 IC-IoU/SSR: Easy={first2_summary['easy']['ic_iou']:.4f}/"
+        f"{first2_summary['easy']['ssr']:.4f}, Hard={first2_summary['hard']['ic_iou']:.4f}/"
+        f"{first2_summary['hard']['ssr']:.4f}, Avg={first2_summary['avg_ic_iou']:.4f}/"
+        f"{first2_summary['avg_ssr']:.4f}"
+    )
+    print(
+        f"Third IC-IoU/SSR: Easy={third_summary['easy']['ic_iou']:.4f}/"
+        f"{third_summary['easy']['ssr']:.4f}, Hard={third_summary['hard']['ic_iou']:.4f}/"
+        f"{third_summary['hard']['ssr']:.4f}, Avg={third_summary['avg_ic_iou']:.4f}/"
+        f"{third_summary['avg_ssr']:.4f}"
+    )
+    print(
+        f"ICR@{args.icr_threshold:.1f}: Easy={easy_icr_metrics['icr']:.4f}, "
+        f"Hard={hard_icr_metrics['icr']:.4f}, Avg={avg_icr:.4f}"
     )
 
 

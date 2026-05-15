@@ -130,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         help="SSR success threshold. SSR counts samples with IoU >= threshold.",
     )
     parser.add_argument(
+        "--icr_threshold",
+        type=float,
+        default=0.7,
+        help="ICR threshold for inter-instruction predicted-mask consistency.",
+    )
+    parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
