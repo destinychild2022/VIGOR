@@ -91,16 +91,22 @@ class LisaMetaModel:
 
         # DINO-V2
         # 优先从本地路径加载权重文件
-        dinov2_local_path = "/opt/data/private/model/dinov2_vitl14"
+        dinov2_local_candidates = [
+            "/root/autodl-tmp/model/dinov2_vitl14",
+            "/opt/data/private/model/dinov2_vitl14",
+        ]
         dinov2_weight_path = None
         
         # 检查本地路径是否有权重文件
-        if os.path.exists(dinov2_local_path):
+        for dinov2_local_path in dinov2_local_candidates:
+            if not os.path.exists(dinov2_local_path):
+                continue
             import glob
             pth_files = glob.glob(os.path.join(dinov2_local_path, "*.pth"))
             if pth_files:
                 dinov2_weight_path = pth_files[0]
                 print(f"Found local DINOv2 weight: {dinov2_weight_path}")
+                break
         
         # ✅ 优先使用本地 torch.hub 缓存，避免测试/训练时触发 GitHub 下载导致 403 rate limit。
         # 获取当前进程的 rank，只有 rank 0 在缺少缓存时才尝试在线加载，其他进程等待。
@@ -111,13 +117,19 @@ class LisaMetaModel:
         use_pretrained = dinov2_weight_path is None
         
         dinov2_vitl14 = None
-        cache_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+        dinov2_cache_candidates = [
+            os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main"),
+            "/root/autodl-tmp/torch_cache/hub/facebookresearch_dinov2_main",
+            os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main"),
+        ]
+        cache_dir = next((path for path in dinov2_cache_candidates if os.path.exists(path)), None)
 
         def load_dinov2_from_cache():
-            if not os.path.exists(cache_dir):
+            if cache_dir is None:
                 raise FileNotFoundError(
                     "DINOv2 本地 torch.hub 代码缓存不存在，已禁止在线下载以避免 HTTP 403/rate limit。"
-                    f"请先把 facebookresearch/dinov2 代码放到: {cache_dir}"
+                    "请先把 facebookresearch/dinov2 代码放到以下任一路径: "
+                    + ", ".join(dinov2_cache_candidates)
                 )
             return torch.hub.load(cache_dir, 'dinov2_vitl14', pretrained=False, source='local')
         
@@ -208,8 +220,9 @@ class LisaMetaModel:
 
         # 1x1 conv to reduce the dimension of the image feature to 256
         self.lisa_dino_conv = nn.Conv2d(1024, 256, kernel_size=1, stride=1, padding=0)
+        self.lisa_ego3d_patch_reso = getattr(config, "lisa_ego3d_patch_reso", 2)
         self.lisa_ego3d_pos_embed = Ego3DPositionEmbeddingMLP(
-            in_channels=3,
+            in_channels=self.lisa_ego3d_patch_reso ** 2 * 3,
             num_pos_feats=1024,
             n_freqs=getattr(config, "lisa_ego3d_n_freqs", 8),
         )
@@ -330,27 +343,38 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         if intrinsics.dim() == 2:
             intrinsics = intrinsics.unsqueeze(0).expand(depths.shape[0], -1, -1)
 
+        reso = getattr(self.model, "lisa_ego3d_patch_reso", 2)
         patch_h, patch_w = patch_hw
         depth_h, depth_w = depths.shape[-2:]
-        patch_depth = F.interpolate(depths, size=(patch_h, patch_w), mode="area").squeeze(1)
+        patch_depth = F.interpolate(depths, size=(patch_h * reso, patch_w * reso), mode="area")
         patch_depth = torch.nan_to_num(patch_depth, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        patch_depth = patch_depth.reshape(depths.shape[0], 1, -1)
 
-        ys = (torch.arange(patch_h, device=depths.device, dtype=torch.float32) + 0.5) * (depth_h / patch_h)
-        xs = (torch.arange(patch_w, device=depths.device, dtype=torch.float32) + 0.5) * (depth_w / patch_w)
-        v, u = torch.meshgrid(ys, xs, indexing="ij")
-        u = u.unsqueeze(0)
-        v = v.unsqueeze(0)
+        patch_size_h = depth_h // patch_h
+        patch_size_w = depth_w // patch_w
+        step_h = patch_size_h // reso
+        step_w = patch_size_w // reso
+        if step_h <= 0 or step_w <= 0:
+            raise ValueError(
+                f"Invalid ego3d sampling grid: depth_hw={(depth_h, depth_w)}, "
+                f"patch_hw={patch_hw}, reso={reso}"
+            )
+        ys, xs = torch.meshgrid(
+            torch.arange(0, depth_h, step_h, device=depths.device),
+            torch.arange(0, depth_w, step_w, device=depths.device),
+            indexing="ij",
+        )
+        ys = ys[: patch_h * reso, : patch_w * reso].float() + patch_size_h / reso / 2
+        xs = xs[: patch_h * reso, : patch_w * reso].float() + patch_size_w / reso / 2
+        uv_h = torch.stack([xs, ys, torch.ones_like(xs)], dim=0).reshape(3, -1)
 
-        fx = intrinsics[:, 0, 0].view(-1, 1, 1).clamp_min(1e-6)
-        fy = intrinsics[:, 1, 1].view(-1, 1, 1).clamp_min(1e-6)
-        cx = intrinsics[:, 0, 2].view(-1, 1, 1)
-        cy = intrinsics[:, 1, 2].view(-1, 1, 1)
-
-        z = patch_depth
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        xyz = torch.stack([x, y, z], dim=-1).reshape(depths.shape[0], patch_h * patch_w, 3)
-        return xyz
+        p_cam = (torch.linalg.inv(intrinsics) @ uv_h) * patch_depth
+        patch_p_cam = (
+            p_cam.reshape(depths.shape[0], 3, patch_h, reso, patch_w, reso)
+            .permute(0, 2, 4, 3, 5, 1)
+            .reshape(depths.shape[0], patch_h * patch_w, reso * reso * 3)
+        )
+        return patch_p_cam
 
     def get_ego3d_position_embs(
         self,

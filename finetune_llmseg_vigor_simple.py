@@ -26,6 +26,20 @@ except (ImportError, AttributeError, NameError) as e:
     SWANLAB_AVAILABLE = False
     print(f"Warning: swanlab not available ({e}), training will continue without SwanLab logging")
 
+# SwanLab API key can be explicitly defined in local_secrets.py:
+#   SWANLAB_API_KEY = "your-swanlab-api-key"
+# local_secrets.py is ignored by git, so the real key stays local.
+SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", "").strip()
+try:
+    from local_secrets import SWANLAB_API_KEY as LOCAL_SWANLAB_API_KEY
+    if LOCAL_SWANLAB_API_KEY:
+        SWANLAB_API_KEY = str(LOCAL_SWANLAB_API_KEY).strip()
+except ImportError:
+    pass
+
+if SWANLAB_API_KEY:
+    os.environ["SWANLAB_API_KEY"] = SWANLAB_API_KEY
+
 # ✅ 全局变量：收集维度追踪信息（用于记录到SwanLab）
 _dimension_tracking_info = []
 
@@ -102,7 +116,7 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
-        "--version", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/LISA_Plus_7b"
+        "--version", default="/root/autodl-tmp/model/LISA_Plus_7b"
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -116,7 +130,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/clip-vit-large-patch14-2", type=str
+        "--vision-tower", default="/root/autodl-tmp/model/clip-vit-large-patch14", type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -125,13 +139,13 @@ def parse_args(args):
         "--dataset", default="refer_seg||reason_seg", type=str
     )
     # VIGOR-100K数据集参数
-    parser.add_argument("--vigor_data_base_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K", type=str, help="VIGOR-100K数据集根目录")
+    parser.add_argument("--vigor_data_base_dir", default="/root/autodl-tmp/VIGOR-100K_new", type=str, help="VIGOR-100K数据集根目录")
     parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
     parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
     parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR validation split (train/test/unseen)")
     parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
-    parser.add_argument("--vigor_train_sam_masks_dir", default=None, type=str, help="VIGOR train SAM masks directory")
-    parser.add_argument("--vigor_val_sam_masks_dir", default=None, type=str, help="VIGOR val SAM masks directory")
+    parser.add_argument("--vigor_train_sam_masks_dir", default="/root/autodl-tmp/train_masks_sam_0.8_0.8", type=str, help="VIGOR train SAM masks directory")
+    parser.add_argument("--vigor_val_sam_masks_dir", default="/root/autodl-tmp/test_mask/sam_masks3", type=str, help="VIGOR val SAM masks directory")
     parser.add_argument("--vigor_val_max_samples", default=2, type=int, help="Max samples for VIGOR validation set")
     parser.add_argument("--vigor_only_hard", action="store_true", default=False, help="Only load hard samples for VIGOR dataset (skip easy samples)")
     parser.add_argument("--vigor_max_instructions", default=3, type=int, help="Max instructions per sample (1, 2, or 3)")
@@ -159,7 +173,7 @@ def parse_args(args):
     parser.add_argument("--robotarm_max_per_view", default=100, type=int, help="每个视角最多使用前N张（用于构建300样本池）")
     parser.add_argument("--robotarm_val_ratio", default=0.1, type=float, help="从样本池中划分到验证集的比例（默认0.1，即9:1）")
     parser.add_argument("--robotarm_split_seed", default=0, type=int, help="划分随机种子（保证可复现）")
-    parser.add_argument("--log_base_dir", default="./runs", type=str)
+    parser.add_argument("--log_base_dir", default="/root/autodl-tmp/runs", type=str)
     parser.add_argument("--exp_name", default="debug", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
@@ -173,6 +187,12 @@ def parse_args(args):
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=8, type=int)
+    parser.add_argument(
+        "--val_workers",
+        default=None,
+        type=int,
+        help="number of validation dataloader workers; defaults to --workers when unset",
+    )
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--align_loss_weight", default=1.0, type=float)
@@ -188,7 +208,7 @@ def parse_args(args):
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
-    parser.add_argument("--vision_pretrained", default="/mnt/data-oss/rap-prod-bak/GLOVER/model/LLM-Seg-deepspeed", type=str)
+    parser.add_argument("--vision_pretrained", default="/root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--resume", default="", type=str)
@@ -759,6 +779,8 @@ def init_deepseed_config(args):
 
 def main(args):
     args = parse_args(args)
+    if args.val_workers is None:
+        args.val_workers = args.workers
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
 
     if args.local_rank == 0:
@@ -861,7 +883,7 @@ def main(args):
             val_dataset,
             batch_size=args.val_batch_size,
             shuffle=False,
-            num_workers=args.workers,
+            num_workers=args.val_workers,
             pin_memory=False,
             sampler=val_sampler,
             collate_fn=partial(
@@ -875,18 +897,23 @@ def main(args):
 
     # resume deepspeed checkpoint
     if args.auto_resume and len(args.resume) == 0:
-        # 自动寻找最新的 epoch_X 存档
         ckpt_base = os.path.join(args.log_dir, "ckpt_model")
         if os.path.exists(ckpt_base):
             import re
-            epoch_dirs = [d for d in os.listdir(ckpt_base) if re.match(r"epoch_\d+$", d)]
-            if epoch_dirs:
-                # 按 epoch 数字排序，取最大的
-                epoch_dirs.sort(key=lambda x: int(x.split("_")[1]))
-                resume = os.path.join(ckpt_base, epoch_dirs[-1])
-                args.resume = resume
+            latest_dir = os.path.join(ckpt_base, "latest")
+            if os.path.isdir(latest_dir):
+                args.resume = latest_dir
                 if args.local_rank == 0:
-                    print(f"[信息] 自动恢复：找到最新存档 {resume}")
+                    print(f"[信息] 自动恢复：找到最新权重 {latest_dir}")
+            else:
+                # Backward compatible fallback for older runs that saved epoch_X dirs.
+                epoch_dirs = [d for d in os.listdir(ckpt_base) if re.match(r"epoch_\d+$", d)]
+                epoch_dirs.sort(key=lambda x: int(x.split("_")[1]))
+                if epoch_dirs:
+                    resume = os.path.join(ckpt_base, epoch_dirs[-1])
+                    args.resume = resume
+                    if args.local_rank == 0:
+                        print(f"[信息] 自动恢复：找到旧格式最新存档 {resume}")
 
     best_score, cur_ciou = 0.0, 0.0
     if args.resume:
@@ -963,12 +990,10 @@ def main(args):
                 best_score = max(giou, best_score)
                 cur_ciou = ciou if is_best else cur_ciou
 
-            
-            # ========== 保存权重逻辑 (best + 每5轮定期存档) ==========
-            SAVE_INTERVAL = 5  # 每 5 个 epoch 保存一次定期存档
+            # ========== 保存权重逻辑 (latest + best) ==========
+            latest_save_dir = os.path.join(args.log_dir, "ckpt_model", "latest")
             best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
             
-            # 第一步：每 5 轮保存一个定期存档，按 epoch_X 命名
             real_epoch = epoch + 1  # epoch 从 0 开始，显示时 +1
             try:
                 curr_lr = scheduler.get_last_lr()[0]
@@ -984,34 +1009,32 @@ def main(args):
                 "lr": curr_lr,
                 "args": vars(args),
             }
-            if real_epoch % SAVE_INTERVAL == 0:
-                epoch_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}")
-                temp_save_dir = os.path.join(args.log_dir, "ckpt_model", f"epoch_{real_epoch}_temp")
-                
-                if args.local_rank == 0 and os.path.exists(temp_save_dir):
-                    shutil.rmtree(temp_save_dir, ignore_errors=True)
-                
-                torch.distributed.barrier()
-                
-                if args.local_rank == 0:
-                    print(f"\n[Epoch {real_epoch}] 定期存档 -> {epoch_save_dir}")
-                
-                model_engine.save_checkpoint(temp_save_dir, client_state=client_state)
-                
-                if args.local_rank == 0:
-                    try:
-                        os.makedirs(os.path.dirname(epoch_save_dir), exist_ok=True)
-                        if os.path.exists(epoch_save_dir):
-                            shutil.rmtree(epoch_save_dir, ignore_errors=True)
-                        os.rename(temp_save_dir, epoch_save_dir)
-                        print(f"  [成功] 定期存档已保存: {epoch_save_dir}")
-                    except Exception as e:
-                        print(f"  [警告] 存档重命名失败: {e}，权重暂留在 {temp_save_dir}")
 
-            # 第二步：如果当前是历史最高分，则同步更新 "best"
+            latest_temp_save_dir = os.path.join(args.log_dir, "ckpt_model", "latest_temp")
+            if args.local_rank == 0 and os.path.exists(latest_temp_save_dir):
+                shutil.rmtree(latest_temp_save_dir, ignore_errors=True)
+
+            torch.distributed.barrier()
+
+            if args.local_rank == 0:
+                print(f"\n[Epoch {real_epoch}] 正在保存最新权重 (latest) 到: {latest_save_dir}")
+
+            model_engine.save_checkpoint(latest_temp_save_dir, client_state=client_state)
+
+            if args.local_rank == 0:
+                try:
+                    os.makedirs(os.path.dirname(latest_save_dir), exist_ok=True)
+                    if os.path.exists(latest_save_dir):
+                        shutil.rmtree(latest_save_dir, ignore_errors=True)
+                    os.rename(latest_temp_save_dir, latest_save_dir)
+                    print(f"  [成功] 最新权重已更新: {latest_save_dir}")
+                except Exception as e:
+                    print(f"  [警告] latest 重命名失败: {e}，权重暂留在 {latest_temp_save_dir}")
+
+            # 如果当前是历史最高分，则同步更新 "best"
             if not args.no_eval and is_best:
                 if args.local_rank == 0:
-                    print(f"  [🎉 创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
+                    print(f"  [创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
                     torch.save(
                         {"epoch": epoch, "giou": best_score, "ciou": cur_ciou},
                         os.path.join(

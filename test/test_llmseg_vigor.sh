@@ -8,21 +8,22 @@ set -euo pipefail
 # ========================================================================
 
 # ========== 模型路径配置 ==========
-LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_BASE="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-spatial/ckpt_model"
-CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
-SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+LISA_MODEL_PATH="/root/autodl-tmp/model/LISA_Plus_7b"
+CHECKPOINT_BASE="/root/autodl-tmp/runs/finetune_llmseg_vigor_simple-spatial-1/ckpt_model"
+CLIP_PATH="/root/autodl-tmp/model/clip-vit-large-patch14"
+SAM_VIT_PATH="/root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+export TORCH_HOME="/root/autodl-tmp/torch_cache"
 
 # ========== 数据集配置 ==========
 # 测试数据集路径
-TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test"
+TEST_DATA_DIR="/root/autodl-tmp/VIGOR-100K_new/test"
 DEPTH_DIR="${TEST_DATA_DIR}/depth"
 # SAM 候选 mask 目录 (必需！)
-SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
+SAM_MASKS_DIR="/root/autodl-tmp/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
-OUTPUT_DIR="./result"
-VIS_DIR="./vis_output2_hard"  # 可视化输出目录
+OUTPUT_DIR="/root/autodl-tmp/result"
+VIS_DIR="/root/autodl-tmp/vis_output2_hard"  # 可视化输出目录
 SAVE_VIS="false"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
@@ -39,7 +40,7 @@ MASK_SELECTION_MODE="similarity"
 IOU_THRESHOLD=0.5
 
 # 一次性测试的 checkpoint 子目录。需要改哪些权重就直接改这里。
-CKPT_NAMES="epoch_5 epoch_10 epoch_15 epoch_20"
+CKPT_NAMES="best latest"
 
 # ========== 调试配置 ==========
 DEBUG=0
@@ -62,6 +63,7 @@ echo "========================================================================"
 echo "基础模型: ${LISA_MODEL_PATH}"
 echo "权重根目录: ${CHECKPOINT_BASE}"
 echo "测试权重: ${CKPT_NAMES}"
+echo "Torch Hub缓存: ${TORCH_HOME}/hub"
 echo "测试数据: ${TEST_DATA_DIR}"
 echo "Depth目录: ${DEPTH_DIR}"
 echo "SAM候选mask: ${SAM_MASKS_DIR}"

@@ -50,28 +50,28 @@ IGNORE_LABEL = 255
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LLMSeg VIGOR-100K 测试脚本")
 
-    parser.add_argument("--version", default="/opt/data/private/model/LISA_Plus_7b", type=str)
+    parser.add_argument("--version", default="/root/autodl-tmp/model/LISA_Plus_7b", type=str)
     parser.add_argument(
         "--checkpoint",
-        default="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-spatial/ckpt_model/best",
+        default="/root/autodl-tmp/runs/finetune_llmseg_vigor_simple-spatial-1/ckpt_model/best",
         type=str,
         help="单个 checkpoint 目录，例如 ckpt_model/best 或 ckpt_model/epoch_10",
     )
     parser.add_argument("--checkpoint_tag", default=None, type=str, help="结果文件/可视化子目录使用的权重名")
-    parser.add_argument("--vision_tower", default="/opt/data/private/model/clip-vit-large-patch14", type=str)
+    parser.add_argument("--vision_tower", default="/root/autodl-tmp/model/clip-vit-large-patch14", type=str)
     parser.add_argument(
         "--vision_pretrained",
-        default="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth",
+        default="/root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth",
         type=str,
     )
 
-    parser.add_argument("--data_dir", default="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test", type=str)
+    parser.add_argument("--data_dir", default="/root/autodl-tmp/VIGOR-100K_new/test", type=str)
     parser.add_argument("--sam_masks_dir", required=True, type=str)
     parser.add_argument("--depth_dir", default=None, type=str, help="默认使用 data_dir/depth")
     parser.add_argument("--allow_missing_depth", action="store_true", default=False)
 
-    parser.add_argument("--output_dir", default="./result", type=str)
-    parser.add_argument("--vis_dir", default="./vis_output", type=str)
+    parser.add_argument("--output_dir", default="/root/autodl-tmp/result", type=str)
+    parser.add_argument("--vis_dir", default="/root/autodl-tmp/vis_output", type=str)
     parser.add_argument("--save_vis", action="store_true", default=False)
 
     parser.add_argument("--precision", default="bf16", choices=["fp32", "bf16", "fp16"], type=str)

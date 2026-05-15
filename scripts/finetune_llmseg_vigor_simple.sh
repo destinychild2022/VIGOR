@@ -8,23 +8,24 @@
 # ========================================================================
 
 # ========== 模型路径配置 ==========
-MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
-VISION_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+MODEL_PATH="/root/autodl-tmp/model/LISA_Plus_7b"
+CLIP_PATH="/root/autodl-tmp/model/clip-vit-large-patch14"
+VISION_PATH="/root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth"
+export TORCH_HOME="/root/autodl-tmp/torch_cache"
 
 # ========== VIGOR 数据集配置 ==========
-VIGOR_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new"
+VIGOR_DATA_DIR="/root/autodl-tmp/VIGOR-100K_new"
 VIGOR_TRAIN_SPLIT="train"
 VIGOR_VAL_SPLIT="test"
 # SAM候选masks路径
-VIGOR_TRAIN_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/train_masks_sam_0.8_0.8"
-VIGOR_VAL_SAM_MASKS="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
+VIGOR_TRAIN_SAM_MASKS="/root/autodl-tmp/train_masks_sam_0.8_0.8"
+VIGOR_VAL_SAM_MASKS="/root/autodl-tmp/test_mask/sam_masks3"
 # 是否只使用 hard 样本 (不使用 easy 样本)
 VIGOR_ONLY_HARD=false
 
 # ========== 输出配置 ==========
-LOG_DIR="./runs"
-EXP_NAME="finetune_llmseg_vigor_simple-spatial"
+LOG_DIR="/root/autodl-tmp/runs"
+EXP_NAME="finetune_llmseg_vigor_simple-spatial-1"
 TRAIN_VIS_DIR="train_vis"
 VAL_VIS_DIR="val_vis"
 EVAL_VIS_DIR="eval_vis_iop"
@@ -32,8 +33,10 @@ EVAL_VIS_DIR="eval_vis_iop"
 # ========== 训练超参数 ==========
 EPOCHS=20
 STEPS_PER_EPOCH=1000
-BATCH_SIZE=8
+BATCH_SIZE=16
 GRAD_ACCUMULATION_STEPS=1
+TRAIN_WORKERS=10
+VAL_WORKERS=4
 LR=2e-5
 PRECISION="bf16"
 ALIGN_TEMP=0.05
@@ -51,11 +54,12 @@ LORA_DROPOUT=0.1
 LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 # ========== GPU 配置 ==========
-GPU_IDS="0,1"
+GPU_IDS="0"
 MASTER_PORT=24375
 
 # ========== Checkpoint 配置 ==========
-RESUME_PATH="./runs/finetune_llmseg_vigor_simple-spatial/ckpt_model/best"
+# 留空时训练脚本会优先从 ${LOG_DIR}/${EXP_NAME}/ckpt_model/latest 自动恢复。
+RESUME_PATH=""
 
 # ========== 分布式超时配置 ==========
 # 60 minutes, to avoid validation all-reduce timeout when ranks finish unevenly.
@@ -75,10 +79,13 @@ echo "========================================================================"
 echo "  VIGOR 简化版微调训练"
 echo "========================================================================"
 echo "模型路径: ${MODEL_PATH}"
+echo "Torch Hub缓存: ${TORCH_HOME}/hub"
 echo "数据目录: ${VIGOR_DATA_DIR}"
 echo "GPU 显卡: ${GPU_IDS}"
 echo "实验名称: ${EXP_NAME}"
-echo "权重保存: ckpt_model/best (最优) + epoch_5/10/15/20 (每5轮定期存档)"
+echo "训练Workers: ${TRAIN_WORKERS}"
+echo "验证Workers: ${VAL_WORKERS}"
+echo "权重保存: ckpt_model/latest (最新) + ckpt_model/best (验证集最优)"
 echo "最大验证场景 ID: ${VAL_MAX_SCENE_ID}"
 echo "验证数据: Easy + Hard 混合验证"
 echo "========================================================================"
@@ -111,7 +118,8 @@ $DEEPSPEED_BIN --include localhost:${GPU_IDS} \
   --epochs=${EPOCHS} \
   --batch_size=${BATCH_SIZE} \
   --grad_accumulation_steps=${GRAD_ACCUMULATION_STEPS} \
-  --workers=12 \
+  --workers=${TRAIN_WORKERS} \
+  --val_workers=${VAL_WORKERS} \
   --lora_r=${LORA_R} \
   --lora_alpha=${LORA_ALPHA} \
   --lora_dropout=${LORA_DROPOUT} \

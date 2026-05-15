@@ -21,6 +21,10 @@ env/
 *.swo
 *~
 
+# Local secrets
+local_secrets.py
+.env
+
 # Jupyter Notebook
 .ipynb_checkpoints/
 *.ipynb
