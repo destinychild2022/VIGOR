@@ -66,6 +66,8 @@ def parse_args(args):
     )
 
     parser.add_argument("--data_dir", default="/root/autodl-tmp/VIGOR-100K_new/test", type=str)
+    parser.add_argument("--vigor_easy_json_file", default="open_vocab_grasp_easy_new_1.json", type=str, help="VIGOR easy JSON filename under data_dir")
+    parser.add_argument("--vigor_hard_json_file", default="open_vocab_grasp_hard_new_1.json", type=str, help="VIGOR hard JSON filename under data_dir")
     parser.add_argument("--sam_masks_dir", required=True, type=str)
     parser.add_argument("--depth_dir", default=None, type=str, help="默认使用 data_dir/depth")
     parser.add_argument("--allow_missing_depth", action="store_true", default=False)
@@ -121,14 +123,11 @@ def torch_dtype_from_precision(precision: str):
     return torch.float32
 
 
-def load_samples(data_dir: str, difficulty: str) -> List[Dict]:
-    json_candidates = [
-        os.path.join(data_dir, f"open_vocab_grasp_{difficulty}.json"),
-        os.path.join(data_dir, f"open_vocab_grasp_{difficulty}_new_1.json"),
-    ]
-    json_file = next((path for path in json_candidates if os.path.exists(path)), None)
-    if json_file is None:
-        print(f"  [警告] 文件不存在: {json_candidates[0]} 或 {json_candidates[1]}")
+def load_samples(data_dir: str, difficulty: str, easy_json_file: str, hard_json_file: str) -> List[Dict]:
+    json_name = easy_json_file if difficulty == "easy" else hard_json_file
+    json_file = os.path.join(data_dir, json_name)
+    if not os.path.exists(json_file):
+        print(f"  [警告] {difficulty} JSON 文件不存在: {json_file}")
         return []
 
     with open(json_file, "r", encoding="utf-8") as f:
@@ -776,9 +775,35 @@ def compute_metrics(result_list: List[Dict], icr_thresholds: List[float]) -> Dic
     }
 
 
+def _instruction_values(result_list: List[Dict], instruction_indices: List[int]) -> Tuple[List[float], int]:
+    values = []
+    sample_count = 0
+    for result in result_list:
+        ic_ious = result.get("ic_ious", [])
+        selected = [float(ic_ious[idx]) for idx in instruction_indices if idx < len(ic_ious)]
+        if selected:
+            sample_count += 1
+            values.extend(selected)
+    return values, sample_count
+
+
+def compute_hard_instruction_metrics(hard_results: List[Dict]) -> Dict:
+    first2_values, first2_samples = _instruction_values(hard_results, [0, 1])
+    third_values, third_samples = _instruction_values(hard_results, [2])
+    return {
+        "first2_avg": float(np.mean(first2_values)) if first2_values else 0.0,
+        "first2_count": len(first2_values),
+        "first2_sample_count": first2_samples,
+        "third_avg": float(np.mean(third_values)) if third_values else 0.0,
+        "third_count": len(third_values),
+        "third_sample_count": third_samples,
+    }
+
+
 def write_results(args, results: Dict[str, List[Dict]], icr_thresholds: List[float]):
     easy_metrics = compute_metrics(results["easy"], icr_thresholds)
     hard_metrics = compute_metrics(results["hard"], icr_thresholds)
+    hard_instr_metrics = compute_hard_instruction_metrics(results["hard"])
     total_count = easy_metrics["count"] + hard_metrics["count"]
     if total_count > 0:
         avg_ic_iou = (
@@ -833,6 +858,8 @@ def write_results(args, results: Dict[str, List[Dict]], icr_thresholds: List[flo
         f.write(f"  Hard: {hard_metrics['count']}\n\n")
         f.write(f"IC-IoU Easy: {easy_metrics['ic_iou']:.4f}\n")
         f.write(f"IC-IoU Hard: {hard_metrics['ic_iou']:.4f}\n")
+        f.write(f"IC-IoU Hard 前2条指令 Avg: {hard_instr_metrics['first2_avg']:.4f}\n")
+        f.write(f"IC-IoU Hard 第3条指令 Avg: {hard_instr_metrics['third_avg']:.4f}\n")
         f.write(f"IC-IoU Avg:  {avg_ic_iou:.4f}\n\n")
         f.write("ICR@0.X:\n")
         for t in icr_thresholds:
@@ -886,12 +913,14 @@ def main(cli_args):
     print("=" * 60)
     print("  加载测试数据...")
     print("=" * 60)
-    easy_samples = load_samples(args.data_dir, "easy") if args.split in ["easy", "both"] else []
-    hard_samples = load_samples(args.data_dir, "hard") if args.split in ["hard", "both"] else []
+    easy_samples = load_samples(args.data_dir, "easy", args.vigor_easy_json_file, args.vigor_hard_json_file) if args.split in ["easy", "both"] else []
+    hard_samples = load_samples(args.data_dir, "hard", args.vigor_easy_json_file, args.vigor_hard_json_file) if args.split in ["hard", "both"] else []
     if args.max_samples is not None:
         easy_samples = easy_samples[: args.max_samples]
         hard_samples = hard_samples[: args.max_samples]
     print(f"  测试模式: {args.split}")
+    print(f"  Easy JSON: {args.vigor_easy_json_file}")
+    print(f"  Hard JSON: {args.vigor_hard_json_file}")
     print(f"  Easy 样本数: {len(easy_samples)}")
     print(f"  Hard 样本数: {len(hard_samples)}")
     print(f"  SAM 候选 mask 目录: {args.sam_masks_dir}")

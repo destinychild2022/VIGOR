@@ -9,7 +9,7 @@ set -euo pipefail
 
 # ========== 模型路径配置 ==========
 LISA_MODEL_PATH="/root/autodl-tmp/model/LISA_Plus_7b"
-CHECKPOINT_BASE="/root/autodl-tmp/runs/finetune_llmseg_vigor_simple-spatial-1/ckpt_model"
+CHECKPOINT_BASE="/root/autodl-tmp/runs/finetune_llmseg_vigor_simple-spatial-object/ckpt_model"
 CLIP_PATH="/root/autodl-tmp/model/clip-vit-large-patch14"
 SAM_VIT_PATH="/root/autodl-tmp/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 export TORCH_HOME="/root/autodl-tmp/torch_cache"
@@ -17,13 +17,15 @@ export TORCH_HOME="/root/autodl-tmp/torch_cache"
 # ========== 数据集配置 ==========
 # 测试数据集路径
 TEST_DATA_DIR="/root/autodl-tmp/VIGOR-100K_new/test"
+VIGOR_EASY_JSON_FILE="open_vocab_grasp_easy_object_1.json"
+VIGOR_HARD_JSON_FILE="open_vocab_grasp_hard_object_1.json"
 DEPTH_DIR="${TEST_DATA_DIR}/depth"
 # SAM 候选 mask 目录 (必需！)
 SAM_MASKS_DIR="/root/autodl-tmp/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="/root/autodl-tmp/result"
-VIS_DIR="/root/autodl-tmp/vis_output2_hard"  # 可视化输出目录
+VIS_DIR="/root/autodl-tmp/vis_output_spatial_object"  # 可视化输出目录
 SAVE_VIS="false"  # 是否保存可视化图片 (true/false)
 
 # ========== 测试配置 ==========
@@ -33,6 +35,12 @@ WORKERS=12
 BATCH_SIZE=1
 MAX_INSTRUCTIONS=3
 
+# ========== LoRA 配置 ==========
+LORA_R=8
+LORA_ALPHA=16
+LORA_DROPOUT=0.1
+LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
+
 # 候选 mask 选择方式:
 #   similarity: 选 pred_similarity 最大的单个候选 mask
 #   iou:        合并 pred_iou > IOU_THRESHOLD 的候选 mask（与 validate_threshold 一致）
@@ -40,7 +48,7 @@ MASK_SELECTION_MODE="similarity"
 IOU_THRESHOLD=0.5
 
 # 一次性测试的 checkpoint 子目录。需要改哪些权重就直接改这里。
-CKPT_NAMES="best latest"
+CKPT_NAMES="latest"
 
 # ========== 调试配置 ==========
 DEBUG=0
@@ -65,6 +73,8 @@ echo "权重根目录: ${CHECKPOINT_BASE}"
 echo "测试权重: ${CKPT_NAMES}"
 echo "Torch Hub缓存: ${TORCH_HOME}/hub"
 echo "测试数据: ${TEST_DATA_DIR}"
+echo "Easy JSON: ${VIGOR_EASY_JSON_FILE}"
+echo "Hard JSON: ${VIGOR_HARD_JSON_FILE}"
 echo "Depth目录: ${DEPTH_DIR}"
 echo "SAM候选mask: ${SAM_MASKS_DIR}"
 echo "输出目录: ${OUTPUT_DIR}"
@@ -72,6 +82,7 @@ echo "可视化目录: ${VIS_DIR}"
 echo "候选选择: ${MASK_SELECTION_MODE} (IOU_THRESHOLD=${IOU_THRESHOLD})"
 echo "Workers: ${WORKERS}"
 echo "Batch size: ${BATCH_SIZE}"
+echo "LoRA: r=${LORA_R}, alpha=${LORA_ALPHA}, dropout=${LORA_DROPOUT}, target=${LORA_TARGET_MODULES}"
 echo "Python: ${PYTHON_BIN}"
 echo "========================================================================"
 
@@ -81,6 +92,8 @@ COMMON_ARGS="
     --vision_tower=${CLIP_PATH}
     --vision_pretrained=${SAM_VIT_PATH}
     --data_dir=${TEST_DATA_DIR}
+    --vigor_easy_json_file=${VIGOR_EASY_JSON_FILE}
+    --vigor_hard_json_file=${VIGOR_HARD_JSON_FILE}
     --depth_dir=${DEPTH_DIR}
     --sam_masks_dir=${SAM_MASKS_DIR}
     --precision=${PRECISION}
@@ -90,6 +103,10 @@ COMMON_ARGS="
     --workers=${WORKERS}
     --batch_size=${BATCH_SIZE}
     --max_instructions=${MAX_INSTRUCTIONS}
+    --lora_r=${LORA_R}
+    --lora_alpha=${LORA_ALPHA}
+    --lora_dropout=${LORA_DROPOUT}
+    --lora_target_modules=${LORA_TARGET_MODULES}
     --mask_selection_mode=${MASK_SELECTION_MODE}
     --iou_threshold=${IOU_THRESHOLD}
     --use_mm_start_end

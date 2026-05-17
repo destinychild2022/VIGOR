@@ -140,7 +140,8 @@ def parse_args(args):
     )
     # VIGOR-100K数据集参数
     parser.add_argument("--vigor_data_base_dir", default="/root/autodl-tmp/VIGOR-100K_new", type=str, help="VIGOR-100K数据集根目录")
-    parser.add_argument("--vigor_json_file", default="open_vocab_grasp_easy.json", type=str, help="VIGOR JSON文件名（如open_vocab_grasp_easy.json）")
+    parser.add_argument("--vigor_easy_json_file", default="open_vocab_grasp_easy_new_1.json", type=str, help="VIGOR easy JSON filename under train/test split")
+    parser.add_argument("--vigor_hard_json_file", default="open_vocab_grasp_hard_new_1.json", type=str, help="VIGOR hard JSON filename under train/test split")
     parser.add_argument("--vigor_split", default="train", type=str, help="VIGOR数据集划分（train/test/unseen）")
     parser.add_argument("--vigor_val_split", default="test", type=str, help="VIGOR validation split (train/test/unseen)")
     parser.add_argument("--vigor_max_samples", default=None, type=int, help="Max samples for VIGOR dataset (None for all)")
@@ -193,14 +194,20 @@ def parse_args(args):
         type=int,
         help="number of validation dataloader workers; defaults to --workers when unset",
     )
+    parser.add_argument(
+        "--save_best",
+        action="store_true",
+        default=False,
+        help="save ckpt_model/best when validation reaches a new best score",
+    )
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--align_loss_weight", default=1.0, type=float)
     parser.add_argument("--regression_loss_weight", default=1.0, type=float)
     parser.add_argument("--align_temperature", default=0.1, type=float, help="温度参数，控制softmax分布的尖锐程度。较小的值（如0.05）会使分布更尖锐，较大的值（如0.1-0.2）会使分布更平滑，有助于梯度传播。建议从0.1开始尝试。")
     parser.add_argument("--lora_alpha", default=16, type=int)
-    parser.add_argument("--lora_dropout", default=0.05, type=float)
-    parser.add_argument("--lora_target_modules", default="q_proj,v_proj", type=str)
+    parser.add_argument("--lora_dropout", default=0.1, type=float)
+    parser.add_argument("--lora_target_modules", default="q_proj,k_proj,v_proj,out_proj", type=str)
     parser.add_argument("--explanatory", default=0.1, type=float)
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.95, type=float)
@@ -496,8 +503,6 @@ def init_training_dataset(args, tokenizer):
     # Choose dataset based on --dataset argument
     if args.dataset == "vigor":
         # VIGOR dataset
-        vigor_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_json_file)
-        
         # Create SAM mask helper
         sam_mask_helper = None
         
@@ -510,8 +515,8 @@ def init_training_dataset(args, tokenizer):
         else:
             print("Warning: --vigor_train_sam_masks_dir not specified")
         
-        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_easy_new_1.json")
-        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, "open_vocab_grasp_hard_new_1.json")
+        easy_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_easy_json_file)
+        hard_json_path = os.path.join(args.vigor_data_base_dir, args.vigor_split, args.vigor_hard_json_file)
 
         def load_vigor_samples(json_file):
             if not os.path.exists(json_file):
@@ -632,7 +637,7 @@ def init_validation_dataset(args, tokenizer):
 
         combined_raw_samples = []
         val_json_dir = os.path.join(args.vigor_data_base_dir, args.vigor_val_split)
-        for json_name in ["open_vocab_grasp_easy_new_1.json", "open_vocab_grasp_hard_new_1.json"]:
+        for json_name in [args.vigor_easy_json_file, args.vigor_hard_json_file]:
             path = os.path.join(val_json_dir, json_name)
             if not os.path.exists(path):
                 print(f"[警告] 找不到验证文件: {path}")
@@ -665,7 +670,7 @@ def init_validation_dataset(args, tokenizer):
         # 使用 VIGORDatasetMultiInstance 并传入我们过滤好的 samples
         # 并禁用 max_samples 限制（即使用全部满足条件的样本）
         val_dataset = VIGORDatasetMultiInstance(
-            json_path=os.path.join(val_json_dir, "open_vocab_grasp_hard_new_1.json"), # 仅路径占位
+            json_path=os.path.join(val_json_dir, args.vigor_hard_json_file), # 仅路径占位
             tokenizer=tokenizer,
             vision_tower=args.vision_tower,
             precision=args.precision,
@@ -990,7 +995,7 @@ def main(args):
                 best_score = max(giou, best_score)
                 cur_ciou = ciou if is_best else cur_ciou
 
-            # ========== 保存权重逻辑 (latest + best) ==========
+            # ========== 保存权重逻辑 (latest; optional best) ==========
             latest_save_dir = os.path.join(args.log_dir, "ckpt_model", "latest")
             best_save_dir = os.path.join(args.log_dir, "ckpt_model", "best")
             
@@ -1031,8 +1036,8 @@ def main(args):
                 except Exception as e:
                     print(f"  [警告] latest 重命名失败: {e}，权重暂留在 {latest_temp_save_dir}")
 
-            # 如果当前是历史最高分，则同步更新 "best"
-            if not args.no_eval and is_best:
+            # 如果当前是历史最高分，且显式打开 save_best，则同步更新 "best"
+            if args.save_best and (not args.no_eval) and is_best:
                 if args.local_rank == 0:
                     print(f"  [创新高] 正在保存当前最好权重 (best) 到: {best_save_dir}...")
                     torch.save(
