@@ -8,22 +8,25 @@
 
 # ========== 模型路径配置 ==========
 LISA_MODEL_PATH="/opt/data/private/model/LISA_Plus_7b"
-CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-newdata/ckpt_model/epoch_20"
+CHECKPOINT_PATH="/opt/data/private/LLMSeg/runs/finetune_llmseg_vigor_simple-object/ckpt_model/epoch_20"
 CLIP_PATH="/opt/data/private/model/clip-vit-large-patch14"
 SAM_VIT_PATH="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
 
 # ========== 数据集配置 ==========
 # 测试数据集路径
 TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test"
-TEST_EASY_JSON="open_vocab_grasp_easy_object_2.json"
-TEST_HARD_JSON="open_vocab_grasp_hard_object_2.json"
+TEST_EASY_JSON="open_vocab_grasp_easy_object_mix.json"
+TEST_HARD_JSON="open_vocab_grasp_hard_object_mix.json"
 # SAM 候选 mask 目录 (必需！)
 SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== 输出配置 ==========
 OUTPUT_DIR="./result"
-VIS_DIR="./vis_output_newdata"  # 可视化输出目录
+VIS_DIR="./vis_output_object_topk_testset"  # 可视化输出目录
 SAVE_VIS="true"  # 是否保存可视化图片 (true/false)
+TOPK_MASK="${TOPK_MASK:-true}"  # 是否保存 similarity 排序的 Top-K mask (true/false)
+TOPK_MASK_K="${TOPK_MASK_K:-5}"  # Top-K mask 最大保存数量
+TOPK_RECALL_IOU_THRESHOLD="${TOPK_RECALL_IOU_THRESHOLD:-0.5}"  # object recall IoU 阈值
 
 # ========== 测试配置 ==========
 PRECISION="bf16"
@@ -36,7 +39,7 @@ LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 # ========== 调试配置 ==========
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
-GPU_ID="${GPU_ID:-0}"
+GPU_ID="${GPU_ID:-1}"
 SPLIT="${SPLIT:-both}"  # 可选: both, easy, hard
 WORKERS="${WORKERS:-12}"
 
@@ -55,6 +58,9 @@ echo "Hard JSON: ${TEST_HARD_JSON}"
 echo "SAM候选mask: ${SAM_MASKS_DIR}"
 echo "输出目录: ${OUTPUT_DIR}"
 echo "可视化目录: ${VIS_DIR}"
+echo "Top-K mask: ${TOPK_MASK}"
+echo "Top-K mask K: ${TOPK_MASK_K}"
+echo "Top-K recall IoU threshold: ${TOPK_RECALL_IOU_THRESHOLD}"
 echo "DataLoader workers: ${WORKERS}"
 echo "========================================================================"
 
@@ -70,6 +76,8 @@ ARGS="
     --sam_masks_dir=${SAM_MASKS_DIR}
     --output_dir=${OUTPUT_DIR}
     --vis_dir=${VIS_DIR}
+    --topk_mask_k=${TOPK_MASK_K}
+    --topk_recall_iou_threshold=${TOPK_RECALL_IOU_THRESHOLD}
     --precision=${PRECISION}
     --icr_thresholds=${ICR_THRESHOLDS}
     --lora_r=${LORA_R}
@@ -86,6 +94,11 @@ ARGS="
 if [ "$SAVE_VIS" = "true" ]; then
     ARGS="${ARGS} --save_vis"
     echo "可视化保存: 开启"
+fi
+
+if [ "$TOPK_MASK" = "true" ] || [ "$TOPK_MASK" = "1" ]; then
+    ARGS="${ARGS} --save_topk_masks"
+    echo "Top-K mask 保存: 开启"
 fi
 
 

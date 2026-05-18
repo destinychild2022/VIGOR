@@ -68,10 +68,18 @@ LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
-GPU_ID="${GPU_ID:-1}"
+GPU_ID="${GPU_ID:-2}"
 VLPART_GPU_ID="${VLPART_GPU_ID:-${GPU_ID}}"
 SPLIT="${SPLIT:-both}"
 WORKERS="${WORKERS:-12}"
+
+RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+if [[ ("${SAVE_VIS}" == "true" || "${SAVE_VIS}" == "1") && -e "${VIS_DIR}" ]]; then
+  VIS_DIR="${VIS_DIR}_${RUN_TIMESTAMP}"
+fi
+if [[ ("${SAVE_PRED_MASKS}" == "true" || "${SAVE_PRED_MASKS}" == "1") && -e "${VLPART_PRED_MASKS_DIR}" ]]; then
+  VLPART_PRED_MASKS_DIR="${VLPART_PRED_MASKS_DIR}_${RUN_TIMESTAMP}"
+fi
 
 echo "========================================================================"
 echo "  LLMSeg -> region RGB -> VLPart VIGOR-100K evaluation"

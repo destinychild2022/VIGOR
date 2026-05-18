@@ -99,6 +99,12 @@ def parse_args(args):
                         help="可视化输出目录")
     parser.add_argument("--save_vis", action="store_true", default=False,
                         help="是否保存可视化图片")
+    parser.add_argument("--save_topk_masks", action="store_true", default=False,
+                        help="SAVE_VIS 开启时，额外保存 similarity 排序的 Top-K 候选 mask")
+    parser.add_argument("--topk_mask_k", default=5, type=int,
+                        help="Top-K mask 保存和 object recall 统计的最大 K")
+    parser.add_argument("--topk_recall_iou_threshold", default=0.5, type=float,
+                        help="Top-K object recall 的 IoU 阈值")
     
     # 调试
     parser.add_argument("--debug", action="store_true", default=False)
@@ -134,13 +140,13 @@ def load_samples(data_dir: str, json_file_name: str, difficulty: str) -> List[Di
     
     samples = []
     for sample in raw_samples:
-        # 支持解析逗号分隔的多路径
-        gt_mask_path_raw = sample.get('gt_mask_path', '')
-        if not gt_mask_path_raw:
+        # 支持解析逗号分隔的多路径；评估 GT 使用 object-level mask
+        gt_object_mask_path_raw = sample.get('gt_object_mask_path', '')
+        if not gt_object_mask_path_raw:
             continue
         
         # 兼容多目标逻辑
-        gt_mask_paths_rel = [p.strip() for p in gt_mask_path_raw.split(',') if p.strip()]
+        gt_mask_paths_rel = [p.strip() for p in gt_object_mask_path_raw.split(',') if p.strip()]
         if not gt_mask_paths_rel:
             continue
         
@@ -165,7 +171,7 @@ def load_samples(data_dir: str, json_file_name: str, difficulty: str) -> List[Di
         
         samples.append({
             'image_path': image_path,
-            'gt_mask_paths': gt_mask_paths, # 返回列表
+            'gt_mask_paths': gt_mask_paths, # 来自 gt_object_mask_path，返回列表
             'gt_object': gt_object,
             'instructions': instructions,
             'difficulty': difficulty,
@@ -241,6 +247,81 @@ def compute_iou_max(pred_mask: np.ndarray, gt_masks: List[np.ndarray]) -> Tuple[
 def compute_icr_score(iou_pairs: List[float], threshold: float) -> int:
     """计算 ICR 分数"""
     return sum(1 for iou in iou_pairs if iou >= threshold)
+
+
+def sanitize_filename_token(value) -> str:
+    token = str(value) if value is not None else "unknown"
+    token = token.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    token = re.sub(r"[^0-9A-Za-z_.-]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or "unknown"
+
+
+def resize_mask_nearest(mask: np.ndarray, size_hw: Tuple[int, int]) -> np.ndarray:
+    h, w = size_hw
+    if mask.shape == (h, w):
+        return mask
+    return cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def vigor_mask_to_png(mask: np.ndarray) -> np.ndarray:
+    """VIGOR png convention: foreground/object is 0, background is 255."""
+    return np.where(np.asarray(mask) == 0, 0, 255).astype(np.uint8)
+
+
+def compute_topk_object_recall(
+    top_masks: List[np.ndarray],
+    gt_masks: List[np.ndarray],
+    topk_values: List[int],
+    threshold: float,
+) -> Tuple[Dict[int, bool], Dict[int, float]]:
+    """Top-k success: any mask in top-k hits any GT mask above threshold."""
+    per_mask_best_ious = []
+    for pred_mask in top_masks:
+        iou, _ = compute_iou_max(pred_mask, gt_masks)
+        per_mask_best_ious.append(iou)
+
+    recalls = {}
+    max_ious = {}
+    for k in topk_values:
+        considered = per_mask_best_ious[: min(k, len(per_mask_best_ious))]
+        best_iou = max(considered) if considered else 0.0
+        recalls[k] = best_iou > threshold
+        max_ious[k] = best_iou
+    return recalls, max_ious
+
+
+def save_topk_masks(
+    top_masks: List[np.ndarray],
+    top_scores: List[float],
+    top_pred_ious: List[float],
+    gt_masks: List[np.ndarray],
+    vis_dir: str,
+    sample_info: dict,
+    instruction_idx: int,
+    obj_count: int = 1,
+) -> List[str]:
+    """Save similarity-ranked masks as VIGOR-style png files."""
+    difficulty = sample_info.get("difficulty", "unknown")
+    img_name = sample_info.get("img_name", "unknown")
+    gt_object = sanitize_filename_token(sample_info.get("gt_object", "Unknown"))
+    saved_paths = []
+
+    for rank, pred_mask in enumerate(top_masks, start=1):
+        best_iou, _ = compute_iou_max(pred_mask, gt_masks)
+        score = top_scores[rank - 1] if rank - 1 < len(top_scores) else 0.0
+        pred_iou = top_pred_ious[rank - 1] if rank - 1 < len(top_pred_ious) else 0.0
+        rank_dir = os.path.join(vis_dir, "topk_masks", f"top{rank}", difficulty)
+        os.makedirs(rank_dir, exist_ok=True)
+        output_filename = (
+            f"{img_name}_{gt_object}_{obj_count}_instr{instruction_idx}_"
+            f"top{rank}_score{score:.4f}_pred_iou{pred_iou:.4f}_gt_iou{best_iou:.3f}.png"
+        )
+        output_path = os.path.join(rank_dir, output_filename)
+        cv2.imwrite(output_path, vigor_mask_to_png(pred_mask))
+        saved_paths.append(output_path)
+
+    return saved_paths
 
 
 def save_visualization(
@@ -757,14 +838,21 @@ def build_test_loader(samples, clip_image_processor, transform, sam_mask_helper,
 
 def predict_mask_llmseg(
     model, tokenizer, prepared_sample: Dict, instruction, args
-):
-    """LLMSeg 预测掩码 - 从 SAM 候选中选择"""
+) -> Dict:
+    """LLMSeg 预测掩码 - 从 SAM 候选中按 similarity 排序选择"""
     ori_size = prepared_sample["ori_size"]
     segs = prepared_sample["segs"]
     segs_origin = prepared_sample["segs_origin"]
     
     if segs is None:
-        return np.ones(ori_size, dtype=np.float32)  # 返回全背景
+        background = np.ones(ori_size, dtype=np.float32)
+        return {
+            "pred_mask": background,
+            "top_masks": [background],
+            "top_scores": [0.0],
+            "top_pred_ious": [0.0],
+            "top_indices": [],
+        }
     
     image_clip = prepared_sample["image_clip"]
     image_tensor = prepared_sample["image_tensor"]
@@ -822,12 +910,38 @@ def predict_mask_llmseg(
     
     # 获取预测结果
     pred_similarity = output_dict["pred_similarity"][0]  # (1, K)
-    max_idx = torch.argmax(pred_similarity).item()
+    scores = torch.nan_to_num(
+        pred_similarity.detach().float().reshape(-1),
+        nan=-1e4,
+        posinf=1e4,
+        neginf=-1e4,
+    )
+    topk = min(max(int(args.topk_mask_k), 1), scores.numel())
+    top_scores, top_indices = torch.topk(scores, k=topk, largest=True, sorted=True)
+    max_idx = int(top_indices[0].item())
+
+    pred_iou_scores = torch.zeros_like(scores)
+    if "pred_iou" in output_dict:
+        pred_iou_raw = torch.nan_to_num(
+            output_dict["pred_iou"][0].detach().float().reshape(-1),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        copy_len = min(pred_iou_scores.numel(), pred_iou_raw.numel())
+        if copy_len > 0:
+            pred_iou_scores[:copy_len] = pred_iou_raw[:copy_len]
     
     # 获取预测 mask
     pred_mask = segs_origin[:, :, max_idx]  # (H, W)
     
-    return pred_mask
+    return {
+        "pred_mask": pred_mask,
+        "top_masks": [segs_origin[:, :, int(idx.item())] for idx in top_indices],
+        "top_scores": [float(score.item()) for score in top_scores],
+        "top_pred_ious": [float(pred_iou_scores[int(idx.item())].item()) for idx in top_indices],
+        "top_indices": [int(idx.item()) for idx in top_indices],
+    }
 
 
 def evaluate_sample(
@@ -836,7 +950,7 @@ def evaluate_sample(
     """评估单个样本 (支持多目标 Max-IoU)"""
     sample = prepared_sample["sample"]
     image_path = sample['image_path']
-    gt_mask_paths = sample['gt_mask_paths'] # 这是一个列表
+    gt_mask_paths = sample['gt_mask_paths'] # 来自 gt_object_mask_path 的列表
     instructions = sample['instructions']
     img_name = sample['img_name']
     
@@ -854,23 +968,39 @@ def evaluate_sample(
     # 对每条指令进行推理
     pred_masks = []
     ic_ious = []
+    topk_values = [1, 3, 5]
+    topk_recalls = {k: [] for k in topk_values}
+    topk_max_ious = {k: [] for k in topk_values}
     
     for instr_idx, instruction in enumerate(instructions[:3]):
-        pred_mask = predict_mask_llmseg(
+        pred_result = predict_mask_llmseg(
             model, tokenizer, prepared_sample, instruction, args
         )
+        pred_mask = pred_result["pred_mask"]
+        top_masks = pred_result["top_masks"]
         
         # 调整大小
-        if pred_mask.shape != (original_h, original_w):
-            pred_mask = cv2.resize(pred_mask.astype(np.float32), 
-                                   (original_w, original_h),
-                                   interpolation=cv2.INTER_NEAREST)
+        pred_mask = resize_mask_nearest(pred_mask, (original_h, original_w))
+        top_masks = [
+            resize_mask_nearest(mask, (original_h, original_w))
+            for mask in top_masks
+        ]
         
         pred_masks.append(pred_mask)
         
         # 多目标择优逻辑 (Max-IoU)
         iou, best_gt = compute_iou_max(pred_mask, gt_masks)
         ic_ious.append(iou)
+
+        recall_flags, recall_ious = compute_topk_object_recall(
+            top_masks,
+            gt_masks,
+            topk_values,
+            args.topk_recall_iou_threshold,
+        )
+        for k in topk_values:
+            topk_recalls[k].append(recall_flags[k])
+            topk_max_ious[k].append(recall_ious[k])
         
         # 保存可视化结果 (展示最匹配的那个 GT)
         if args.save_vis:
@@ -890,6 +1020,17 @@ def evaluate_sample(
                 iou=iou,
                 obj_count=obj_count
             )
+            if args.save_topk_masks:
+                save_topk_masks(
+                    top_masks=top_masks,
+                    top_scores=pred_result["top_scores"],
+                    top_pred_ious=pred_result["top_pred_ious"],
+                    gt_masks=gt_masks,
+                    vis_dir=args.vis_dir,
+                    sample_info=sample_info,
+                    instruction_idx=instr_idx,
+                    obj_count=obj_count,
+                )
     
     # 计算平均 IC-IoU
     avg_ic_iou = np.mean(ic_ious) if ic_ious else 0.0
@@ -905,19 +1046,66 @@ def evaluate_sample(
     
     return {
         'image_path': image_path,
-        'gt_mask_path': gt_mask_paths[0], # 返回第一个作为代表
+        'gt_mask_path': gt_mask_paths[0], # 返回第一个 object mask 作为代表
         'gt_object': sample['gt_object'],
         'difficulty': sample['difficulty'],
         'ic_ious': ic_ious,
         'avg_ic_iou': avg_ic_iou,
         'iou_pairs': iou_pairs,
+        'topk_recalls': topk_recalls,
+        'topk_max_ious': topk_max_ious,
         'num_instructions': len(instructions[:3]),
     }
+
+
+def compute_topk_recall_metrics(result_list: List[Dict], topk_values: List[int]) -> Dict[int, Dict]:
+    metrics = {}
+    for k in topk_values:
+        flags = []
+        for result in result_list:
+            flags.extend(result.get("topk_recalls", {}).get(k, []))
+        total = len(flags)
+        success = sum(1 for flag in flags if flag)
+        metrics[k] = {
+            "success": success,
+            "total": total,
+            "recall": (float(success) / float(total)) if total > 0 else 0.0,
+        }
+    return metrics
+
+
+def write_topk_recall_report(
+    output_path: str,
+    easy_metrics: Dict[int, Dict],
+    hard_metrics: Dict[int, Dict],
+    threshold: float,
+    topk_values: List[int],
+):
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"  LLMSeg Top-K Object Recall @ IoU>{threshold}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write("规则: Top-K 中任一 mask 与任一 GT mask 的 IoU 超过阈值即成功。\n")
+        f.write("Hard 多 GT 样本按同一规则处理：任一预测 mask 命中任一 GT 即成功。\n\n")
+
+        for k in topk_values:
+            f.write(f"Top-{k} object recall @ IoU>{threshold}:\n")
+            for split_name, metrics in [("Easy", easy_metrics), ("Hard", hard_metrics)]:
+                item = metrics[k]
+                f.write(
+                    f"  {split_name}: {item['recall']:.4f} "
+                    f"({item['success']}/{item['total']})\n"
+                )
+            f.write("\n")
 
 
 
 def main(args):
     args = parse_args(args)
+    if args.topk_mask_k <= 0:
+        raise ValueError(f"--topk_mask_k must be > 0, got {args.topk_mask_k}")
+    if args.save_topk_masks and args.topk_mask_k < 5:
+        raise ValueError("Top-K mask report requires --topk_mask_k >= 5")
 
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.set_device(torch.device(args.device))
@@ -931,6 +1119,14 @@ def main(args):
     if args.save_vis:
         os.makedirs(args.vis_dir, exist_ok=True)
         print(f"\n  可视化输出目录: {args.vis_dir}")
+        if args.save_topk_masks:
+            print(
+                f"  Top-K mask 输出: 开启 "
+                f"(K={args.topk_mask_k}, IoU阈值>{args.topk_recall_iou_threshold})"
+            )
+            print(f"  Top-K mask 目录: {os.path.join(args.vis_dir, 'topk_masks')}")
+    elif args.save_topk_masks:
+        print("  [警告] --save_topk_masks 已开启，但 --save_vis 未开启；不会保存 Top-K mask 或 recall txt。")
     
     # 检查 SAM masks 目录
     if not os.path.exists(args.sam_masks_dir):
@@ -1076,6 +1272,9 @@ def main(args):
     
     easy_metrics = compute_metrics(results['easy'], icr_thresholds)
     hard_metrics = compute_metrics(results['hard'], icr_thresholds)
+    topk_values = [1, 3, 5]
+    easy_topk_recall_metrics = compute_topk_recall_metrics(results['easy'], topk_values)
+    hard_topk_recall_metrics = compute_topk_recall_metrics(results['hard'], topk_values)
     
     # 计算总体平均值
     total_count = easy_metrics['count'] + hard_metrics['count']
@@ -1152,6 +1351,21 @@ def main(args):
             f.write(f"    Easy:    {easy_metrics['icr_scores'][t]:.4f}\n")
             f.write(f"    Hard:    {hard_metrics['icr_scores'][t]:.4f}\n")
             f.write(f"    Average: {avg_icr_scores[t]:.4f}\n")
+
+        if args.save_vis and args.save_topk_masks:
+            f.write("\nTop-K object recall:\n")
+            for k in topk_values:
+                f.write(f"  Top-{k} object recall @ IoU>{args.topk_recall_iou_threshold}:\n")
+                easy_item = easy_topk_recall_metrics[k]
+                hard_item = hard_topk_recall_metrics[k]
+                f.write(
+                    f"    Easy: {easy_item['recall']:.4f} "
+                    f"({easy_item['success']}/{easy_item['total']})\n"
+                )
+                f.write(
+                    f"    Hard: {hard_item['recall']:.4f} "
+                    f"({hard_item['success']}/{hard_item['total']})\n"
+                )
         
         # 详细样本结果
         f.write("\n" + "=" * 80 + "\n")
@@ -1161,7 +1375,7 @@ def main(args):
         for i, r in enumerate(results['easy']):
             f.write(f"[Easy Sample {i+1}]\n")
             f.write(f"  Image: {r['image_path']}\n")
-            f.write(f"  GT Mask: {r['gt_mask_path']}\n")
+            f.write(f"  GT Object Mask: {r['gt_mask_path']}\n")
             f.write(f"  Object: {r['gt_object']}\n")
             f.write(f"  IC-IoU (per instruction): {[f'{x:.4f}' for x in r['ic_ious']]}\n")
             f.write(f"  Avg IC-IoU: {r['avg_ic_iou']:.4f}\n")
@@ -1178,7 +1392,7 @@ def main(args):
         for i, r in enumerate(results['hard']):
             f.write(f"[Hard Sample {i+1}]\n")
             f.write(f"  Image: {r['image_path']}\n")
-            f.write(f"  GT Mask: {r['gt_mask_path']}\n")
+            f.write(f"  GT Object Mask: {r['gt_mask_path']}\n")
             f.write(f"  Object: {r['gt_object']}\n")
             f.write(f"  IC-IoU (per instruction): {[f'{x:.4f}' for x in r['ic_ious']]}\n")
             f.write(f"  Avg IC-IoU: {r['avg_ic_iou']:.4f}\n")
@@ -1189,6 +1403,21 @@ def main(args):
             f.write("\n")
     
     print(f"\n结果已保存到: {result_file}")
+
+    topk_recall_file = None
+    if args.save_vis and args.save_topk_masks:
+        topk_recall_file = os.path.join(
+            args.output_dir,
+            f"llmseg_vigor_topk_object_recall_{timestamp}.txt",
+        )
+        write_topk_recall_report(
+            topk_recall_file,
+            easy_topk_recall_metrics,
+            hard_topk_recall_metrics,
+            args.topk_recall_iou_threshold,
+            topk_values,
+        )
+        print(f"Top-K object recall 已保存到: {topk_recall_file}")
     
     # 打印汇总
     print("\n" + "=" * 60)
@@ -1196,6 +1425,14 @@ def main(args):
     print("=" * 60)
     print(f"总样本数: {total_count}")
     print(f"IC-IoU: Easy={easy_metrics['ic_iou']:.4f}, Hard={hard_metrics['ic_iou']:.4f}, Avg={avg_ic_iou:.4f}")
+    if topk_recall_file is not None:
+        for k in topk_values:
+            easy_item = easy_topk_recall_metrics[k]
+            hard_item = hard_topk_recall_metrics[k]
+            print(
+                f"Top-{k} Object Recall @ IoU>{args.topk_recall_iou_threshold}: "
+                f"Easy={easy_item['recall']:.4f}, Hard={hard_item['recall']:.4f}"
+            )
 
 
 if __name__ == "__main__":

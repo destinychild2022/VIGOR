@@ -58,6 +58,41 @@ def parse_rgb(value: str) -> Tuple[int, int, int]:
     return rgb
 
 
+def has_existing_outputs(path: str) -> bool:
+    output_path = Path(path)
+    if not output_path.exists():
+        return False
+    if output_path.is_file():
+        return True
+    try:
+        next(output_path.iterdir())
+        return True
+    except StopIteration:
+        return False
+
+
+def timestamped_sibling(path: str, timestamp: str) -> str:
+    output_path = Path(path)
+    candidate = output_path.with_name(f"{output_path.name}_{timestamp}")
+    suffix = 1
+    while candidate.exists():
+        candidate = output_path.with_name(f"{output_path.name}_{timestamp}_{suffix}")
+        suffix += 1
+    return str(candidate)
+
+
+def resolve_run_output_dirs(args: argparse.Namespace) -> None:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if args.save_vis and has_existing_outputs(args.vis_dir):
+        old_dir = args.vis_dir
+        args.vis_dir = timestamped_sibling(args.vis_dir, timestamp)
+        print(f"  Existing visualizations found; writing this run to: {args.vis_dir} (was {old_dir})")
+    if args.save_pred_masks and has_existing_outputs(args.vlpart_pred_masks_dir):
+        old_dir = args.vlpart_pred_masks_dir
+        args.vlpart_pred_masks_dir = timestamped_sibling(args.vlpart_pred_masks_dir, timestamp)
+        print(f"  Existing VLPart pred masks found; writing this run to: {args.vlpart_pred_masks_dir} (was {old_dir})")
+
+
 def safe_name(text: str, max_len: int = 80) -> str:
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text.strip()).strip("._")
     return (text or "sample")[:max_len]
@@ -87,6 +122,29 @@ def project_mask_to_region_rgb(
     region_rgb = background
     region_rgb[fg] = image_rgb[fg]
     return region_rgb
+
+
+def overlay_vigor_mask(
+    image_rgb: np.ndarray,
+    mask: Optional[np.ndarray],
+    color_rgb: Tuple[int, int, int],
+    alpha: float = 0.5,
+) -> np.ndarray:
+    overlay = image_rgb.copy()
+    if mask is None:
+        return overlay
+
+    h, w = image_rgb.shape[:2]
+    vigor_mask = to_vigor_mask(mask)
+    if vigor_mask.shape != (h, w):
+        vigor_mask = cv2.resize(vigor_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    fg = vigor_mask == 0
+    if fg.any():
+        color = np.array(color_rgb, dtype=np.float32)
+        overlay[fg] = (
+            image_rgb[fg].astype(np.float32) * (1.0 - alpha) + color * alpha
+        ).astype(np.uint8)
+    return overlay
 
 
 def load_gt_masks(mask_paths: List[str], image_shape: Tuple[int, int]) -> List[np.ndarray]:
@@ -172,6 +230,7 @@ def normalize_mask_panel(mask: np.ndarray, foreground_rgb: Tuple[int, int, int])
 
 
 def save_gt_pred_mask_comparison(
+    image_rgb: np.ndarray,
     pred_mask: np.ndarray,
     gt_mask: Optional[np.ndarray],
     vis_dir: str,
@@ -180,17 +239,16 @@ def save_gt_pred_mask_comparison(
     iou: float,
     obj_count: int = 1,
 ) -> str:
-    """Save one original-layout GT-mask vs VLPart-pred-mask comparison."""
-    if gt_mask is None:
-        gt_mask = np.ones_like(pred_mask, dtype=np.uint8) * 255
-
-    h, w = pred_mask.shape[:2]
-    if gt_mask.shape != (h, w):
+    """Save one original-layout GT vs VLPart comparison overlaid on RGB."""
+    h, w = image_rgb.shape[:2]
+    if pred_mask.shape != (h, w):
+        pred_mask = cv2.resize(pred_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    if gt_mask is not None and gt_mask.shape != (h, w):
         gt_mask = cv2.resize(gt_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    gt_panel = normalize_mask_panel(gt_mask, foreground_rgb=(0, 255, 0))
-    pred_panel = normalize_mask_panel(pred_mask, foreground_rgb=(255, 0, 0))
-    combined_image = np.hstack([gt_panel, pred_panel])
+    gt_overlay = overlay_vigor_mask(image_rgb, gt_mask, (0, 255, 0), alpha=0.5)
+    pred_overlay = overlay_vigor_mask(image_rgb, pred_mask, (255, 0, 0), alpha=0.5)
+    combined_image = np.hstack([gt_overlay, pred_overlay])
 
     gt_object = sample_info.get("gt_object", "Unknown")
     difficulty = sample_info.get("difficulty", "unknown")
@@ -211,12 +269,12 @@ def save_gt_pred_mask_comparison(
     instr_display = instruction[:80] + "..." if len(instruction) > 80 else instruction
     cv2.putText(combined_with_text, f"Instruction: {instr_display}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
     cv2.putText(combined_with_text, f"IoU: {iou:.4f}", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    cv2.putText(combined_with_text, "GT (Green)", (200, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 0), 2)
-    cv2.putText(combined_with_text, "VLPart Pred (Red)", (350, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    cv2.putText(combined_with_text, "GT overlay (Green)", (200, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 0), 2)
+    cv2.putText(combined_with_text, "VLPart overlay (Red)", (390, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
     difficulty_dir = Path(vis_dir) / difficulty
     difficulty_dir.mkdir(parents=True, exist_ok=True)
-    gt_object_clean = gt_object.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    gt_object_clean = safe_name(gt_object, max_len=80)
     output_filename = f"{img_name}_{gt_object_clean}_{obj_count}_instr{instruction_idx}_iou{iou:.3f}.png"
     output_path = difficulty_dir / output_filename
 
@@ -263,6 +321,7 @@ def write_results(
         f.write(f"VLPart config: {args.vlpart_config_file}\n")
         f.write(f"VLPart weights: {args.vlpart_weights}\n")
         f.write(f"VLPart vocabulary: {args.vlpart_vocabulary}\n")
+        f.write("VLPart input mode: region_rgb\n")
         f.write(f"测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         f.write("=" * 80 + "\n")
@@ -392,6 +451,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--save_region_rgb", action="store_true", default=True)
     parser.add_argument("--skip_success_rate_analysis", action="store_true", default=False)
     parser.add_argument("--region_background_rgb", default="0,0,0")
+    parser.add_argument("--reuse_region_inputs", dest="reuse_region_inputs", action="store_true", default=True)
+    parser.add_argument("--no_reuse_region_inputs", dest="reuse_region_inputs", action="store_false")
 
     parser.add_argument("--precision", default="bf16", choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--image_size", default=896, type=int)
@@ -458,6 +519,90 @@ def load_split_samples(llmseg, args: argparse.Namespace) -> Dict[str, List[Dict]
     return samples
 
 
+def read_rgb_image(image_path: str) -> np.ndarray:
+    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def maybe_load_cached_region_inputs(
+    llmseg,
+    args: argparse.Namespace,
+) -> Optional[Tuple[Dict[str, List[Dict]], Dict[str, List[Tuple[str, str]]]]]:
+    if not args.reuse_region_inputs:
+        return None
+
+    region_dir = Path(args.region_rgb_dir)
+    mask_dir = Path(args.llmseg_masks_dir)
+    if not (region_dir.exists() and mask_dir.exists()):
+        return None
+
+    print("\n" + "=" * 60)
+    print("  Existing region_rgb and llmseg_masks found; checking cache")
+    print("=" * 60)
+    samples = load_split_samples(llmseg, args)
+    items = {"easy": [], "hard": []}
+    skipped_errors = {"easy": [], "hard": []}
+    missing = []
+
+    for split_name in ["easy", "hard"]:
+        seen_counts = defaultdict(int)
+        for sample in samples[split_name]:
+            try:
+                img_name = sample["img_name"]
+                obj_name = sample["gt_object"]
+                seen_counts[(img_name, obj_name)] += 1
+                obj_count = seen_counts[(img_name, obj_name)]
+                item = {
+                    "sample": sample,
+                    "obj_count": obj_count,
+                    "image_shape": None,
+                    "records": [],
+                }
+
+                for instruction_idx, instruction in enumerate(sample.get("instructions", [])[:3]):
+                    stem = output_stem(sample, obj_count, instruction_idx)
+                    mask_path = Path(args.llmseg_masks_dir) / split_name / f"{stem}.png"
+                    region_path = Path(args.region_rgb_dir) / split_name / f"{stem}.png"
+                    if not mask_path.is_file():
+                        missing.append(str(mask_path))
+                        continue
+                    if not region_path.is_file():
+                        missing.append(str(region_path))
+                        continue
+
+                    item["records"].append(
+                        {
+                            "instruction_idx": instruction_idx,
+                            "instruction": instruction,
+                            "llmseg_mask_path": str(mask_path),
+                            "region_path": str(region_path),
+                            "stem": stem,
+                        }
+                    )
+
+                if item["records"]:
+                    items[split_name].append(item)
+            except Exception as exc:
+                image_path = sample.get("image_path", "unknown")
+                skipped_errors[split_name].append((image_path, repr(exc)))
+                if len(skipped_errors[split_name]) <= 5 or args.debug:
+                    print(f"  [Cache {split_name} Error] {image_path}: {exc}")
+
+    if missing:
+        print(f"  Cache is incomplete ({len(missing)} missing files); regenerating Stage 1.")
+        for missing_path in missing[:5]:
+            print(f"    missing: {missing_path}")
+        return None
+
+    easy_count = len(items["easy"])
+    hard_count = len(items["hard"])
+    print(f"  Reusing cached inputs: Easy={easy_count}, Hard={hard_count}")
+    print(f"  VLPart input mode: region RGB ({args.region_rgb_dir})")
+    return items, skipped_errors
+
+
 def generate_region_inputs(llmseg, args: argparse.Namespace) -> Tuple[Dict[str, List[Dict]], Dict[str, List[Tuple[str, str]]]]:
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.set_device(torch.device(args.device))
@@ -474,9 +619,11 @@ def generate_region_inputs(llmseg, args: argparse.Namespace) -> Tuple[Dict[str, 
     sam_mask_helper = llmseg.SAM_Mask_Reader_PNG(args.sam_masks_dir)
     model, tokenizer, clip_image_processor, transform, _ = llmseg.load_model(args)
     samples = load_split_samples(llmseg, args)
+    easy_count = len(samples["easy"])
+    hard_count = len(samples["hard"])
 
-    print(f"  Easy samples: {len(samples['easy'])}")
-    print(f"  Hard samples: {len(samples['hard'])}")
+    print(f"  Easy samples: {easy_count}")
+    print(f"  Hard samples: {hard_count}")
     print(f"  Region RGB dir: {args.region_rgb_dir}")
     print(f"  LLMSeg mask dir: {args.llmseg_masks_dir}")
 
@@ -563,9 +710,10 @@ def generate_region_inputs(llmseg, args: argparse.Namespace) -> Tuple[Dict[str, 
                     if item["records"]:
                         items[split_name].append(item)
                 except Exception as exc:
-                    skipped_errors[split_name].append((sample.get("image_path", "unknown"), repr(exc)))
+                    image_path = sample.get("image_path", "unknown")
+                    skipped_errors[split_name].append((image_path, repr(exc)))
                     if len(skipped_errors[split_name]) <= 5 or args.debug:
-                        print(f"  [Stage1 {split_name} Error] {sample.get('image_path', 'unknown')}: {exc}")
+                        print(f"  [Stage1 {split_name} Error] {image_path}: {exc}")
     finally:
         del model
         del tokenizer
@@ -627,10 +775,7 @@ def evaluate_with_vlpart(
         for item in tqdm(split_items, desc=f"VLPart {split_name.capitalize()}"):
             sample = item["sample"]
             try:
-                image_bgr = cv2.imread(sample["image_path"], cv2.IMREAD_COLOR)
-                if image_bgr is None:
-                    raise FileNotFoundError(f"Failed to read image: {sample['image_path']}")
-                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                image_rgb = read_rgb_image(sample["image_path"])
                 h, w = image_rgb.shape[:2]
                 gt_masks = load_gt_masks(sample["gt_mask_paths"], (h, w))
 
@@ -675,6 +820,7 @@ def evaluate_with_vlpart(
                             "img_name": sample["img_name"],
                         }
                         save_gt_pred_mask_comparison(
+                            image_rgb=image_rgb,
                             pred_mask=final_mask,
                             gt_mask=best_gt,
                             vis_dir=args.vis_dir,
@@ -722,6 +868,7 @@ def evaluate_with_vlpart(
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    resolve_run_output_dirs(args)
 
     print("=" * 72)
     print("  LLMSeg -> region RGB -> VLPart VIGOR evaluation")
@@ -731,10 +878,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"VLPart weights: {args.vlpart_weights}")
     print(f"Split: {args.split}")
     print(f"Output dir: {args.output_dir}")
+    print(f"Visualization dir: {args.vis_dir}")
+    print(f"VLPart pred masks dir: {args.vlpart_pred_masks_dir}")
+    print(f"VLPart input mode: region RGB ({args.region_rgb_dir})")
     print("=" * 72)
 
     llmseg = load_llmseg_module()
-    items, skipped_errors = generate_region_inputs(llmseg, args)
+    cached_inputs = maybe_load_cached_region_inputs(llmseg, args)
+    if cached_inputs is None:
+        items, skipped_errors = generate_region_inputs(llmseg, args)
+    else:
+        items, skipped_errors = cached_inputs
 
     vlpart_eval = load_vlpart_module()
     results = evaluate_with_vlpart(llmseg, vlpart_eval, items, skipped_errors, args)
