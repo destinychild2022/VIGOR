@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -241,24 +242,219 @@ def load_samples_per_instruction(data_dir: str, json_file_name: str, difficulty:
     return samples
 
 
-def resolve_topk_mask_paths(sample: Dict, args: argparse.Namespace) -> List[Tuple[int, str]]:
-    topk_root = Path(args.llmseg_topk_masks_dir)
-    difficulty = sample["difficulty"]
+def topk_mask_lookup_prefix(sample: Dict, rank: int) -> str:
     img_name = sample["img_name"]
     obj_name = sanitize_filename_token(sample.get("gt_object", "unknown"))
     obj_count = int(sample.get("obj_count", 1))
     instruction_index = int(sample.get("instruction_index", 0))
+    return f"{img_name}_{obj_name}_{obj_count}_instr{instruction_index}_top{rank}_"
 
+
+TOPK_MASK_INDEX_CACHE_VERSION = 1
+
+
+def topk_mask_index_cache_path(
+    args: argparse.Namespace,
+    rank_dir: Path,
+    difficulty: str,
+    rank: int,
+) -> Optional[Path]:
+    cache_root = getattr(args, "topk_mask_index_cache_dir", "") or getattr(
+        args, "candidate_feature_cache_dir", ""
+    )
+    if not cache_root:
+        return None
+    try:
+        stat = os.stat(rank_dir)
+    except OSError:
+        return None
+    payload = {
+        "version": TOPK_MASK_INDEX_CACHE_VERSION,
+        "rank_dir": str(rank_dir),
+        "difficulty": str(difficulty),
+        "rank": int(rank),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    safe_difficulty = sanitize_filename_token(difficulty)
+    return Path(cache_root) / "topk_mask_index" / f"{safe_difficulty}_top{rank}_{digest}.pt"
+
+
+def load_persistent_topk_mask_index(cache_path: Optional[Path]) -> Optional[Dict[str, str]]:
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+    except Exception as exc:
+        print(f"  [topK index Warning] failed to read {cache_path}: {exc}", flush=True)
+        return None
+    if payload.get("version") != TOPK_MASK_INDEX_CACHE_VERSION:
+        return None
+    index = payload.get("index")
+    if not isinstance(index, dict):
+        return None
+    print(f"  [topK index] loaded {len(index)} prefixes from {cache_path}", flush=True)
+    return index
+
+
+def save_persistent_topk_mask_index(cache_path: Optional[Path], index: Dict[str, str]) -> None:
+    if cache_path is None:
+        return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": TOPK_MASK_INDEX_CACHE_VERSION,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "index": index,
+    }
+    tmp_path = cache_path.with_suffix(cache_path.suffix + f".{os.getpid()}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, cache_path)
+
+
+def try_acquire_topk_index_lock(cache_path: Optional[Path]) -> Tuple[Optional[Path], bool]:
+    if cache_path is None:
+        return None, False
+    lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return lock_path, False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"pid={os.getpid()}\ncreated_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    return lock_path, True
+
+
+def wait_for_topk_index_cache(cache_path: Path, lock_path: Path) -> Optional[Dict[str, str]]:
+    print(f"  [topK index] waiting for lock: {lock_path}", flush=True)
+    start = time.time()
+    last_notice = 0.0
+    while True:
+        cached_index = load_persistent_topk_mask_index(cache_path)
+        if cached_index is not None:
+            return cached_index
+        elapsed = time.time() - start
+        try:
+            lock_age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            lock_age = 0.0
+        if lock_age > 1800:
+            print(
+                f"  [topK index Warning] removing stale lock after {lock_age:.0f}s: {lock_path}",
+                flush=True,
+            )
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            return None
+        if elapsed > 3600:
+            print(
+                f"  [topK index Warning] waited {elapsed:.0f}s for {cache_path}; building locally",
+                flush=True,
+            )
+            return None
+        if elapsed - last_notice >= 30:
+            last_notice = elapsed
+            print(
+                f"  [topK index] still waiting {elapsed:.0f}s for {cache_path.name}",
+                flush=True,
+            )
+        time.sleep(5)
+
+
+def build_topk_mask_index_from_dir(
+    args: argparse.Namespace,
+    rank_dir: Path,
+    difficulty: str,
+    rank: int,
+) -> Dict[str, str]:
+    marker = f"_top{rank}_"
+    index: Dict[str, str] = {}
+    print(f"  [topK index] scanning {rank_dir}", flush=True)
+    scanned = 0
+    rank_dir_str = str(rank_dir)
+    progress_every = int(getattr(args, "topk_mask_index_progress_every", 5000) or 0)
+    start_time = time.time()
+    with os.scandir(rank_dir_str) as it:
+        for entry in it:
+            scanned += 1
+            name = entry.name
+            if name.lower().endswith(".png") and marker in name:
+                prefix = name.rsplit(marker, 1)[0] + marker
+                current = index.get(prefix)
+                if current is None or name < os.path.basename(current):
+                    index[prefix] = os.path.join(rank_dir_str, name)
+            if progress_every and scanned % progress_every == 0:
+                print(
+                    f"  [topK index] {rank_dir.name}: scanned={scanned}, "
+                    f"prefixes={len(index)}, sec={time.time() - start_time:.1f}",
+                    flush=True,
+                )
+    print(
+        f"  [topK index] {rank_dir}: files={scanned}, prefixes={len(index)}, "
+        f"sec={time.time() - start_time:.1f}",
+        flush=True,
+    )
+    return index
+
+
+def get_topk_mask_index(args: argparse.Namespace, difficulty: str, rank: int) -> Dict[str, str]:
+    cache = getattr(args, "_topk_mask_index", None)
+    if cache is None:
+        cache = {}
+        setattr(args, "_topk_mask_index", cache)
+
+    key = (str(difficulty), int(rank))
+    if key in cache:
+        return cache[key]
+
+    topk_root = Path(args.llmseg_topk_masks_dir)
+    rank_dir = topk_root / f"top{rank}" / difficulty
+    index: Dict[str, str] = {}
+    if not rank_dir.is_dir():
+        print(f"  [topK index Warning] missing dir: {rank_dir}", flush=True)
+        cache[key] = index
+        return index
+
+    index_cache_path = topk_mask_index_cache_path(args, rank_dir, difficulty, rank)
+    cached_index = load_persistent_topk_mask_index(index_cache_path)
+    if cached_index is not None:
+        cache[key] = cached_index
+        return cached_index
+
+    lock_path, have_lock = try_acquire_topk_index_lock(index_cache_path)
+    if not have_lock and index_cache_path is not None and lock_path is not None:
+        cached_index = wait_for_topk_index_cache(index_cache_path, lock_path)
+        if cached_index is not None:
+            cache[key] = cached_index
+            return cached_index
+        lock_path, have_lock = try_acquire_topk_index_lock(index_cache_path)
+
+    try:
+        index = build_topk_mask_index_from_dir(args, rank_dir, difficulty, rank)
+        save_persistent_topk_mask_index(index_cache_path, index)
+    finally:
+        if have_lock and lock_path is not None:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    cache[key] = index
+    return index
+
+def resolve_topk_mask_paths(sample: Dict, args: argparse.Namespace) -> List[Tuple[int, str]]:
+    difficulty = sample["difficulty"]
     mask_paths = []
     for rank in range(1, args.topk_mask_k + 1):
-        rank_dir = topk_root / f"top{rank}" / difficulty
-        prefix = (
-            f"{img_name}_{obj_name}_{obj_count}_instr{instruction_index}_"
-            f"top{rank}_"
-        )
-        matches = sorted(rank_dir.glob(prefix + "*.png"))
-        if matches:
-            mask_paths.append((rank, str(matches[0])))
+        prefix = topk_mask_lookup_prefix(sample, rank)
+        mask_path = get_topk_mask_index(args, difficulty, rank).get(prefix)
+        if mask_path:
+            mask_paths.append((rank, mask_path))
     return mask_paths
 
 

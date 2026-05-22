@@ -4,11 +4,12 @@ from detectron2.config import CfgNode as CN
 def add_vigor_noisy_config(cfg):
     cfg.VIGOR_NOISY = CN()
     cfg.VIGOR_NOISY.ENABLED = False
-    cfg.VIGOR_NOISY.NOISY_RATIO = 0.5
-    cfg.VIGOR_NOISY.TOPK_MASKS_DIR = "/opt/data/private/LLMSeg/vis_output_object_topk_trainset/topk_masks"
-    cfg.VIGOR_NOISY.TOPK_RANK = 1
-    cfg.VIGOR_NOISY.DIFFICULTY = "easy"
-    cfg.VIGOR_NOISY.INSTRUCTION_INDEX = 0
-    cfg.VIGOR_NOISY.OBJECT_IOU_THRESHOLD = 0.5
-    cfg.VIGOR_NOISY.AFF_COVERAGE_THRESHOLD = 0.7
+    # Extra noisy duplicate samples relative to the full clean easy set.
+    cfg.VIGOR_NOISY.NOISY_RATIO = 0.2
+    # For each noisy duplicate, choose one random object among the K nearest
+    # objects in the same scene and union its GT object region with the target.
+    cfg.VIGOR_NOISY.NEARBY_TOPK = 1
+    # Drop and redraw a noisy target when its chosen nearby object is farther
+    # than this bbox-center distance in input pixels. Set <= 0 to disable.
+    cfg.VIGOR_NOISY.MAX_CENTER_DISTANCE = 150.0
     cfg.VIGOR_NOISY.RANDOM_SEED = 42

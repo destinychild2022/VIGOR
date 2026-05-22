@@ -42,12 +42,8 @@ def configure_vigor_noisy_dataset(cfg):
     vigor_noisy.set_vigor_noisy_options(
         enabled=cfg.VIGOR_NOISY.ENABLED,
         noisy_ratio=cfg.VIGOR_NOISY.NOISY_RATIO,
-        topk_masks_dir=cfg.VIGOR_NOISY.TOPK_MASKS_DIR,
-        topk_rank=cfg.VIGOR_NOISY.TOPK_RANK,
-        difficulty=cfg.VIGOR_NOISY.DIFFICULTY,
-        instruction_index=cfg.VIGOR_NOISY.INSTRUCTION_INDEX,
-        object_iou_threshold=cfg.VIGOR_NOISY.OBJECT_IOU_THRESHOLD,
-        aff_coverage_threshold=cfg.VIGOR_NOISY.AFF_COVERAGE_THRESHOLD,
+        nearby_topk=cfg.VIGOR_NOISY.NEARBY_TOPK,
+        max_center_distance=cfg.VIGOR_NOISY.MAX_CENTER_DISTANCE,
         random_seed=cfg.VIGOR_NOISY.RANDOM_SEED,
     )
 

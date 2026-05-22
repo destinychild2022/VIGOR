@@ -41,7 +41,7 @@ SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
 
 # ========== VLPart model ==========
 VLPART_CONFIG_FILE="configs/vigor/swinbase_vigor_easy_stage1.yaml"
-VLPART_WEIGHTS="/opt/data/private/LLMSeg/VLPart/output/VLPart/vigor_swinbase_easy_stage1_bs16_lr4e-5/model_final.pth"
+VLPART_WEIGHTS="/opt/data/private/LLMSeg/VLPart/output/VLPart/vigor_swinbase_easy_stage1_llmseg_noisy_ratio20_from_gtbaseline_lr4e-6_3ep/model_final.pth"
 VLPART_CONFIDENCE_THRESHOLD="0.05"
 VLPART_MASK_SELECTION="top1"
 VLPART_VOCABULARY="custom"
@@ -55,8 +55,8 @@ VIS_DIR="${OUTPUT_ROOT}/visualizations"
 REGION_RGB_DIR="${OUTPUT_ROOT}/region_rgb"
 LLMSEG_MASKS_DIR="${OUTPUT_ROOT}/llmseg_masks"
 VLPART_PRED_MASKS_DIR="${OUTPUT_ROOT}/vlpart_pred_masks"
-SAVE_VIS="true"
-SAVE_PRED_MASKS="true"
+SAVE_VIS="false"
+SAVE_PRED_MASKS="false"
 
 # ========== Test settings ==========
 PRECISION="bf16"
@@ -68,7 +68,7 @@ LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
-GPU_ID="${GPU_ID:-2}"
+GPU_ID="${GPU_ID:-1}"
 VLPART_GPU_ID="${VLPART_GPU_ID:-${GPU_ID}}"
 SPLIT="${SPLIT:-both}"
 WORKERS="${WORKERS:-12}"

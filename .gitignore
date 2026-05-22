@@ -105,3 +105,7 @@ eval_vis*/
 !README.md
 success_rate_results.txt
 test_results*.txt
+/SAM2/
+/tool/
+/tools/
+/graspnet_vis/

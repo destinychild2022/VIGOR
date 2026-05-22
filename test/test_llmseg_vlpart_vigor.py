@@ -447,7 +447,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--llmseg_masks_dir", default="./result_llmseg_vlpart/llmseg_masks")
     parser.add_argument("--vlpart_pred_masks_dir", default="./result_llmseg_vlpart/vlpart_pred_masks")
     parser.add_argument("--save_vis", action="store_true", default=False)
-    parser.add_argument("--save_pred_masks", action="store_true", default=True)
+    parser.add_argument("--save_pred_masks", action="store_true", default=False)
     parser.add_argument("--save_region_rgb", action="store_true", default=True)
     parser.add_argument("--skip_success_rate_analysis", action="store_true", default=False)
     parser.add_argument("--region_background_rgb", default="0,0,0")

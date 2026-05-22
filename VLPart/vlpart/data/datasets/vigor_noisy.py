@@ -21,8 +21,7 @@ from detectron2.structures import BoxMode
 
 DEFAULT_VIGOR_ROOT = "/opt/data/private/LLMSeg/dataset/VIGOR-100K_new"
 DEFAULT_MAPPING_PATH = "configs/vigor/vigor_easy_object_to_vocabulary.json"
-DEFAULT_CACHE_VERSION = "vigor_noisy_dataset_cache_v1"
-DEFAULT_TOPK_MASKS_DIR = "/opt/data/private/LLMSeg/vis_output_object_topk_trainset/topk_masks"
+DEFAULT_CACHE_VERSION = "vigor_gt_nearby_noisy_dataset_cache_v1"
 DEFAULT_VOCABULARY = [
     "cylindrical side surface",
     "hexagonal side face",
@@ -34,13 +33,10 @@ logger = logging.getLogger("detectron2.vigor_noisy")
 
 _OPTIONS = {
     "enabled": True,
-    "noisy_ratio": 0.5,
-    "topk_masks_dir": DEFAULT_TOPK_MASKS_DIR,
-    "topk_rank": 1,
-    "difficulty": "easy",
-    "instruction_index": 0,
-    "object_iou_threshold": 0.5,
-    "aff_coverage_threshold": 0.7,
+    # Extra noisy duplicate samples relative to the full clean easy set.
+    "noisy_ratio": 0.2,
+    "nearby_topk": 1,
+    "max_center_distance": 150.0,
     "random_seed": 42,
 }
 
@@ -48,25 +44,17 @@ _OPTIONS = {
 def set_vigor_noisy_options(
     *,
     enabled=True,
-    noisy_ratio=0.5,
-    topk_masks_dir=DEFAULT_TOPK_MASKS_DIR,
-    topk_rank=1,
-    difficulty="easy",
-    instruction_index=0,
-    object_iou_threshold=0.5,
-    aff_coverage_threshold=0.7,
+    noisy_ratio=0.2,
+    nearby_topk=1,
+    max_center_distance=150.0,
     random_seed=42,
 ):
     _OPTIONS.update(
         {
             "enabled": bool(enabled),
             "noisy_ratio": float(noisy_ratio),
-            "topk_masks_dir": str(topk_masks_dir),
-            "topk_rank": int(topk_rank),
-            "difficulty": str(difficulty),
-            "instruction_index": int(instruction_index),
-            "object_iou_threshold": float(object_iou_threshold),
-            "aff_coverage_threshold": float(aff_coverage_threshold),
+            "nearby_topk": int(nearby_topk),
+            "max_center_distance": float(max_center_distance),
             "random_seed": int(random_seed),
         }
     )
@@ -114,39 +102,22 @@ def _file_signature(path):
     return f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
-def _rank_dir_signature(rank_dir):
-    rank_dir = Path(rank_dir)
-    if not rank_dir.exists():
-        return f"{rank_dir.resolve()}:missing"
-    stat = rank_dir.stat()
-    return f"{rank_dir.resolve()}:{stat.st_mtime_ns}"
-
-
 def _cache_path(dataset_name, json_file, data_root, mapping_file, options):
     cache_dir = Path(os.getenv("VIGOR_CACHE_DIR", _repo_root() / "datasets" / "cache" / "vigor"))
-    rank_dir = (
-        Path(options["topk_masks_dir"])
-        / f"top{int(options['topk_rank'])}"
-        / str(options["difficulty"])
-    )
     key_parts = [
         DEFAULT_CACHE_VERSION,
         dataset_name or "vigor_noisy",
         str(Path(data_root).resolve()),
         _file_signature(json_file),
         _file_signature(mapping_file),
-        _rank_dir_signature(rank_dir),
-        f"enabled={options['enabled']}",
-        f"ratio={float(options['noisy_ratio']):.6f}",
-        f"rank={int(options['topk_rank'])}",
-        f"difficulty={options['difficulty']}",
-        f"instr={int(options['instruction_index'])}",
-        f"object_iou>{float(options['object_iou_threshold']):.6f}",
-        f"aff_cov>{float(options['aff_coverage_threshold']):.6f}",
-        f"seed={int(options['random_seed'])}",
+        "enabled={}".format(options["enabled"]),
+        "extra_ratio={:.6f}".format(float(options["noisy_ratio"])),
+        "nearby_topk={}".format(int(options["nearby_topk"])),
+        "max_center_distance={:.3f}".format(float(options["max_center_distance"])),
+        "seed={}".format(int(options["random_seed"])),
     ]
     digest = hashlib.md5("|".join(key_parts).encode("utf-8")).hexdigest()[:12]
-    return cache_dir / f"{dataset_name or 'vigor_noisy'}_{digest}.pkl"
+    return cache_dir / "{}_{}.pkl".format(dataset_name or "vigor_noisy", digest)
 
 
 def _load_cache(cache_file):
@@ -192,29 +163,6 @@ def _read_foreground(mask_path, image_shape=None):
     return mask == 0
 
 
-def _compute_iou(a, b):
-    intersection = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    if union == 0:
-        return 0.0
-    return float(intersection / union)
-
-
-def _compute_coverage(pred, aff_gt):
-    denom = aff_gt.sum()
-    if denom == 0:
-        return 0.0
-    return float(np.logical_and(pred, aff_gt).sum() / denom)
-
-
-def _sanitize_filename_token(value):
-    token = str(value) if value is not None else "unknown"
-    token = token.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    token = re.sub(r"[^0-9A-Za-z_.-]+", "_", token)
-    token = re.sub(r"_+", "_", token).strip("_")
-    return token or "unknown"
-
-
 def _scene_name_from_sample(sample):
     scene = str(sample.get("scene", "")).strip()
     if scene:
@@ -230,50 +178,68 @@ def _scene_name_from_sample(sample):
     return ""
 
 
-def _build_topk_index(options):
-    rank = int(options["topk_rank"])
-    rank_dir = Path(options["topk_masks_dir"]) / f"top{rank}" / str(options["difficulty"])
-    marker = f"_top{rank}_"
-    index = {}
-    if not rank_dir.is_dir():
-        logger.warning("LLM-Seg top-K mask directory not found: %s", rank_dir)
-        return index
+def _object_mask_info(mask_path, image_shape):
+    fg = _read_foreground(mask_path, image_shape)
+    ys, xs = np.where(fg)
+    if len(xs) == 0:
+        raise ValueError(f"Empty object foreground mask: {mask_path}")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    bbox = [float(x0), float(y0), float(x1 - x0 + 1), float(y1 - y0 + 1)]
+    center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+    return {
+        "bbox": bbox,
+        "center": center,
+        "area": int(fg.sum()),
+    }
 
-    start = time.perf_counter()
-    scanned = 0
-    for entry in os.scandir(rank_dir):
-        if not entry.is_file():
+
+def _squared_distance(a, b):
+    dx = float(a[0]) - float(b[0])
+    dy = float(a[1]) - float(b[1])
+    return dx * dx + dy * dy
+
+
+def _ensure_scene_object_info(scene_candidates):
+    valid = []
+    for item in scene_candidates:
+        if "center" not in item or "bbox" not in item:
+            try:
+                object_info = _object_mask_info(item["object_mask_path"], item["image_shape"])
+            except Exception as exc:
+                logger.warning("Failed to read GT object mask %s for nearby-noisy candidate: %s", item["object_mask_path"], exc)
+                continue
+            item["bbox"] = object_info["bbox"]
+            item["center"] = object_info["center"]
+            item["area"] = object_info["area"]
+        valid.append(item)
+    return valid
+
+
+def _select_nearby_partner(target, candidates_by_scene, rng, nearby_topk, max_center_distance):
+    scene_candidates = _ensure_scene_object_info(candidates_by_scene.get(target["scene"], []))
+    if "center" not in target:
+        return None, None, "missing_target_mask"
+
+    pool = []
+    for item in scene_candidates:
+        if item["sample_index"] == target["sample_index"]:
             continue
-        name = entry.name
-        if not name.endswith(".png"):
-            continue
-        marker_pos = name.find(marker)
-        if marker_pos < 0:
-            continue
-        prefix = name[: marker_pos + len(marker)]
-        index.setdefault(prefix, entry.path)
-        scanned += 1
-        if scanned % 50000 == 0:
-            logger.info("Indexed %d LLM-Seg top-K masks from %s", scanned, rank_dir)
+        distance = float(np.sqrt(_squared_distance(target["center"], item["center"])))
+        pool.append((item, distance))
+    if not pool:
+        return None, None, "without_partner"
 
-    logger.info(
-        "Indexed %d LLM-Seg top-K masks from %s in %.1fs",
-        len(index),
-        rank_dir,
-        time.perf_counter() - start,
-    )
-    return index
+    pool.sort(key=lambda item_and_distance: item_and_distance[1])
+    max_distance = float(max_center_distance)
+    if max_distance > 0:
+        pool = [item_and_distance for item_and_distance in pool if item_and_distance[1] <= max_distance]
+        if not pool:
+            return None, None, "too_far"
 
-
-def _build_noisy_prefix(sample, obj_count, options):
-    rank = int(options["topk_rank"])
-    instruction_index = int(options["instruction_index"])
-    scene = _scene_name_from_sample(sample)
-    if not scene:
-        return ""
-    img_name = f"{scene}.png"
-    obj_name = _sanitize_filename_token(sample.get("gt_object", sample.get("object", "unknown")))
-    return f"{img_name}_{obj_name}_{obj_count}_instr{instruction_index}_top{rank}_"
+    k = max(1, min(int(nearby_topk), len(pool)))
+    partner, distance = rng.choice(pool[:k])
+    return partner, distance, "ok"
 
 
 def load_vigor_noisy_json(json_file, data_root, mapping_file, dataset_name=None):
@@ -299,28 +265,25 @@ def load_vigor_noisy_json(json_file, data_root, mapping_file, dataset_name=None)
 def _build_vigor_noisy_json(json_file, data_root, mapping_file, options, dataset_name=None):
     vocabulary, object_to_vocabulary, vocab_to_id = _load_mapping(mapping_file)
     samples = _load_samples(json_file)
-    topk_index = _build_topk_index(options) if options["enabled"] else {}
     records = []
-    valid_noisy = []
-    seen_counts = {}
-    missing_topk = 0
-    rejected_object_iou = 0
-    rejected_aff_coverage = 0
+    candidates = []
     log_period = max(1, int(os.getenv("VIGOR_LOAD_LOG_PERIOD", "1000")))
     start_time = time.perf_counter()
 
     logger.info(
-        "Building VIGOR noisy dataset %s from %s (%d samples), noisy_ratio=%.3f",
+        "Building VIGOR GT+nearby noisy dataset %s from %s (%d clean samples), extra_noisy_ratio=%.3f, nearby_topk=%d, max_center_distance=%.1f",
         dataset_name or "<unnamed>",
         json_file,
         len(samples),
         float(options["noisy_ratio"]),
+        int(options["nearby_topk"]),
+        float(options["max_center_distance"]),
     )
 
     for idx, sample in enumerate(samples):
         gt_object = sample.get("gt_object", sample.get("object", ""))
         if gt_object not in object_to_vocabulary:
-            raise KeyError(f"gt_object '{gt_object}' is missing from mapping file: {mapping_file}")
+            raise KeyError(f"gt_object {gt_object!r} is missing from mapping file: {mapping_file}")
 
         image_paths = _split_paths(sample.get("gt_object_path", ""))
         aff_mask_paths = _split_paths(sample.get("gt_mask_path", ""))
@@ -348,11 +311,6 @@ def _build_vigor_noisy_json(json_file, data_root, mapping_file, options, dataset
         vocabulary_name = object_to_vocabulary[gt_object]
         category_id = vocab_to_id[vocabulary_name]
 
-        img_name = f"{scene}.png"
-        count_key = (img_name, gt_object)
-        seen_counts[count_key] = seen_counts.get(count_key, 0) + 1
-        obj_count = seen_counts[count_key]
-
         record = {
             "file_name": clean_image_path,
             "image_id": idx,
@@ -374,73 +332,115 @@ def _build_vigor_noisy_json(json_file, data_root, mapping_file, options, dataset
                 }
             ],
         }
+        records.append(record)
 
         if options["enabled"] and object_mask_path:
-            prefix = _build_noisy_prefix(sample, obj_count, options)
-            pred_mask_path = topk_index.get(prefix)
-            if pred_mask_path:
-                try:
-                    pred_fg = _read_foreground(pred_mask_path, (height, width))
-                    object_fg = _read_foreground(object_mask_path, (height, width))
-                    aff_fg = _read_foreground(aff_mask_path, (height, width))
-                    object_iou = _compute_iou(pred_fg, object_fg)
-                    aff_coverage = _compute_coverage(pred_fg, aff_fg)
-                except Exception as exc:
-                    logger.warning("Failed to validate noisy mask %s: %s", pred_mask_path, exc)
-                else:
-                    if object_iou <= float(options["object_iou_threshold"]):
-                        rejected_object_iou += 1
-                    elif aff_coverage <= float(options["aff_coverage_threshold"]):
-                        rejected_aff_coverage += 1
-                    else:
-                        valid_noisy.append((idx, pred_mask_path, object_iou, aff_coverage))
-            else:
-                missing_topk += 1
+            candidates.append(
+                {
+                    "sample_index": idx,
+                    "record_index": len(records) - 1,
+                    "scene": scene,
+                    "gt_object": gt_object,
+                    "object_image_path": clean_image_path,
+                    "object_mask_path": object_mask_path,
+                    "image_shape": (height, width),
+                }
+            )
 
-        records.append(record)
         if (idx + 1) % log_period == 0 or idx + 1 == len(samples):
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "Built VIGOR noisy dataset base records: %d / %d samples (%.1f samples/s)",
+                "Built VIGOR clean records: %d / %d samples (%.1f samples/s)",
                 idx + 1,
                 len(samples),
                 (idx + 1) / max(elapsed, 1e-6),
             )
 
+    candidates_by_scene = {}
+    for candidate in candidates:
+        candidates_by_scene.setdefault(candidate["scene"], []).append(candidate)
+
     if options["enabled"]:
-        target_noisy = int(round(len(records) * min(max(float(options["noisy_ratio"]), 0.0), 1.0)))
+        extra_ratio = max(float(options["noisy_ratio"]), 0.0)
+        target_noisy = int(round(len(records) * extra_ratio))
     else:
         target_noisy = 0
+
+    eligible_targets = [
+        candidate
+        for candidate in candidates
+        if len(candidates_by_scene.get(candidate["scene"], [])) > 1
+    ]
     rng = random.Random(int(options["random_seed"]))
-    rng.shuffle(valid_noisy)
-    selected_noisy = valid_noisy[:target_noisy]
+    rng.shuffle(eligible_targets)
 
-    for idx, pred_mask_path, object_iou, aff_coverage in selected_noisy:
-        records[idx]["vigor_input_type"] = "llmseg_pred"
-        records[idx]["vigor_llmseg_object_mask_path"] = pred_mask_path
-        records[idx]["vigor_llmseg_object_iou"] = object_iou
-        records[idx]["vigor_llmseg_aff_coverage"] = aff_coverage
+    clean_count = len(records)
+    noisy_records = []
+    skipped_without_partner = 0
+    skipped_too_far = 0
+    skipped_missing_target_mask = 0
+    for target in eligible_targets:
+        if len(noisy_records) >= target_noisy:
+            break
 
-    if target_noisy and len(valid_noisy) < target_noisy:
+        partner, center_distance, skip_reason = _select_nearby_partner(
+            target,
+            candidates_by_scene,
+            rng,
+            int(options["nearby_topk"]),
+            float(options["max_center_distance"]),
+        )
+        if partner is None:
+            if skip_reason == "too_far":
+                skipped_too_far += 1
+            elif skip_reason == "missing_target_mask":
+                skipped_missing_target_mask += 1
+            else:
+                skipped_without_partner += 1
+            continue
+
+        noisy_record = copy.deepcopy(records[target["record_index"]])
+        noisy_record.update(
+            {
+                "image_id": clean_count + len(noisy_records),
+                "vigor_input_type": "gt_nearby_object_mix",
+                "vigor_noisy_source_index": target["sample_index"],
+                "vigor_secondary_sample_index": partner["sample_index"],
+                "vigor_secondary_gt_object": partner["gt_object"],
+                "vigor_secondary_object_mask_path": partner["object_mask_path"],
+                "vigor_secondary_object_image_path": partner["object_image_path"],
+                "vigor_secondary_bbox": partner["bbox"],
+                "vigor_secondary_center": partner["center"],
+                "vigor_secondary_center_distance": center_distance,
+                "vigor_nearby_topk": int(options["nearby_topk"]),
+                "vigor_max_center_distance": float(options["max_center_distance"]),
+            }
+        )
+        noisy_records.append(noisy_record)
+
+    records.extend(noisy_records)
+
+    if target_noisy and len(noisy_records) < target_noisy:
         logger.warning(
-            "Only %d valid noisy masks are available for target noisy count %d; "
-            "actual noisy ratio is %.4f",
-            len(valid_noisy),
+            "Only %d usable GT nearby-noisy records are available for requested noisy count %d",
+            len(noisy_records),
             target_noisy,
-            len(selected_noisy) / max(len(records), 1),
         )
 
     logger.info(
-        "VIGOR noisy dataset %s: total=%d, selected_noisy=%d, clean=%d, "
-        "valid_noisy=%d, missing_topk=%d, rejected_object_iou=%d, rejected_aff_coverage=%d",
+        "VIGOR GT+nearby noisy dataset %s: clean=%d, requested_noisy=%d, added_noisy=%d, total=%d, "
+        "eligible_targets=%d, skipped_without_partner=%d, skipped_too_far=%d, skipped_missing_target_mask=%d, nearby_topk=%d, max_center_distance=%.1f",
         dataset_name or "<unnamed>",
+        clean_count,
+        target_noisy,
+        len(noisy_records),
         len(records),
-        len(selected_noisy),
-        len(records) - len(selected_noisy),
-        len(valid_noisy),
-        missing_topk,
-        rejected_object_iou,
-        rejected_aff_coverage,
+        len(eligible_targets),
+        skipped_without_partner,
+        skipped_too_far,
+        skipped_missing_target_mask,
+        int(options["nearby_topk"]),
+        float(options["max_center_distance"]),
     )
     return records
 

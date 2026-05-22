@@ -42,57 +42,47 @@ TOPK_MASK_K="3"
 VOCABULARY="custom"
 CUSTOM_VOCABULARY="cylindrical side surface,hexagonal side face,flat side surface,whole object"
 
-# ========== Output ==========
+# ========== Output / cache ==========
 OUTPUT_ROOT="vlpart_vigor_outputs/llmseg_topk_reranker_k${TOPK_MASK_K}"
 OUTPUT_DIR="${OUTPUT_ROOT}/train_logs"
-CHECKPOINT_PATH="${OUTPUT_ROOT}/checkpoints/reranker.pt"
-FEATURE_CACHE_DIR="${OUTPUT_ROOT}/candidate_feature_cache_train"
+CHECKPOINT_PATH="${OUTPUT_ROOT}/checkpoints/formula_scorer.pt"
+# Reuse the full 4-D candidate feature cache produced by the reranker pipeline.
+FEATURE_CACHE_DIR="vlpart_vigor_outputs/llmseg_topk_reranker_k${TOPK_MASK_K}/candidate_feature_cache_train"
 EXTRACT_LOG_DIR="${OUTPUT_ROOT}/extract_logs"
 
 # ========== Training ==========
-EPOCHS="20"
-LR="1e-3"
-WEIGHT_DECAY="1e-4"
-HIDDEN_DIM="32"
-# Optional extra hidden layer after the first Linear/ReLU/Dropout block.
-# If EXTRA_HIDDEN_DIM=0, it reuses HIDDEN_DIM.
-EXTRA_MLP_LAYER="false"
-EXTRA_HIDDEN_DIM="0"
-DROPOUT="0.0"
+# Formula: score = (alpha * pred_similarity + (1 - alpha) * pred_iou) * vlpart_score
+# pred_similarity uses the raw value from LLMSeg top-K mask filenames.
 # Loss: one-hot cross entropy over all candidates in each instruction group.
 # The candidate with the highest GT IoU is the positive class; all others are 0.
-# Input features are used as raw cache values, without z-score normalization.
+# alpha is stored as one nn.Parameter through a sigmoid, so the effective alpha stays in [0, 1].
+EPOCHS="20"
+LR="5e-2"
+WEIGHT_DECAY="0.0"
 RANKING_TEMPERATURE="1.0"
+FORMULA_ALPHA_INIT="0.5"
 SEED="42"
-MAX_SAMPLES="10000"
+MAX_SAMPLES="1000"
 PREDICTION_CACHE_SIZE="128"
 FEATURE_CACHE_CHUNK_SIZE="1000"
-BALANCE_TRAIN_EASY_HARD="true"
+BALANCE_TRAIN_EASY_HARD="false"
 DEBUG="0"
-
-# ========== Ranker input feature switches ==========
-# Available features:
-#   pred_similarity   LLMSeg top-K object mask similarity score
-#   pred_iou          LLMSeg top-K object mask predicted IoU, 0 if unavailable
-#   vlpart_score      VLPart candidate confidence score
-#   containment_score VLPart candidate containment in the LLMSeg object mask
-USE_RANKER_FEATURE_PRED_SIMILARITY="true"
-USE_RANKER_FEATURE_PRED_IOU="true"
-USE_RANKER_FEATURE_VLPART_SCORE="true"
-USE_RANKER_FEATURE_CONTAINMENT_SCORE="true"
 
 # ========== SwanLab ==========
 SWANLAB_ENABLED="true"
 SWANLAB_API_KEY="17UKzqoPx2VI4PLzCHYdH"
 SWANLAB_PROJECT="VLPart"
-SWANLAB_EXP_NAME="vigor_topk_reranker_k${TOPK_MASK_K}"
+SWANLAB_EXP_NAME="vigor_topk_formula_scorer_k${TOPK_MASK_K}"
 if [[ -n "${SWANLAB_API_KEY}" ]]; then
   export SWANLAB_API_KEY="${SWANLAB_API_KEY}"
 fi
 
 echo "========================================================================"
-echo "  Train VLPart top-K affordance reranker"
+echo "  Train VLPart top-K formula scorer"
 echo "========================================================================"
+echo "Formula: (alpha * pred_similarity + (1 - alpha) * pred_iou) * vlpart_score"
+echo "Loss: one-hot CE, positive candidate = max GT IoU in each group"
+echo "Initial alpha: ${FORMULA_ALPHA_INIT}"
 echo "Top-K masks: ${LLMSEG_TOPK_MASKS_DIR}"
 echo "Top-K K: ${TOPK_MASK_K}"
 echo "Checkpoint: ${CHECKPOINT_PATH}"
@@ -102,39 +92,9 @@ echo "Feature cache chunk size: ${FEATURE_CACHE_CHUNK_SIZE}"
 echo "Balance train easy/hard: ${BALANCE_TRAIN_EASY_HARD}"
 echo "Parallel extract: ${PARALLEL_EXTRACT}"
 echo "Extract GPUs: ${EXTRACT_GPUS[*]}"
-RANKER_FEATURE_ARGS=()
-RANKER_FEATURE_NAMES=()
-add_ranker_feature() {
-  local enabled="$1"
-  local feature_name="$2"
-  if [[ "${enabled}" == "true" || "${enabled}" == "1" ]]; then
-    RANKER_FEATURE_ARGS+=(--ranker_feature "${feature_name}")
-    RANKER_FEATURE_NAMES+=("${feature_name}")
-  fi
-}
-add_ranker_feature "${USE_RANKER_FEATURE_PRED_SIMILARITY}" "pred_similarity"
-add_ranker_feature "${USE_RANKER_FEATURE_PRED_IOU}" "pred_iou"
-add_ranker_feature "${USE_RANKER_FEATURE_VLPART_SCORE}" "vlpart_score"
-add_ranker_feature "${USE_RANKER_FEATURE_CONTAINMENT_SCORE}" "containment_score"
-if [[ "${#RANKER_FEATURE_NAMES[@]}" -eq 0 ]]; then
-  echo "At least one ranker feature switch must be enabled." >&2
-  exit 1
-fi
-
 echo "Train GPU: ${GPU_ID}"
-if [[ "${EXTRA_HIDDEN_DIM}" == "0" ]]; then
-  EFFECTIVE_EXTRA_HIDDEN_DIM="${HIDDEN_DIM}"
-else
-  EFFECTIVE_EXTRA_HIDDEN_DIM="${EXTRA_HIDDEN_DIM}"
-fi
-
 echo "Epochs: ${EPOCHS}"
-echo "MLP hidden dim: ${HIDDEN_DIM}"
-echo "Extra MLP layer: ${EXTRA_MLP_LAYER}"
-echo "Extra hidden dim: ${EFFECTIVE_EXTRA_HIDDEN_DIM}"
-echo "Loss: one-hot CE, positive candidate = max GT IoU in each group"
-echo "Input scaling: raw cache feature values, no normalization"
-echo "Ranker features: ${RANKER_FEATURE_NAMES[*]}"
+echo "LR: ${LR}"
 echo "SwanLab enabled: ${SWANLAB_ENABLED}"
 echo "SwanLab project: ${SWANLAB_PROJECT}"
 echo "SwanLab experiment: ${SWANLAB_EXP_NAME}"
@@ -158,7 +118,6 @@ COMMON_ARGS=(
   --candidate_feature_cache_dir "${FEATURE_CACHE_DIR}"
   --feature_cache_chunk_size "${FEATURE_CACHE_CHUNK_SIZE}"
   --seed "${SEED}"
-  "${RANKER_FEATURE_ARGS[@]}"
 )
 
 if [[ -n "${MAX_SAMPLES}" ]]; then
@@ -212,28 +171,22 @@ fi
 
 echo ""
 echo "========================================================================"
-echo "  Step 2/2: train reranker from cached features"
+echo "  Step 2/2: train formula scorer from cached features"
 echo "========================================================================"
 
 ARGS=(
-  --mode train
+  --mode train_formula_scorer
   "${COMMON_ARGS[@]}"
   --device "cuda:${GPU_ID}"
   --extract_num_shards "${NUM_EXTRACT_SHARDS}"
   --epochs "${EPOCHS}"
   --lr "${LR}"
   --weight_decay "${WEIGHT_DECAY}"
-  --hidden_dim "${HIDDEN_DIM}"
-  --extra_hidden_dim "${EXTRA_HIDDEN_DIM}"
-  --dropout "${DROPOUT}"
   --ranking_temperature "${RANKING_TEMPERATURE}"
+  --formula_alpha_init "${FORMULA_ALPHA_INIT}"
   --swanlab_project "${SWANLAB_PROJECT}"
   --swanlab_exp_name "${SWANLAB_EXP_NAME}"
 )
-
-if [[ "${EXTRA_MLP_LAYER}" == "true" || "${EXTRA_MLP_LAYER}" == "1" ]]; then
-  ARGS+=(--extra_mlp_layer)
-fi
 
 if [[ "${SWANLAB_ENABLED}" == "true" || "${SWANLAB_ENABLED}" == "1" ]]; then
   ARGS+=(--swanlab_enabled)
@@ -243,5 +196,5 @@ fi
 
 echo ""
 echo "========================================================================"
-echo "  VLPart top-K reranker training finished"
+echo "  VLPart top-K formula scorer training finished"
 echo "========================================================================"

@@ -6,6 +6,8 @@ DATASETS:
 
 SOLVER:
   IMS_PER_BATCH: 16
+  STEPS: (72000, 96000)
+  MAX_ITER: 108000
 
 DATALOADER:
   SAMPLER_TRAIN: "MultiDatasetSampler"
@@ -23,13 +25,9 @@ DATALOADER:
 
 VIGOR_NOISY:
   ENABLED: True
-  NOISY_RATIO: 0.5
-  TOPK_MASKS_DIR: "/opt/data/private/LLMSeg/vis_output_object_topk_trainset/topk_masks"
-  TOPK_RANK: 1
-  DIFFICULTY: "easy"
-  INSTRUCTION_INDEX: 0
-  OBJECT_IOU_THRESHOLD: 0.5
-  AFF_COVERAGE_THRESHOLD: 0.7
+  NOISY_RATIO: 0.2
+  NEARBY_TOPK: 1
+  MAX_CENTER_DISTANCE: 150.0
   RANDOM_SEED: 42
 
-OUTPUT_DIR: "output/VLPart/vigor_swinbase_easy_stage1_llmseg_noisy_ratio50"
+OUTPUT_DIR: "output/VLPart/vigor_swinbase_easy_stage1_gt_plus_nearby_noisy_ratio20_top1_dist150"

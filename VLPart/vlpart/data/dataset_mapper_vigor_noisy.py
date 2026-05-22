@@ -17,23 +17,26 @@ logger = logging.getLogger("detectron2.vlpart.data.dataset_mapper_vigor_noisy")
 
 
 class DatasetMapperWithImageVigorNoisy(DatasetMapperWithImage):
-    def _read_noisy_image(self, dataset_dict):
-        scene_file_name = dataset_dict["vigor_scene_file_name"]
-        mask_path = dataset_dict["vigor_llmseg_object_mask_path"]
-        image = utils.read_image(scene_file_name, format=self.image_format)
+    def _read_mask(self, mask_path, image_shape):
         mask = utils.read_image(mask_path, "L").squeeze(2)
-        if mask.shape != image.shape[:2]:
-            h, w = image.shape[:2]
+        if mask.shape != image_shape:
+            h, w = image_shape
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        return mask == 0
 
-        fg = mask == 0
+    def _read_gt_nearby_mix_image(self, dataset_dict):
+        image = utils.read_image(dataset_dict["vigor_scene_file_name"], format=self.image_format)
+        target_fg = self._read_mask(dataset_dict["gt_object_mask_path"], image.shape[:2])
+        nearby_fg = self._read_mask(dataset_dict["vigor_secondary_object_mask_path"], image.shape[:2])
+        fg = np.logical_or(target_fg, nearby_fg)
         masked = np.zeros_like(image)
         masked[fg] = image[fg]
         return masked
 
     def _read_input_image(self, dataset_dict):
-        if dataset_dict.get("vigor_input_type") == "llmseg_pred":
-            return self._read_noisy_image(dataset_dict)
+        input_type = dataset_dict.get("vigor_input_type")
+        if input_type == "gt_nearby_object_mix":
+            return self._read_gt_nearby_mix_image(dataset_dict)
         if "file_name" in dataset_dict:
             return utils.read_image(dataset_dict["file_name"], format=self.image_format)
 
