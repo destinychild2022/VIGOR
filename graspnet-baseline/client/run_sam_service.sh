@@ -6,8 +6,8 @@
 # 1. 配置
 PORT="5557"
 CHECKPOINT="/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth"
-export CUDA_VISIBLE_DEVICES=1
-DEVICE="cuda:0" # 物理卡 2 现在映射为逻辑 0
+export CUDA_VISIBLE_DEVICES=0
+DEVICE="cuda:0" # 物理卡 0 现在映射为逻辑 0
 
 # 2. 激活环境
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ fi
 echo "=========================================="
 echo "🎯 启动 SAM (ViT-H) 分割服务"
 echo "   Port:      $PORT"
-echo "   Device:    Physical GPU 2 ($DEVICE)"
+echo "   Device:    Physical GPU 0 ($DEVICE)"
 echo "=========================================="
 
 python "$SCRIPT_DIR/sam_service.py" \

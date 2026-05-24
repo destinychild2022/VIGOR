@@ -24,6 +24,7 @@ VIGOR 主控客户端 (SAM + VIGOR affordance)
 import os
 import sys
 import argparse
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -369,10 +370,8 @@ def parse_args():
     # 语言指令
     p.add_argument('--instruction', type=str, default=None,
                    help='抓取语言指令, 如 "pick up the bolt"')
-
-    # SAM
-    p.add_argument('--sam_checkpoint', type=str,
-                   default='/opt/data/private/model/SAM-vit-h/sam_vit_h_4b8939.pth')
+    p.add_argument('--instruction_idx', type=int, default=0,
+                   help='手动模式下使用样本 instructions 中的第几条指令 (0-indexed)')
 
     # VIGOR
     p.add_argument('--vigor_version', type=str,
@@ -392,8 +391,27 @@ def parse_args():
     p.add_argument('--dataset_path', type=str,
                    default='/opt/data/private/LLMSeg/dataset/VIGOR-100K/test/open_vocab_grasp_hard.json',
                    help='测试数据集 JSON 路径')
-    p.add_argument('--scene_idx', type=int, default=0,
-                   help='运行数据集中的第几个样本 (0-indexed)')
+    p.add_argument('--scene_id', type=str, default=None,
+                   help='手动模式下指定 JSON 中的 scene 编号，如 7、10940')
+    p.add_argument('--object_idx', type=int, default=0,
+                   help='手动模式下指定 scene 内第几个物体/sample (0-indexed)')
+    p.add_argument('--auto', action='store_true',
+                   help='自动遍历 JSON 中每个 sample 的每条 instruction')
+    p.add_argument('--max_attempts', type=int, default=8,
+                   help='每条 instruction 最多连续尝试多少步')
+    p.add_argument('--max_scene_id', type=int, default=None,
+                   help='自动模式只遍历 scene id <= 该值的 samples；None 表示直到 JSON 结束')
+    p.add_argument('--results_path', type=str, default=None,
+                   help='自动模式结果 JSON 保存路径；为空则只打印统计')
+    p.add_argument('--record_video', action='store_true',
+                   help='自动模式下为每条 instruction 在 server 端录制一段视频')
+    p.add_argument('--server_video_dir', type=str,
+                   default='/home/harrison/workspace/BEHAVIOR-1K/test/vigor_instruction_videos',
+                   help='视频保存目录；该路径在 OmniGibson server 端解析')
+    p.add_argument('--video_fps', type=int, default=12,
+                   help='server 端保存视频的 FPS')
+    p.add_argument('--video_frame_stride', type=int, default=2,
+                   help='server 端每隔多少个仿真 step 写一帧，越大越省空间')
 
     # 输出
     p.add_argument('--vis_dir', type=str,
@@ -402,209 +420,497 @@ def parse_args():
     return p.parse_args()
 
 
-def load_dataset_instruction(json_path, idx):
-    """从 JSON 数据集中加载指令"""
-    import json
-    if not os.path.exists(json_path):
+def load_dataset_samples(json_path):
+    """读取 VIGOR JSON。"""
+    if not json_path or not os.path.exists(json_path):
         print(f"  [Error] 数据集不存在: {json_path}")
-        return None
+        return []
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
     samples = data.get('samples', [])
-    if idx >= len(samples):
-        print(f"  [Error] 索引 {idx} 超出范围 (max={len(samples)-1})")
+    print(f"  -> 数据集加载成功: {json_path} (samples={len(samples)})")
+    return samples
+
+
+def _safe_instructions(sample):
+    instructions = sample.get('instructions', [])
+    return instructions if isinstance(instructions, list) else []
+
+
+def _scene_id_as_int(sample):
+    try:
+        return int(str(sample.get('scene')))
+    except (TypeError, ValueError):
         return None
-    
-    sample = samples[idx]
-    # 取第一个指令
-    instr = sample['instructions'][0]
-    scene_id = sample.get('scene', 'Unknown')
-    obj_name = sample.get('object', 'Unknown')
-    
-    print(f"  -> 从数据集加载成功: Index={idx}, Scene={scene_id}, Object={obj_name}")
-    return instr, scene_id
+
+
+def select_manual_sample(samples, args):
+    """手动模式：按 scene_id + scene 内 object_idx 选择。"""
+    if not samples:
+        return None, None
+
+    if args.scene_id is None:
+        raise ValueError("手动模式必须指定 --scene_id，不再支持 JSON 全局 sample index")
+
+    scene_id = str(args.scene_id)
+    scene_items = [
+        (idx, sample) for idx, sample in enumerate(samples)
+        if str(sample.get('scene')) == scene_id
+    ]
+    if not scene_items:
+        raise ValueError(f"JSON 中找不到 scene={scene_id}")
+    if args.object_idx < 0 or args.object_idx >= len(scene_items):
+        names = [s.get('object', 'Unknown') for _, s in scene_items]
+        raise ValueError(
+            f"scene={scene_id} 的 object_idx={args.object_idx} 超出范围 "
+            f"(0..{len(scene_items)-1}); objects={names}"
+        )
+    return scene_items[args.object_idx]
+
+
+def _normalize_name(value):
+    return " ".join(str(value).lower().replace("_", " ").replace("-", " ").split())
+
+
+def _singularize_token(token):
+    if token.endswith("ies") and len(token) > 3:
+        return token[:-3] + "y"
+    if token.endswith("ses") and len(token) > 3:
+        return token[:-2]
+    if token.endswith("s") and len(token) > 1:
+        return token[:-1]
+    return token
+
+
+def _singularize_name(value):
+    return " ".join(_singularize_token(tok) for tok in _normalize_name(value).split())
+
+
+def _names_match(a, b):
+    if a is None or b is None:
+        return None
+    na, nb = _normalize_name(a), _normalize_name(b)
+    if not na or not nb:
+        return None
+    sa, sb = _singularize_name(a), _singularize_name(b)
+    return (
+        na == nb or na in nb or nb in na or
+        sa == sb or sa in sb or sb in sa
+    )
+
+
+def parse_execute_success(response, gt_object=None):
+    """
+    解析 OmniGibson Server 的 EXECUTE 返回。
+    Server 只返回实际锁定到的 grasped_object；
+    是否成功由客户端用 JSON 中的 gt_object 判断。
+    """
+    if not isinstance(response, dict):
+        return False, "invalid response"
+
+    grasped_object = response.get('grasped_object')
+    if gt_object and grasped_object:
+        object_match = _names_match(grasped_object, gt_object)
+        if object_match is False:
+            return False, f"object mismatch: got={grasped_object}, gt={gt_object}"
+        return True, f"matched gt_object={gt_object}"
+
+    return False, "no grasped object returned"
+
+
+def load_scene(server_socket, scene_id):
+    """请求 server 加载指定场景。"""
+    if scene_id is None:
+        return False
+    print(f"\n[Scene] 请求 Server 加载场景: {scene_id}")
+    server_socket.send_pyobj({'type': 'LOAD_SCENE', 'scene_id': str(scene_id)})
+    res = server_socket.recv_pyobj()
+    status = str(res.get('status', ''))
+    print(f"  -> Server 结果: {status}")
+    return "SUCCESS" in status.upper()
+
+
+def start_instruction_video(args, server_socket, sample, instruction_idx):
+    if not (args.auto and args.record_video):
+        return None
+    video_meta = {
+        'scene_id': sample.get('scene'),
+        'object_name': sample.get('object', 'object'),
+        'instruction_idx': instruction_idx,
+    }
+    server_socket.send_pyobj({
+        'type': 'START_VIDEO',
+        'video_dir': args.server_video_dir,
+        'video_meta': video_meta,
+        'video_fps': args.video_fps,
+        'video_frame_stride': args.video_frame_stride,
+    })
+    res = server_socket.recv_pyobj()
+    print(f"  -> Server 视频录制: {res.get('status')}, path={res.get('video_path')}")
+    return res.get('video_path')
+
+
+def stop_instruction_video(args, server_socket):
+    if not (args.auto and args.record_video):
+        return None
+    server_socket.send_pyobj({'type': 'STOP_VIDEO'})
+    res = server_socket.recv_pyobj()
+    print(f"  -> Server 视频结束: {res.get('status')}, path={res.get('video_path')}")
+    return res.get('video_path')
+
+
+def run_one_attempt(
+    args, server_socket, graspnet_socket, sam_socket,
+    vigor_model, tokenizer, clip_proc, transform,
+    instruction, sample, attempt_idx,
+):
+    """完成一次观察-分割-抓取-执行闭环。返回是否成功和 server response。"""
+    eval_object = sample.get('object') if sample else None
+
+    print(f"\n--- Attempt {attempt_idx}/{args.max_attempts}: 获取仿真观测 ---")
+    server_socket.send_pyobj({'type': 'GET_OBS'})
+    obs = server_socket.recv_pyobj()
+    rgb       = obs['rgb']
+    depth     = obs['depth']
+    depth_key = obs.get('depth_key', 'depth_linear')
+    intrinsic = obs['intrinsic']
+    cam_pos   = obs['cam_pos']
+    cam_quat  = obs['cam_quat']
+
+    print("\n--- SAM 生成候选掩码 ---")
+    sam_masks = generate_sam_masks(sam_socket, rgb)
+    if len(sam_masks) == 0:
+        torch.cuda.empty_cache()
+        return False, {'status': 'FAIL', 'message': 'SAM 未生成候选掩码'}
+
+    print("\n--- VIGOR 选择 affordance ---")
+    affordance_mask, _ = vigor_predict_affordance(
+        vigor_model, tokenizer, clip_proc, transform,
+        rgb, instruction, sam_masks, args.precision
+    )
+    save_debug_images(rgb, depth, affordance_mask, args.vis_dir)
+
+    print("\n--- 发送给 GraspNet Service ---")
+    graspnet_socket.send_pyobj({
+        'rgb':             rgb,
+        'depth':           depth,
+        'depth_key':       depth_key,
+        'affordance_mask': affordance_mask,
+        'intrinsic':       intrinsic,
+        'cam_pos':         cam_pos,
+        'cam_quat':        cam_quat,
+    })
+    grasp_result = graspnet_socket.recv_pyobj()
+    if grasp_result['status'] != 'SUCCESS':
+        print(f"  -> GraspNet 失败: {grasp_result.get('message', '')}")
+        torch.cuda.empty_cache()
+        return False, grasp_result
+
+    cam_translation = np.array(grasp_result['translation'])
+    cam_rotation    = np.array(grasp_result['rotation'])
+    grasp_width     = grasp_result['width']
+    grasp_score     = grasp_result['score']
+
+    world_pos, world_rot = transform_to_world(
+        cam_translation, cam_rotation, cam_pos, cam_quat
+    )
+    world_euler = R.from_matrix(world_rot).as_euler('xyz', degrees=True)
+    print(f"  -> World Position:  {world_pos}")
+    print(f"  -> World Euler(°):  {world_euler}")
+    print(f"  -> Gripper Width:   {grasp_width:.4f}")
+    print(f"  -> Grasp Score:     {grasp_score:.4f}")
+
+    execute_msg = {
+        'type': 'EXECUTE',
+        'translation': world_pos.tolist(),
+        'rotation': world_rot.tolist(),
+        'width': float(grasp_width),
+    }
+
+    print("\n--- 发送抓取指令给 Server ---")
+    server_socket.send_pyobj(execute_msg)
+    response = server_socket.recv_pyobj()
+    success, reason = parse_execute_success(response, eval_object)
+    print(f"  -> Server grasped_object: {response.get('grasped_object')}")
+    print(f"  -> Success: {success} ({reason})")
+    torch.cuda.empty_cache()
+    return success, response
+
+
+def run_instruction_trial(
+    args, server_socket, graspnet_socket, sam_socket,
+    vigor_model, tokenizer, clip_proc, transform,
+    sample_idx, sample, instruction_idx, instruction,
+):
+    """对一条 instruction 最多连续尝试 args.max_attempts 步。"""
+    scene_id = sample.get('scene')
+    object_name = sample.get('object', 'Unknown')
+    gt_object = object_name
+
+    print("\n" + "=" * 80)
+    print(
+        f"[Trial] sample={sample_idx}, scene={scene_id}, object={object_name}, "
+        f"gt_object={gt_object}, instruction_idx={instruction_idx}"
+    )
+    print(f"        instruction: \"{instruction}\"")
+
+    success = False
+    response = None
+    steps = 0
+    video_path = start_instruction_video(args, server_socket, sample, instruction_idx)
+    try:
+        for attempt_idx in range(1, args.max_attempts + 1):
+            steps = attempt_idx
+            success, response = run_one_attempt(
+                args, server_socket, graspnet_socket, sam_socket,
+                vigor_model, tokenizer, clip_proc, transform,
+                instruction, sample, attempt_idx,
+            )
+            if success:
+                break
+    finally:
+        stopped_video_path = stop_instruction_video(args, server_socket)
+        if stopped_video_path:
+            video_path = stopped_video_path
+
+    print(f"[Trial Done] success={success}, steps={steps}")
+    return {
+        'sample_idx': sample_idx,
+        'scene': scene_id,
+        'object': object_name,
+        'gt_object': gt_object,
+        'instruction_idx': instruction_idx,
+        'instruction': instruction,
+        'success': success,
+        'steps': steps,
+        'video_path': video_path,
+        'response': response,
+    }
+
+
+def summarize_results(results):
+    total = len(results)
+    success_results = [r for r in results if r['success']]
+    success_count = len(success_results)
+    total_steps = sum(r['steps'] for r in results)
+    success_steps = sum(r['steps'] for r in success_results)
+
+    return {
+        'total_instructions': total,
+        'success_count': success_count,
+        'success_rate': success_count / total if total else 0.0,
+        'avg_steps': total_steps / total if total else 0.0,
+        'avg_success_steps': success_steps / success_count if success_count else 0.0,
+    }
+
+
+def print_summary(summary):
+    print("\n" + "=" * 80)
+    print("[Summary]")
+    print(f"  Total instructions: {summary['total_instructions']}")
+    print(f"  Success count:      {summary['success_count']}")
+    print(f"  Success rate:       {summary['success_rate']:.4f}")
+    print(f"  Avg steps:          {summary['avg_steps']:.4f}")
+    print(f"  Avg success steps:  {summary['avg_success_steps']:.4f}")
+    print("=" * 80)
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def save_results(results_path, results, summary):
+    if not results_path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(results_path)), exist_ok=True)
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(
+            _json_safe({'summary': summary, 'results': results}),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"  -> 结果已保存: {results_path}")
 
 
 def main():
     args = parse_args()
+    if args.max_attempts <= 0:
+        raise ValueError("--max_attempts 必须大于 0")
+
+    samples = load_dataset_samples(args.dataset_path) if args.dataset_path else []
+    if args.dataset_path and not samples:
+        return
+
     device_vigor = torch.device(args.vigor_device)
 
     print("\n" + "=" * 80)
     print(">>> VIGOR 主控客户端 (Dual-GPU Mode) <<<")
     print(f"    VIGOR Device: {args.vigor_device}")
+    print(f"    Mode: {'AUTO' if args.auto else 'MANUAL'}")
+    print(f"    Max Attempts: {args.max_attempts}")
     print("=" * 80)
 
-    # --- 初始化模型 ---
     print("\n[1/1] 初始化 VIGOR (LLMSeg)...")
-    vigor_model, tokenizer, clip_proc, transform, seg_idx = init_vigor(args, device_vigor)
+    vigor_model, tokenizer, clip_proc, transform, _ = init_vigor(args, device_vigor)
 
-    # --- 连接 OmniGibson Server ---
     ctx = zmq.Context()
     server_socket = ctx.socket(zmq.REQ)
     server_socket.connect(f"tcp://{args.server_ip}:{args.server_port}")
     print(f"\n-> 已连接 OmniGibson Server ({args.server_ip}:{args.server_port})")
 
-    # --- 连接 GraspNet Service ---
     graspnet_socket = ctx.socket(zmq.REQ)
     graspnet_socket.connect(f"tcp://{args.graspnet_ip}:{args.graspnet_port}")
     print(f"-> 已连接 GraspNet Service ({args.graspnet_ip}:{args.graspnet_port})")
 
-    # --- 连接 SAM Service ---
     sam_socket = ctx.socket(zmq.REQ)
     sam_socket.connect(f"tcp://{args.sam_ip}:{args.sam_port}")
     print(f"-> 已连接 SAM Service ({args.sam_ip}:{args.sam_port})")
 
-    print("\n-> 所有模型就绪, 可以开始抓取实验")
-    print("   ⚠️  请确保 graspnet_service.py 已在 graspnet conda 环境中启动!\n")
-
-    current_idx = args.scene_idx
-    last_scene_id = None
     try:
-        while True:
-            # ==============================================================
-            # --- 0. 预先解析任务详情 ---
-            # ==============================================================
-            instruction = None
-            scene_id = None
-            if args.dataset_path:
-                instruction, scene_id = load_dataset_instruction(args.dataset_path, current_idx)
-            
-            if instruction is None:
-                instruction = args.instruction if args.instruction else "pick up the object"
-            
-            print(f"\n[任务预览] Index: {current_idx} | 场景 ID: {scene_id} | 指令: \"{instruction}\"")
-            
-            # --- 主交互提示 ---
-            user_input = input(f"[Ready] 准备开始 (回车: 执行 / q: 重试上一个 / e: 退出): ").strip().lower()
-
-            if user_input == 'e':
-                print("  -> 退出实验循环")
-                break
-                
-            if user_input == 'q':
-                # 回退：回到上一个 index
-                # 注意：如果本来就是 0，就保持 0
-                current_idx = max(0, current_idx - 1)
-                print(f"  << [动作] 正在回退到 Index={current_idx}")
-                continue
-
-            # ==============================================================
-            # --- 1. 场景同步 (如果需要) ---
-            # ==============================================================
-            if scene_id is not None and scene_id != last_scene_id:
-                print(f"\n[动作] 正在请求 Server 加载新场景: {scene_id}...")
-                server_socket.send_pyobj({'type': 'LOAD_SCENE', 'scene_id': scene_id})
-                res = server_socket.recv_pyobj()
-                print(f"  -> Server 结果: {res['status']}")
-                
-                if "SUCCESS" in res['status']:
-                    last_scene_id = scene_id
-                    # 场景切换比较久，在这里加一个二次确认
-                    print(f"\n[确认] 场景 {scene_id} 已加载完毕。")
-                    confirm = input("   按回车继续，或输入 q 取消本次进度重来: ").strip().lower()
-                    if confirm == 'q':
-                        print(f"  << [动作] 本次 index={current_idx} 已取消。")
+        if args.auto:
+            results = []
+            for sample_idx, sample in enumerate(samples):
+                scene_id_int = _scene_id_as_int(sample)
+                if args.max_scene_id is not None:
+                    if scene_id_int is None:
+                        print(f"  [Skip] sample={sample_idx} scene id 无法转成整数: {sample.get('scene')}")
                         continue
-                else:
-                    print(f"  ❌ Server 换场失败，请检查 Server 端或 JSON 配置。")
-                    current_idx = max(0, current_idx - 1)
+                    if scene_id_int > args.max_scene_id:
+                        continue
+
+                instructions = _safe_instructions(sample)
+                if not instructions:
+                    print(f"  [Skip] sample={sample_idx} 没有 instructions")
                     continue
-            
-            print(f"  语言指令: \"{instruction}\"")
-            
-            # ==============================================================
-            #  Step 1: 从 OmniGibson Server 获取 RGBD
-            # ==============================================================
-            print("\n--- Step 1: 获取仿真观测 ---")
-            server_socket.send_pyobj({'type': 'GET_OBS'})
-            obs = server_socket.recv_pyobj()
-            rgb       = obs['rgb']         # (H, W, 3) uint8
-            depth     = obs['depth']       # (H, W) float
-            intrinsic = obs['intrinsic']   # (3, 3)
-            cam_pos   = obs['cam_pos']     # (3,)
-            cam_quat  = obs['cam_quat']    # (4,)
 
-            # ==============================================================
-            #  Step 2: SAM 生成候选掩码 (运行在独立服务中)
-            # ==============================================================
-            print("\n--- Step 2: SAM 生成候选掩码 ---")
-            sam_masks = generate_sam_masks(sam_socket, rgb)
+                for instruction_idx, instruction in enumerate(instructions):
+                    # 每条 instruction 独立评估；重新加载场景，避免上一次抓取改变场景状态。
+                    if not load_scene(server_socket, sample.get('scene')):
+                        results.append({
+                            'sample_idx': sample_idx,
+                            'scene': sample.get('scene'),
+                            'object': sample.get('object', 'Unknown'),
+                            'gt_object': sample.get('gt_object', sample.get('object', 'Unknown')),
+                            'instruction_idx': instruction_idx,
+                            'instruction': instruction,
+                            'success': False,
+                            'steps': 0,
+                            'response': {'status': 'LOAD_SCENE_FAIL'},
+                        })
+                        continue
 
-            if len(sam_masks) == 0:
-                print("  ❌ SAM 未能生成候选掩码, 跳过")
-                continue
+                    result = run_instruction_trial(
+                        args, server_socket, graspnet_socket, sam_socket,
+                        vigor_model, tokenizer, clip_proc, transform,
+                        sample_idx, sample, instruction_idx, instruction,
+                    )
+                    results.append(result)
 
-            # ==============================================================
-            #  Step 3: VIGOR 选择 affordance 掩码 (运行在 GPU 0)
-            # ==============================================================
-            print("\n--- Step 3: VIGOR 选择 affordance ---")
-            
-            affordance_mask, best_idx = vigor_predict_affordance(
-                vigor_model, tokenizer, clip_proc, transform,
-                rgb, instruction, sam_masks, args.precision
-            )
+            summary = summarize_results(results)
+            print_summary(summary)
+            save_results(args.results_path, results, summary)
+        else:
+            if samples:
+                sample_idx, sample = select_manual_sample(samples, args)
+                instructions = _safe_instructions(sample)
+                if not instructions and not args.instruction:
+                    raise ValueError(f"sample={sample_idx} 没有可用 instruction")
+                if args.instruction:
+                    instruction_list = [args.instruction]
+                    start_idx = 0
+                else:
+                    if args.instruction_idx < 0 or args.instruction_idx >= len(instructions):
+                        raise ValueError(
+                            f"instruction_idx={args.instruction_idx} 超出范围 "
+                            f"(0..{len(instructions)-1})"
+                        )
+                    instruction_list = instructions
+                    start_idx = args.instruction_idx
+            else:
+                sample_idx = -1
+                sample = {'scene': None, 'object': 'object', 'gt_object': None}
+                instruction_list = [args.instruction if args.instruction else "pick up the object"]
+                start_idx = 0
 
-            # 保存调试图像
-            save_debug_images(rgb, depth, affordance_mask, args.vis_dir)
+            all_results = []
+            current_idx = start_idx
+            attempt_idx = 1
 
-            # ==============================================================
-            #  Step 4: 发送给 GraspNet Service
-            # ==============================================================
-            print("\n--- Step 4: 发送给 GraspNet Service ---")
-            graspnet_socket.send_pyobj({
-                'rgb':             rgb,
-                'depth':           depth,
-                'affordance_mask': affordance_mask,
-                'intrinsic':       intrinsic,
-            })
-            grasp_result = graspnet_socket.recv_pyobj()
+            # 加载初始场景
+            if sample.get('scene') is not None:
+                if not load_scene(server_socket, sample.get('scene')):
+                    print("  -> 场景加载失败，退出")
+                    current_idx = len(instruction_list)
 
-            if grasp_result['status'] != 'SUCCESS':
-                print(f"  ❌ GraspNet 失败: {grasp_result.get('message', '')}")
-                continue
+            while current_idx < len(instruction_list):
+                instruction_idx = current_idx if not args.instruction else -1
+                instruction = instruction_list[current_idx]
 
-            # GraspNet 返回的是相机坐标系下的位姿
-            cam_translation = np.array(grasp_result['translation'])
-            cam_rotation    = np.array(grasp_result['rotation'])
-            grasp_width     = grasp_result['width']
-            grasp_score     = grasp_result['score']
+                print("\n[Manual Preview]")
+                print(f"  sample_idx:       {sample_idx}")
+                print(f"  scene:            {sample.get('scene')}")
+                print(f"  object:           {sample.get('object')}")
+                print(f"  gt_object:        {sample.get('gt_object')}")
+                print(f"  instruction_idx:  {instruction_idx}  ({current_idx + 1}/{len(instruction_list)} 条指令)")
+                print(f"  instruction:      \"{instruction}\"")
+                print(f"  attempt:          {attempt_idx}/{args.max_attempts}")
+                user_input = input("[Ready] 回车执行一次 / n 下一条指令 / e 退出: ").strip().lower()
+                if user_input == 'e':
+                    break
+                if user_input == 'n':
+                    current_idx += 1
+                    attempt_idx = 1
+                    if current_idx < len(instruction_list) and sample.get('scene') is not None:
+                        load_scene(server_socket, sample.get('scene'))
+                    continue
 
-            # 转换到世界坐标系
-            world_pos, world_rot = transform_to_world(
-                cam_translation, cam_rotation, cam_pos, cam_quat
-            )
+                success, response = run_one_attempt(
+                    args, server_socket, graspnet_socket, sam_socket,
+                    vigor_model, tokenizer, clip_proc, transform,
+                    instruction, sample, attempt_idx,
+                )
+                result_entry = {
+                    'sample_idx': sample_idx,
+                    'scene': sample.get('scene'),
+                    'object': sample.get('object'),
+                    'gt_object': sample.get('object'),
+                    'instruction_idx': instruction_idx,
+                    'instruction': instruction,
+                    'success': success,
+                    'steps': attempt_idx,
+                    'response': response,
+                }
+                all_results.append(result_entry)
+                print(f"  -> {'success' if success else 'fail'} (attempt {attempt_idx})")
 
-            world_euler = R.from_matrix(world_rot).as_euler('xyz', degrees=True)
-            print(f"  -> World Position:  {world_pos}")
-            print(f"  -> World Euler(°):  {world_euler}")
-            print(f"  -> Gripper Width:   {grasp_width:.4f}")
-            print(f"  -> Grasp Score:     {grasp_score:.4f}")
+                if success or attempt_idx >= args.max_attempts:
+                    print_summary(summarize_results([result_entry]))
+                    current_idx += 1
+                    attempt_idx = 1
+                    if current_idx < len(instruction_list) and sample.get('scene') is not None:
+                        load_scene(server_socket, sample.get('scene'))
+                else:
+                    attempt_idx += 1
 
-            # ==============================================================
-            #  Step 5: 发送抓取指令给 OmniGibson Server
-            # ==============================================================
-            print("\n--- Step 5: 发送抓取指令给 Server ---")
-            server_socket.send_pyobj({
-                'type': 'EXECUTE',
-                'translation': world_pos.tolist(),
-                'rotation': world_rot.tolist(),
-                'width': float(grasp_width)
-            })
-            response = server_socket.recv_pyobj()
-            print(f"  -> Server 响应: {response['status']}")
-            print("=" * 60 + "\n")
-
-            # --- 自动跳转下一个样本 ---
-            current_idx += 1
-            del obs, rgb, depth, sam_masks, affordance_mask, grasp_result
-            torch.cuda.empty_cache()
+            if all_results:
+                print("\n[All Results Summary]")
+                print_summary(summarize_results(all_results))
 
     except KeyboardInterrupt:
         print("\n-> 用户中断")
     finally:
         server_socket.close()
         graspnet_socket.close()
+        sam_socket.close()
 
 
 if __name__ == "__main__":

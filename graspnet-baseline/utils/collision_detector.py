@@ -25,9 +25,23 @@ class ModelFreeCollisionDetector():
             collision_mask, empty_mask, iou_list = mfcdetector.detect(grasp_group, approach_dist=0.03, collision_thresh=0.05,
                                             return_empty_grasp=True, empty_thresh=0.01, return_ious=True)
     """
-    def __init__(self, scene_points, voxel_size=0.005):
-        self.finger_width = 0.01
-        self.finger_length = 0.06
+    def __init__(
+        self,
+        scene_points,
+        voxel_size=0.005,
+        finger_width=0.01,
+        finger_length=0.06,
+        width_scale=1.0,
+        depth_scale=1.0,
+        height_scale=1.0,
+        max_grasp_width=None,
+    ):
+        self.finger_width = float(finger_width)
+        self.finger_length = float(finger_length)
+        self.width_scale = float(width_scale)
+        self.depth_scale = float(depth_scale)
+        self.height_scale = float(height_scale)
+        self.max_grasp_width = None if max_grasp_width is None else float(max_grasp_width)
         self.voxel_size = voxel_size
         scene_cloud = o3d.geometry.PointCloud()
         scene_cloud.points = o3d.utility.Vector3dVector(scene_points)
@@ -69,9 +83,11 @@ class ModelFreeCollisionDetector():
         approach_dist = max(approach_dist, self.finger_width)
         T = grasp_group.translations
         R = grasp_group.rotation_matrices
-        heights = grasp_group.heights[:,np.newaxis]
-        depths = grasp_group.depths[:,np.newaxis]
-        widths = grasp_group.widths[:,np.newaxis]
+        heights = (grasp_group.heights * self.height_scale)[:,np.newaxis]
+        depths = (grasp_group.depths * self.depth_scale)[:,np.newaxis]
+        widths = (grasp_group.widths * self.width_scale)[:,np.newaxis]
+        if self.max_grasp_width is not None:
+            widths = np.minimum(widths, self.max_grasp_width)
         targets = self.scene_points[np.newaxis,:,:] - T[:,np.newaxis,:]
         targets = np.matmul(targets, R)
 
