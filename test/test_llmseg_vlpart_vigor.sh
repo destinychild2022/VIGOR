@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ========================================================================
-# LLMSeg -> region RGB -> VLPart VIGOR-100K evaluation
+# LLMSeg Top-K -> region RGB -> VLPart candidates -> reranker evaluation
 #
-# Stage 1: LLMSeg selects one SAM candidate mask for each instruction.
-# Stage 2: the selected mask is projected back to scene RGB, then VLPart
-#          predicts the final mask on that region RGB image.
+# Stage 1: LLMSeg returns similarity-ranked Top-K SAM candidate masks.
+# Stage 2: VLPart predicts every instance candidate on every Top-K region.
+# Stage 3: the learned reranker selects one final affordance mask.
 # Metrics and visualization format follow test/test_llmseg_vigor.sh.
 # ========================================================================
 
@@ -38,18 +38,27 @@ TEST_DATA_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K_new/test"
 TEST_EASY_JSON="open_vocab_grasp_easy_object_mix.json"
 TEST_HARD_JSON="open_vocab_grasp_hard_object_mix.json"
 SAM_MASKS_DIR="/opt/data/private/LLMSeg/dataset/VIGOR-100K/test_mask/sam_masks3"
+TOPK_MASK_K="${TOPK_MASK_K:-3}"
 
 # ========== VLPart model ==========
 VLPART_CONFIG_FILE="configs/vigor/swinbase_vigor_easy_stage1.yaml"
-VLPART_WEIGHTS="/opt/data/private/LLMSeg/VLPart/output/VLPart/vigor_swinbase_easy_stage1_llmseg_noisy_ratio20_from_gtbaseline_lr4e-6_3ep/model_final.pth"
+VLPART_WEIGHTS="/opt/data/private/LLMSeg/VLPart/output/VLPart/vigor_swinbase_easy_stage1_llmseg_noisy_ratio100_nofilter/model_final.pth"
 VLPART_CONFIDENCE_THRESHOLD="0.05"
-VLPART_MASK_SELECTION="top1"
+VLPART_MASK_SELECTION="all"
 VLPART_VOCABULARY="custom"
 VLPART_CUSTOM_VOCABULARY="cylindrical side surface,hexagonal side face,flat side surface,whole object"
 VLPART_PREDICTION_CACHE_SIZE="256"
 
+# ========== Reranker ==========
+if [[ "${TOPK_MASK_K}" == "3" ]]; then
+  DEFAULT_RERANKER_CHECKPOINT="/opt/data/private/LLMSeg/VLPart/vlpart_vigor_outputs/llmseg_topk_reranker_k3_noisy/checkpoints/reranker_top3*candidate.pt"
+else
+  DEFAULT_RERANKER_CHECKPOINT="/opt/data/private/LLMSeg/VLPart/vlpart_vigor_outputs/llmseg_topk_reranker_k${TOPK_MASK_K}_noisy/checkpoints/reranker.pt"
+fi
+RERANKER_CHECKPOINT="${RERANKER_CHECKPOINT:-${DEFAULT_RERANKER_CHECKPOINT}}"
+
 # ========== Output ==========
-OUTPUT_ROOT="./result_llmseg_vlpart"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./result_llmseg_vlpart_topk_reranker_k${TOPK_MASK_K}}"
 OUTPUT_DIR="${OUTPUT_ROOT}/results"
 VIS_DIR="${OUTPUT_ROOT}/visualizations"
 REGION_RGB_DIR="${OUTPUT_ROOT}/region_rgb"
@@ -68,8 +77,9 @@ LORA_TARGET_MODULES="q_proj,k_proj,v_proj,out_proj"
 
 DEBUG="${DEBUG:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
-GPU_ID="${GPU_ID:-1}"
+GPU_ID="${GPU_ID:-0}"
 VLPART_GPU_ID="${VLPART_GPU_ID:-${GPU_ID}}"
+RERANKER_GPU_ID="${RERANKER_GPU_ID:-${VLPART_GPU_ID}}"
 SPLIT="${SPLIT:-both}"
 WORKERS="${WORKERS:-12}"
 
@@ -82,12 +92,15 @@ if [[ ("${SAVE_PRED_MASKS}" == "true" || "${SAVE_PRED_MASKS}" == "1") && -e "${V
 fi
 
 echo "========================================================================"
-echo "  LLMSeg -> region RGB -> VLPart VIGOR-100K evaluation"
+echo "  LLMSeg Top-K -> VLPart candidates -> reranker VIGOR-100K evaluation"
 echo "========================================================================"
 echo "Python: ${PYTHON_BIN}"
 echo "LLMSeg checkpoint: ${CHECKPOINT_PATH}"
 echo "VLPart config: ${VLPART_CONFIG_FILE}"
 echo "VLPart weights: ${VLPART_WEIGHTS}"
+echo "LLMSeg Top-K K: ${TOPK_MASK_K}"
+echo "VLPart candidate mode: ${VLPART_MASK_SELECTION}"
+echo "Reranker checkpoint: ${RERANKER_CHECKPOINT}"
 echo "Data dir: ${TEST_DATA_DIR}"
 echo "Split: ${SPLIT}"
 echo "Output dir: ${OUTPUT_DIR}"
@@ -95,6 +108,11 @@ echo "Visualization dir: ${VIS_DIR}"
 echo "Region RGB dir: ${REGION_RGB_DIR}"
 echo "VLPart pred masks dir: ${VLPART_PRED_MASKS_DIR}"
 echo "========================================================================"
+
+if [[ ! -f "${RERANKER_CHECKPOINT}" ]]; then
+  echo "Reranker checkpoint not found: ${RERANKER_CHECKPOINT}" >&2
+  exit 1
+fi
 
 ARGS=(
   --version "${LISA_MODEL_PATH}"
@@ -105,6 +123,7 @@ ARGS=(
   --easy_json_file "${TEST_EASY_JSON}"
   --hard_json_file "${TEST_HARD_JSON}"
   --sam_masks_dir "${SAM_MASKS_DIR}"
+  --topk_mask_k "${TOPK_MASK_K}"
   --output_dir "${OUTPUT_DIR}"
   --vis_dir "${VIS_DIR}"
   --region_rgb_dir "${REGION_RGB_DIR}"
@@ -127,6 +146,8 @@ ARGS=(
   --vlpart_vocabulary "${VLPART_VOCABULARY}"
   --vlpart_custom_vocabulary "${VLPART_CUSTOM_VOCABULARY}"
   --vlpart_prediction_cache_size "${VLPART_PREDICTION_CACHE_SIZE}"
+  --reranker_checkpoint "${RERANKER_CHECKPOINT}"
+  --reranker_device "cuda:${RERANKER_GPU_ID}"
   --use_mm_start_end
 )
 
@@ -150,5 +171,5 @@ fi
 
 echo ""
 echo "========================================================================"
-echo "  LLMSeg+VLPart evaluation finished"
+echo "  LLMSeg Top-K + VLPart + reranker evaluation finished"
 echo "========================================================================"
